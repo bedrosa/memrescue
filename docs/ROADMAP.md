@@ -61,7 +61,8 @@ Hecho en la iteración 2 (detalle en `PROGRESO.md`, etapa 5):
 - ✔ Prueba automática de la interfaz (UI Automation, 9 pruebas), barra de posición para imágenes grandes.
 
 Pendiente en M1 (no se avanza a M2 sin revisión del propietario):
-- `NullDevice`; omitir errores por código (IO-09).
+- ✔ `NullDevice` (ceros, asignación dispersa) y `PatternDevice` (patrón constante).
+- Omitir errores por código (IO-09).
 - VHD/VHDX diferenciales, VHDX con registro pendiente, VMDK streamOptimized / multiextensión / flat
   (exigen abrir otros ficheros con confirmación explícita del usuario o descomprimir).
 - Patrones de relleno configurables desde la interfaz; colores por estado dentro del volcado.
