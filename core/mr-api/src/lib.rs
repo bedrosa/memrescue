@@ -161,6 +161,22 @@ pub fn open_with(path: impl AsRef<Path>, opts: OpenOptions) -> Result<Source> {
     Ok(Arc::new(mr_image::open_image(path.as_ref(), opts)?.into()))
 }
 
+/// Presenta un dispositivo ya construido (en memoria, virtual o con fallos simulados) como origen,
+/// con `description` como descripción legible. Se interpreta como RAW y no tiene ruta.
+pub fn source_from_device(dev: Arc<dyn BlockDevice>, description: impl Into<String>) -> Source {
+    Arc::new(OpenSource::new(
+        dev,
+        Meta {
+            path: PathBuf::new(),
+            format: ImageFormat::Raw,
+            detected: ImageFormat::Raw,
+            description: description.into(),
+            segments: Vec::new(),
+            range: None,
+        },
+    ))
+}
+
 /// Lista los segmentos de una imagen dividida a partir del primero, sin abrirlos.
 pub fn discover_split(first: impl AsRef<Path>) -> Result<Vec<PathBuf>> {
     Ok(mr_image::split::discover(first.as_ref())?)
@@ -536,6 +552,55 @@ mod tests {
         );
         assert!(!r.map.all_trustworthy());
         assert_eq!((ctx.done(), ctx.total()), (100, 100));
+    }
+
+    #[test]
+    fn verify_applies_the_error_skip_policy() {
+        // 23 = ERROR_CRC, 1117 = ERROR_IO_DEVICE (simulados).
+        let dev = FaultyDevice::new(MemDevice::new(vec![7u8; 512 * 64], 512).unwrap())
+            .with_bad_code([10], 23)
+            .with_bad_code([20], 1117)
+            .with_bad([30]);
+        let src = source_from_device(Arc::new(dev), "prueba");
+        assert_eq!(src.info().sector_count, 64);
+        let opts = VerifyOptions {
+            policy: ReadPolicy {
+                chunk_sectors: 8,
+                retries: 3,
+                on_error: OnError::FillAndContinue,
+                skip_error_codes: vec![23],
+                ..ReadPolicy::default()
+            },
+            ..VerifyOptions::default()
+        };
+        let r = start_verify_task(Arc::clone(&src), opts)
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(r.map.count(SectorState::Unreadable), 3);
+        assert_eq!(r.omitted_errors, 1);
+        // 3 bloques releídos sector a sector + 3 reintentos en cada uno de los 2 no omitidos.
+        assert_eq!(r.retry_reads, 3 + 6);
+        assert_eq!(
+            r.error_codes
+                .iter()
+                .map(|(&c, &n)| (c, n))
+                .collect::<Vec<_>>(),
+            vec![(23, 1), (1117, 1)]
+        );
+        let opts = VerifyOptions {
+            policy: ReadPolicy {
+                chunk_sectors: 8,
+                retries: 3,
+                on_error: OnError::FillAndContinue,
+                ignore_all_errors: true,
+                ..ReadPolicy::default()
+            },
+            ..VerifyOptions::default()
+        };
+        let r = verify(src.as_ref(), &opts, &TaskContext::detached()).unwrap();
+        assert_eq!((r.omitted_errors, r.retry_reads), (3, 3));
+        assert_eq!(r.map.count(SectorState::Read), 61);
     }
 
     #[test]

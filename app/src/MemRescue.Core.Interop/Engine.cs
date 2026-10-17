@@ -1,4 +1,5 @@
-﻿using System.Text;
+﻿using System.Runtime.InteropServices;
+using System.Text;
 
 namespace MemRescue.Core.Interop;
 
@@ -119,7 +120,16 @@ public sealed record VerifyReport(
 
     /// <summary><c>true</c> si ningún sector es ilegible ni se saltó.</summary>
     public bool AllTrustworthy => SectorsUnreadable == 0 && SectorsSkipped == 0;
+
+    /// <summary>Sectores ilegibles cuyo error se omitió por la política (sin agotar reintentos).</summary>
+    public ulong OmittedErrors { get; init; }
+
+    /// <summary>Códigos de error del sistema de los sectores ilegibles, en orden creciente.</summary>
+    public IReadOnlyList<ErrorCodeCount> ErrorCodes { get; init; } = [];
 }
+
+/// <summary>Código de error del sistema y número de sectores ilegibles cuyo último intento falló con él.</summary>
+public readonly record struct ErrorCodeCount(int Code, ulong Sectors);
 
 /// <summary>Sectores leídos con el estado de cada uno.</summary>
 public sealed record MappedSectors(byte[] Data, SectorState[] States)
@@ -360,11 +370,42 @@ public sealed class Source : EngineHandle
     /// <param name="retries">Reintentos por sector ilegible (0–100).</param>
     /// <param name="jumpSectors">Tras un sector ilegible, saltar estos sectores sin leerlos (0 = no saltar).</param>
     /// <param name="readBack">Tras un salto, leer hacia atrás hasta el siguiente error.</param>
-    public VerifyTask StartVerify(ulong startLba = 0, ulong count = 0, uint retries = 1, ulong jumpSectors = 0, bool readBack = false)
+    /// <param name="skipErrorCodes">
+    /// Códigos de error del sistema (p. ej. 23, 1117) que no se reintentan: el sector queda ilegible
+    /// al primer fallo con uno de ellos. Máximo 256; deben ser positivos.
+    /// </param>
+    /// <param name="ignoreAllErrors">Modo «ignorar todo»: ningún error se reintenta.</param>
+    public VerifyTask StartVerify(ulong startLba = 0, ulong count = 0, uint retries = 1, ulong jumpSectors = 0, bool readBack = false,
+        IReadOnlyCollection<int>? skipErrorCodes = null, bool ignoreAllErrors = false)
     {
-        Engine.Check(NativeMethods.mr_source_verify_start(Handle, startLba, count, retries, jumpSectors,
-            readBack ? NativeMethods.VerifyReadBack : 0, out var h));
-        return new VerifyTask(h);
+        var flags = readBack ? NativeMethods.VerifyReadBack : 0;
+        if ((skipErrorCodes is null || skipErrorCodes.Count == 0) && !ignoreAllErrors)
+        {
+            Engine.Check(NativeMethods.mr_source_verify_start(Handle, startLba, count, retries, jumpSectors, flags, out var h0));
+            return new VerifyTask(h0);
+        }
+        var codes = skipErrorCodes?.ToArray() ?? [];
+        var pin = GCHandle.Alloc(codes, GCHandleType.Pinned);
+        try
+        {
+            var o = new MrVerifyOptions
+            {
+                StructSize = (uint)Marshal.SizeOf<MrVerifyOptions>(),
+                Flags = flags | (ignoreAllErrors ? NativeMethods.VerifyIgnoreAllErrors : 0),
+                StartLba = startLba,
+                Count = count,
+                JumpSectors = jumpSectors,
+                Retries = retries,
+                SkipCodeCount = (uint)codes.Length,
+                SkipCodes = codes.Length == 0 ? 0 : pin.AddrOfPinnedObject(),
+            };
+            Engine.Check(NativeMethods.mr_source_verify_start_ex(Handle, in o, out var h));
+            return new VerifyTask(h);
+        }
+        finally
+        {
+            pin.Free();
+        }
     }
 
     private protected override void Release(ulong handle)
@@ -454,7 +495,18 @@ public sealed class VerifyTask : EngineTask
             Engine.Check(NativeMethods.mr_verify_untrusted_range(Handle, i, out var lba, out var count, out var state));
             ranges.Add(new UntrustedRange(lba, count, (SectorState)state));
         }
+        Engine.Check(NativeMethods.mr_verify_error_summary(Handle, out var omitted, out var codeCount));
+        var codes = new List<ErrorCodeCount>((int)Math.Min(codeCount, 1024));
+        for (uint i = 0; i < codeCount; i++)
+        {
+            Engine.Check(NativeMethods.mr_verify_error_code(Handle, i, out var code, out var sectors));
+            codes.Add(new ErrorCodeCount(code, sectors));
+        }
         return new VerifyReport(r.SectorsRequested, r.SectorsRead, r.SectorsRecovered, r.SectorsUnreadable,
-            r.SectorsSkipped, r.SectorsSparse, r.RetryReads, ranges, r.RangesTruncated != 0);
+            r.SectorsSkipped, r.SectorsSparse, r.RetryReads, ranges, r.RangesTruncated != 0)
+        {
+            OmittedErrors = omitted,
+            ErrorCodes = codes,
+        };
     }
 }

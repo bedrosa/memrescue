@@ -21,6 +21,8 @@
  * (mr_source_read_mapped), verificación con salto y lectura hacia atrás e informe con todos los
  * estados (mr_verify_untrusted_range sustituye a mr_verify_bad_range), códigos 12–14,
  * sector_size = 0 (nativo) y campo format en mr_image_info.
+ * Añadido sin cambiar la ABI 3: verificación extendida con política de omisión de errores
+ * (mr_source_verify_start_ex, mr_verify_options, mr_verify_error_summary, mr_verify_error_code).
  */
 #ifndef MEMRESCUE_CORE_H
 #define MEMRESCUE_CORE_H
@@ -89,8 +91,11 @@ typedef int32_t mr_status;
 #define MR_SECTOR_SKIPPED     3u  /* no leído (salto): PATRÓN DE RELLENO, no datos */
 #define MR_SECTOR_SPARSE      4u  /* no asignado en el contenedor: ceros legítimos */
 
-/* Opciones de mr_source_verify_start. */
+/* Opciones de mr_source_verify_start (y flags de mr_verify_options). */
 #define MR_VERIFY_READ_BACK  1u   /* tras un salto, leer hacia atrás hasta el siguiente error */
+/* Solo mr_source_verify_start_ex: «ignorar todo», ningún error se reintenta. */
+#define MR_VERIFY_IGNORE_ALL_ERRORS 2u
+#define MR_MAX_SKIP_CODES  256u   /* máximo de elementos en mr_verify_options.skip_codes */
 
 typedef struct mr_image_info {   /* 32 bytes */
     uint64_t size_bytes;
@@ -119,6 +124,22 @@ typedef struct mr_verify_report { /* 72 bytes */
     uint32_t ranges_truncated;      /* 1 = lista de tramos truncada; los recuentos son exactos */
     uint32_t reserved;
 } mr_verify_report;
+
+/* Opciones de mr_source_verify_start_ex (48 bytes en x64). struct_size = sizeof(mr_verify_options):
+ * permite ampliar la estructura sin romper la ABI; un tamaño desconocido se rechaza.
+ * Política de errores: un sector cuya lectura individual falla con un código de skip_codes (o con
+ * cualquier error si MR_VERIFY_IGNORE_ALL_ERRORS) no se reintenta y queda MR_SECTOR_UNREADABLE
+ * (patrón de relleno, nunca datos). El salto y la lectura hacia atrás se aplican igual. */
+typedef struct mr_verify_options {
+    uint32_t struct_size;
+    uint32_t flags;              /* MR_VERIFY_READ_BACK | MR_VERIFY_IGNORE_ALL_ERRORS */
+    uint64_t start_lba;
+    uint64_t count;              /* 0 = hasta el último sector */
+    uint64_t jump_sectors;       /* 0 = sin salto tras un ilegible */
+    uint32_t retries;            /* 0–100 */
+    uint32_t skip_code_count;    /* ≤ MR_MAX_SKIP_CODES */
+    const int32_t *skip_codes;   /* códigos del sistema (> 0), p. ej. 23, 1117; NULL si count = 0 */
+} mr_verify_options;
 
 uint32_t  mr_abi_version(void);
 mr_status mr_engine_version(uint8_t *buf, size_t cap, size_t *out_len);
@@ -165,7 +186,15 @@ mr_status mr_hash_result(uint64_t task, uint32_t algorithm,
 mr_status mr_source_verify_start(uint64_t source, uint64_t start_lba, uint64_t count,
                                  uint32_t retries, uint64_t jump_sectors, uint32_t flags,
                                  uint64_t *out_task);
+/* Verificación con política de omisión de errores. */
+mr_status mr_source_verify_start_ex(uint64_t source, const mr_verify_options *options,
+                                    uint64_t *out_task);
 mr_status mr_verify_result(uint64_t task, mr_verify_report *out);
+/* Sectores cuyo error se omitió por la política y nº de códigos del sistema distintos registrados. */
+mr_status mr_verify_error_summary(uint64_t task, uint64_t *out_omitted, uint32_t *out_code_count);
+/* Código nº index (orden creciente) y nº de sectores ilegibles cuyo último intento falló con él. */
+mr_status mr_verify_error_code(uint64_t task, uint32_t index, int32_t *out_code,
+                               uint64_t *out_sectors);
 mr_status mr_verify_untrusted_range(uint64_t task, uint64_t index, uint64_t *out_lba,
                                     uint64_t *out_count, uint32_t *out_state);
 

@@ -4,9 +4,14 @@
 //! Además de sectores ilegibles (permanentes o intermitentes) puede simular **regiones dispersas**
 //! (`Allocation::Sparse` en [`BlockDevice::allocation`]) y lleva la cuenta de cuántas lecturas ha
 //! recibido cada sector, para demostrar que el lector no lee lo que no debe (saltos, dispersos).
+//!
+//! Cada sector que falla puede llevar un **código de error del sistema** distinto
+//! ([`io::Error::from_raw_os_error`]), para probar la omisión de errores por código de la política
+//! de lectura. Si una lectura toca varios sectores que fallan, el error devuelto lleva el código
+//! del primero (el de menor LBA).
 
 use crate::{Allocation, AllocationRun, BlockDevice, IoError, Result};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::ops::Range;
 use std::sync::Mutex;
@@ -14,10 +19,10 @@ use std::sync::Mutex;
 /// Envuelve un [`BlockDevice`] y hace fallar las lecturas que tocan determinados sectores.
 pub struct FaultyDevice<D: BlockDevice> {
     inner: D,
-    /// Sectores que fallan siempre.
-    bad: BTreeSet<u64>,
-    /// Sectores que fallan las primeras `n` veces que se leen y luego se leen bien.
-    flaky: Mutex<HashMap<u64, u32>>,
+    /// Sectores que fallan siempre, con el código de error del sistema que devuelven (si lo hay).
+    bad: BTreeMap<u64, Option<i32>>,
+    /// Sectores que fallan las primeras `n` veces que se leen y luego se leen bien (con su código).
+    flaky: Mutex<BTreeMap<u64, (u32, Option<i32>)>>,
     /// Regiones dispersas simuladas: inicio → fin (exclusivo), sin solapes.
     sparse: BTreeMap<u64, u64>,
     reads: Mutex<u64>,
@@ -29,24 +34,41 @@ impl<D: BlockDevice> FaultyDevice<D> {
     pub fn new(inner: D) -> Self {
         Self {
             inner,
-            bad: BTreeSet::new(),
-            flaky: Mutex::new(HashMap::new()),
+            bad: BTreeMap::new(),
+            flaky: Mutex::new(BTreeMap::new()),
             sparse: BTreeMap::new(),
             reads: Mutex::new(0),
             sector_reads: Mutex::new(HashMap::new()),
         }
     }
 
+    /// Sectores que fallan siempre con un error sin código del sistema.
     pub fn with_bad(mut self, lbas: impl IntoIterator<Item = u64>) -> Self {
-        self.bad.extend(lbas);
+        self.bad.extend(lbas.into_iter().map(|l| (l, None)));
         self
     }
 
+    /// Sectores que fallan siempre con el código de error del sistema `code` (p. ej. 23 o 1117).
+    pub fn with_bad_code(mut self, lbas: impl IntoIterator<Item = u64>, code: i32) -> Self {
+        self.bad.extend(lbas.into_iter().map(|l| (l, Some(code))));
+        self
+    }
+
+    /// El sector `lba` falla las primeras `failures` lecturas (error sin código) y luego se lee bien.
     pub fn with_flaky(self, lba: u64, failures: u32) -> Self {
         self.flaky
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .insert(lba, failures);
+            .insert(lba, (failures, None));
+        self
+    }
+
+    /// Como [`Self::with_flaky`], pero cada fallo lleva el código de error del sistema `code`.
+    pub fn with_flaky_code(self, lba: u64, failures: u32, code: i32) -> Self {
+        self.flaky
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(lba, (failures, Some(code)));
         self
     }
 
@@ -162,27 +184,28 @@ impl<D: BlockDevice> BlockDevice for FaultyDevice<D> {
                 *m.entry(lba).or_insert(0) += 1;
             }
         }
-        let fail = |offset| IoError::Read {
+        let fail = |code: Option<i32>| IoError::Read {
             offset,
             len: buf.len(),
-            source: io::Error::other("sector ilegible (simulado)"),
+            source: match code {
+                Some(c) => io::Error::from_raw_os_error(c),
+                None => io::Error::other("sector ilegible (simulado)"),
+            },
         };
-        if self.bad.range(first..=last).next().is_some() {
-            return Err(fail(offset));
+        if let Some((_, &code)) = self.bad.range(first..=last).next() {
+            return Err(fail(code));
         }
         let mut flaky = self.flaky.lock().unwrap_or_else(|p| p.into_inner());
-        let mut failed = false;
-        for lba in first..=last {
-            if let Some(n) = flaky.get_mut(&lba) {
-                if *n > 0 {
-                    *n -= 1;
-                    failed = true;
-                }
+        let mut failed: Option<Option<i32>> = None;
+        for (_, (n, code)) in flaky.range_mut(first..=last) {
+            if *n > 0 {
+                *n -= 1;
+                failed.get_or_insert(*code);
             }
         }
         drop(flaky);
-        if failed {
-            return Err(fail(offset));
+        if let Some(code) = failed {
+            return Err(fail(code));
         }
         self.inner.read_at(offset, buf)
     }
@@ -250,5 +273,36 @@ mod tests {
         );
         assert_eq!(d.sectors_touched(0..100), vec![2, 3, 4, 5, 6, 7]);
         assert_eq!(d.read_calls(), 2);
+    }
+
+    #[test]
+    fn failing_sectors_carry_their_os_error_code() {
+        let d = dev()
+            .with_bad_code([7], 23)
+            .with_bad_code([9], 1117)
+            .with_bad([11])
+            .with_flaky_code(20, 1, 21);
+        let mut b = vec![0u8; 512 * 4];
+        let code = |lba, n: u64| {
+            let mut b = vec![0u8; 512 * n as usize];
+            d.read_sectors(lba, n, &mut b).unwrap_err().os_error_code()
+        };
+        assert_eq!(code(7, 1), Some(23));
+        assert_eq!(code(9, 1), Some(1117));
+        assert_eq!(code(11, 1), None);
+        // Varios sectores malos en la misma lectura: el código es el del primero.
+        assert_eq!(code(6, 4), Some(23));
+        assert_eq!(code(8, 4), Some(1117));
+        // Intermitente con código: falla una vez con 21 y después se lee bien.
+        assert_eq!(code(18, 4), Some(21));
+        d.read_sectors(18, 4, &mut b).unwrap();
+        assert!(matches!(
+            d.read_sectors(7, 1, &mut b[..512]),
+            Err(IoError::Read {
+                offset: 3584,
+                len: 512,
+                ..
+            })
+        ));
     }
 }

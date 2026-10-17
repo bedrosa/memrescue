@@ -27,7 +27,7 @@ memrescue-cli.exe (Rust) ──────────────── llamad
 | Retorno | `int32_t mr_status`: 0 = `MR_OK`; ver tabla de códigos |
 | Cadenas de entrada | UTF-8, puntero + longitud en bytes; no requieren terminador. Puntero nulo solo con longitud 0 |
 | Cadenas de salida | El llamador aporta `(buf, cap, out_len)`. Si cabe, el motor escribe UTF-8 + `\0` y `*out_len` = longitud sin `\0`. Si no, `MR_ERR_BUFFER_TOO_SMALL` y `*out_len` = longitud necesaria (el cliente reintenta con `out_len + 1`) |
-| Estructuras | `#[repr(C)]`, campos de ancho fijo, relleno explícito (`reserved`). Tamaños comprobados por pruebas en ambos lados: `mr_image_info` = 32 B, `mr_task_status` = 24 B, `mr_verify_report` = 72 B |
+| Estructuras | `#[repr(C)]`, campos de ancho fijo, relleno explícito (`reserved`). Tamaños comprobados por pruebas en ambos lados: `mr_image_info` = 32 B, `mr_task_status` = 24 B, `mr_verify_report` = 72 B, `mr_verify_options` = 48 B |
 | Enteros | `uint64_t` para tamaños y LBA; `uint32_t` para enumeraciones y máscaras |
 | Booleanos | No se usan en la ABI (evita discrepancias de tamaño) |
 
@@ -107,13 +107,17 @@ mr_task_free(handle)
 | `mr_hash_start(path, …)` / `mr_source_hash_start(source, mask, store, store_len, out_task)` | Hashes (CRC-32=1, MD5=2, SHA-1=4, SHA-256=8); estricto ante errores |
 | `mr_hash_result(task, alg, buf, cap, out_len)` | Resumen hexadecimal de un algoritmo |
 | `mr_source_verify_start(source, start_lba, count, retries, jump_sectors, flags, out_task)` | Lectura completa tolerante (`count` 0 = hasta el final; reintentos 0–100; `jump_sectors` tras cada ilegible; `flags` 1 = lectura hacia atrás) |
+| `mr_source_verify_start_ex(source, options, out_task)` | Igual que la anterior con `mr_verify_options` (`struct_size` = `sizeof`, otro tamaño se rechaza), que añade la **política de omisión de errores**: `skip_codes` (≤ 256 códigos del sistema positivos, p. ej. 23, 1117) que no se reintentan y `flags` 2 = `MR_VERIFY_IGNORE_ALL_ERRORS` (ningún error se reintenta). Los sectores afectados quedan ilegibles (estado 2, relleno), nunca como datos. `mr_source_verify_start` no cambia |
+| `mr_verify_error_summary(task, out_omitted, out_code_count)` | Sectores cuyo error se omitió por la política y nº de códigos del sistema distintos registrados |
+| `mr_verify_error_code(task, index, out_code, out_sectors)` | Código nº `index` (orden creciente) y nº de sectores ilegibles cuyo último intento falló con él |
 | `mr_verify_result(task, out)` | Informe con el recuento exacto de cada estado, relecturas, nº de tramos no fiables y truncado |
 | `mr_verify_untrusted_range(task, index, out_lba, out_count, out_state)` | Tramo no fiable nº `index` (2 ilegible, 3 saltado). Sustituye a `mr_verify_bad_range` (ABI 2) |
 | `mr_task_status_get(task, out)` | Estado y progreso (bytes en hash, sectores en verificación) |
 | `mr_task_cancel(task)` | Solicita la cancelación |
 | `mr_task_free(task)` | Libera el handle (cancela si sigue en marcha) |
 
-Códigos añadidos en ABI 2: 10 y 11; en ABI 3: 12, 13 y 14. Límites:
+Códigos añadidos en ABI 2: 10 y 11; en ABI 3: 12, 13 y 14. Las tres funciones de la política
+de errores (IO-09) se añadieron sin cambiar la versión: no modifican firmas ni estructuras existentes. Límites:
 cadenas de entrada ≤ 64 KiB (`MR_MAX_STRING_BYTES`), lecturas ≤ 64 MiB (`MR_MAX_READ_BYTES`).
 
 ## Garantía sobre datos sustituidos (ABI 3)
@@ -132,11 +136,13 @@ después de liberarlos.
 
 ## Pruebas que garantizan el contrato
 
-- Rust (`core/mr-ffi/src/tests.rs`, 16 pruebas): tamaños de estructuras, protocolo de búfer pequeño, rutas
+- Rust (`core/mr-ffi/src/tests.rs`, 18 pruebas): tamaños de estructuras, verificación extendida con
+  códigos de error simulados (origen `FaultyDevice` registrado con `mr_api::source_from_device`) y
+  validación de `mr_verify_options`, protocolo de búfer pequeño, rutas
   de dispositivo, UTF-8 inválido, punteros nulos y cadenas desmesuradas, handles inválidos o de otro
   tipo, orígenes en los 4 tamaños de sector, cierre con tarea en curso, verificación con salto y lectura
   hacia atrás, códigos 10/12/13/14, lectura con estados, rangos anidados, imágenes divididas.
-- C# (`app/tests/MemRescue.Core.Interop.Tests`, 52 pruebas): los mismos contratos desde .NET contra la DLL
-  real (incluidos VHD fijo construido según la especificación, descriptor VMDK malicioso, rangos, estados y
+- C# (`app/tests/MemRescue.Core.Interop.Tests`): los mismos contratos desde .NET contra la DLL
+  real (política de errores y `ErrorCodeList` en `VerifyPolicyTests`, incluidos VHD fijo construido según la especificación, descriptor VMDK malicioso, rangos, estados y
   divididas), finalizadores, rutas no ASCII, cancelación, base de datos de trabajo, inmutabilidad del origen y el
   corpus sintético (lectura de marcadores en LBA exactas y cabeceras GPT).

@@ -16,10 +16,17 @@
 //! 4. Opcionalmente, tras un ilegible se **saltan** `jump_sectors` sectores sin leerlos (`Skipped`,
 //!    relleno `skip_fill`) y, si `read_back`, se lee hacia atrás desde el final del salto hasta
 //!    encontrar el siguiente error, para recuperar el borde legible de la zona dañada.
+//! 5. **Omisión de errores** (`skip_error_codes`, `ignore_all_errors`): un sector cuya lectura
+//!    individual falla con un código del sistema de la lista (o con cualquier error, en modo
+//!    «ignorar todo») no se reintenta. La política solo decide si se insiste; qué se hace con el
+//!    sector lo sigue decidiendo `on_error` (`Fail` sigue abortando, `FillAndContinue` lo marca
+//!    `Unreadable`). Nunca convierte un error en dato.
 //!
 //! Memoria: como máximo dos búferes de `chunk` sectores (salida y lectura hacia atrás), con
 //! `chunk × sector ≤ MAX_READ_REQUEST`, sea cual sea el tamaño del rango o del salto.
 //! Ver `docs/formatos/mapa-de-validez.md`.
+
+use std::collections::BTreeMap;
 
 use crate::{
     sector_span, Allocation, AllocationRun, BlockDevice, IoError, Result, SectorState,
@@ -51,6 +58,24 @@ pub struct ReadPolicy {
     pub jump_sectors: u64,
     /// Tras un salto, leer hacia atrás desde su último sector hasta el siguiente error.
     pub read_back: bool,
+    /// Códigos de error del sistema (p. ej. 23 = `ERROR_CRC`, 1117 = `ERROR_IO_DEVICE`) que se
+    /// **omiten**: si un intento de lectura individual falla con uno de ellos, el sector no se
+    /// reintenta más. Ver [`ReadPolicy::omits`].
+    pub skip_error_codes: Vec<i32>,
+    /// Modo «ignorar todo»: ningún error se reintenta (equivale a omitir cualquier código, también
+    /// los errores sin código del sistema).
+    pub ignore_all_errors: bool,
+}
+
+impl ReadPolicy {
+    /// `true` si el error `e` se omite (no se reintenta): modo «ignorar todo» o código del sistema
+    /// incluido en `skip_error_codes`. Un error sin código del sistema solo se omite en modo
+    /// «ignorar todo».
+    pub fn omits(&self, e: &IoError) -> bool {
+        self.ignore_all_errors
+            || e.os_error_code()
+                .is_some_and(|c| self.skip_error_codes.contains(&c))
+    }
 }
 
 impl Default for ReadPolicy {
@@ -63,6 +88,8 @@ impl Default for ReadPolicy {
             skip_fill: *b"SKIP",
             jump_sectors: 0,
             read_back: false,
+            skip_error_codes: Vec::new(),
+            ignore_all_errors: false,
         }
     }
 }
@@ -163,6 +190,13 @@ pub struct ReadReport {
     pub sectors_requested: u64,
     /// Lecturas repetidas por errores (bloques releídos sector a sector y reintentos).
     pub retry_reads: u64,
+    /// Sectores cuyo error se **omitió** por la política (`skip_error_codes` o
+    /// `ignore_all_errors`): quedaron `Unreadable` sin agotar los reintentos.
+    pub omitted_errors: u64,
+    /// Código de error del sistema del último intento fallido de cada sector `Unreadable` →
+    /// número de sectores (incluye los fallos de la lectura hacia atrás). Los errores sin código
+    /// del sistema no aparecen aquí; su número es `Unreadable − suma de esta tabla`.
+    pub error_codes: BTreeMap<i32, u64>,
     /// Estado de cada sector del rango.
     pub map: ValidityMap,
 }
@@ -317,6 +351,8 @@ struct Reader<'a, D: ?Sized, S> {
     start: u64,
     end: u64,
     retry_reads: u64,
+    omitted_errors: u64,
+    error_codes: BTreeMap<i32, u64>,
     out: Out<S>,
 }
 
@@ -325,6 +361,13 @@ where
     D: BlockDevice + ?Sized,
     S: FnMut(u64, &[u8], &[SectorState]) -> Result<()>,
 {
+    /// Anota el código del sistema del error definitivo de un sector `Unreadable`.
+    fn note_error(&mut self, e: &IoError) {
+        if let Some(c) = e.os_error_code() {
+            *self.error_codes.entry(c).or_insert(0) += 1;
+        }
+    }
+
     fn jumps(&self) -> bool {
         self.policy.on_error == OnError::FillAndContinue && self.policy.jump_sectors > 0
     }
@@ -356,22 +399,30 @@ where
         }
         self.retry_reads += 1;
         for s in lba..lba + c {
-            let mut res = dev
-                .read_sectors(s, 1, self.out.sector_mut(s))
-                .map(|()| SectorState::Read);
+            // Primer intento individual y, salvo error omitido, hasta `retries` reintentos. La
+            // omisión se evalúa en cada intento fallido (el código puede cambiar entre intentos).
             let mut attempt = 0;
-            while res.is_err() && attempt < policy.retries {
-                attempt += 1;
-                self.retry_reads += 1;
-                res = dev
-                    .read_sectors(s, 1, self.out.sector_mut(s))
-                    .map(|()| SectorState::Recovered);
-            }
+            let res = loop {
+                match dev.read_sectors(s, 1, self.out.sector_mut(s)) {
+                    Ok(()) if attempt == 0 => break Ok(SectorState::Read),
+                    Ok(()) => break Ok(SectorState::Recovered),
+                    Err(e) if policy.omits(&e) => {
+                        self.omitted_errors += 1;
+                        break Err(e);
+                    }
+                    Err(e) if attempt >= policy.retries => break Err(e),
+                    Err(_) => {
+                        attempt += 1;
+                        self.retry_reads += 1;
+                    }
+                }
+            };
             match res {
                 Ok(st) => self.out.set_state(s, st),
                 Err(e) => match policy.on_error {
                     OnError::Fail => return Err(e),
                     OnError::FillAndContinue => {
+                        self.note_error(&e);
                         fill(self.out.sector_mut(s), policy.bad_fill);
                         self.out.set_state(s, SectorState::Unreadable);
                         if self.jumps() {
@@ -409,8 +460,9 @@ where
             let i = (s - base) as usize;
             if !rb.sparse[i] {
                 let sec = &mut rb.buf[i * self.ss..(i + 1) * self.ss];
-                if self.dev.read_sectors(s, 1, sec).is_err() {
+                if let Err(e) = self.dev.read_sectors(s, 1, sec) {
                     rb.bad = Some(s);
+                    self.note_error(&e);
                     break;
                 }
             }
@@ -516,6 +568,8 @@ pub fn read_range(
         start,
         end,
         retry_reads: 0,
+        omitted_errors: 0,
+        error_codes: BTreeMap::new(),
         out: Out::new(sink, ss, chunk, start),
     };
     let mut lba = start;
@@ -535,6 +589,8 @@ pub fn read_range(
     Ok(ReadReport {
         sectors_requested: count,
         retry_reads: r.retry_reads,
+        omitted_errors: r.omitted_errors,
+        error_codes: r.error_codes,
         map: r.out.map,
     })
 }
@@ -788,6 +844,268 @@ mod tests {
         let g = collect(&d, 0, 16, &pf);
         assert_honest(&g, 0, 512, &pf);
         assert_eq!(g.r.unwrap().map.count(Unreadable), 1);
+    }
+
+    /// Códigos de error del sistema de Windows usados en las pruebas (simulados).
+    const CRC: i32 = 23;
+    const IO_DEVICE: i32 = 1117;
+    const ACCESS_DENIED: i32 = 5;
+
+    fn codes(r: &ReadReport) -> Vec<(i32, u64)> {
+        r.error_codes.iter().map(|(&c, &n)| (c, n)).collect()
+    }
+
+    #[test]
+    fn skip_codes_avoid_retries_only_for_listed_codes() {
+        let d = faulty(64)
+            .with_bad_code([10], CRC)
+            .with_bad_code([20], IO_DEVICE)
+            .with_bad_code([30], ACCESS_DENIED)
+            .with_bad([40]);
+        let p = ReadPolicy {
+            retries: 3,
+            skip_error_codes: vec![CRC, IO_DEVICE],
+            ..fill_policy(8, 0, false)
+        };
+        let g = collect(&d, 0, 64, &p);
+        assert_honest(&g, 0, 512, &p);
+        let r = g.r.as_ref().unwrap();
+        assert_eq!(r.map.count(Unreadable), 4);
+        assert_eq!(r.map.count(Read), 60);
+        // Omitidos: lectura del bloque + un único intento individual, sin reintentos.
+        assert_eq!((d.reads_of(10), d.reads_of(20)), (2, 2));
+        // No omitidos (otro código o sin código): bloque + 1 + 3 reintentos.
+        assert_eq!((d.reads_of(30), d.reads_of(40)), (5, 5));
+        assert_eq!(r.omitted_errors, 2);
+        // 4 bloques releídos sector a sector + 3 reintentos en cada uno de los 2 no omitidos.
+        assert_eq!(r.retry_reads, 4 + 6);
+        assert_eq!(codes(r), vec![(ACCESS_DENIED, 1), (CRC, 1), (IO_DEVICE, 1)]);
+        // Los vecinos de los sectores malos se leen una vez en bloque y una individualmente.
+        assert_eq!((d.reads_of(9), d.reads_of(11)), (2, 2));
+    }
+
+    #[test]
+    fn ignore_all_never_retries_and_never_recovers() {
+        // El 3 fallaría 2 veces (el bloque consume una) y se recuperaría con un reintento; en
+        // modo «ignorar todo» queda `Unreadable`. El 5 falla sin código del sistema.
+        let p = ReadPolicy {
+            retries: 5,
+            ..fill_policy(8, 0, false)
+        };
+        let d = faulty(16).with_flaky(3, 2).with_bad([5]);
+        let g = collect(&d, 0, 16, &p);
+        assert_honest(&g, 0, 512, &p);
+        assert_eq!(
+            runs(&g),
+            vec![
+                (0, 3, Read),
+                (3, 1, Recovered),
+                (4, 1, Read),
+                (5, 1, Unreadable),
+                (6, 10, Read)
+            ]
+        );
+        assert_eq!(g.r.as_ref().unwrap().omitted_errors, 0);
+        let pi = ReadPolicy {
+            ignore_all_errors: true,
+            ..p.clone()
+        };
+        let d = faulty(16).with_flaky(3, 2).with_bad([5]);
+        let g = collect(&d, 0, 16, &pi);
+        assert_honest(&g, 0, 512, &pi);
+        assert_eq!(
+            runs(&g),
+            vec![
+                (0, 3, Read),
+                (3, 1, Unreadable),
+                (4, 1, Read),
+                (5, 1, Unreadable),
+                (6, 10, Read)
+            ]
+        );
+        let r = g.r.as_ref().unwrap();
+        assert_eq!((d.reads_of(3), d.reads_of(5)), (2, 2));
+        assert_eq!(r.map.count(Recovered), 0);
+        assert_eq!((r.omitted_errors, r.retry_reads), (2, 1));
+        // Errores sin código del sistema: no aparecen en la tabla de códigos.
+        assert!(r.error_codes.is_empty());
+        // La lista de códigos no afecta a errores sin código: sin «ignorar todo» se reintentan.
+        let pc = ReadPolicy {
+            skip_error_codes: vec![CRC],
+            ..p
+        };
+        let d = faulty(16).with_bad([5]);
+        let r = collect(&d, 0, 16, &pc).r.unwrap();
+        assert_eq!((d.reads_of(5), r.omitted_errors), (1 + 1 + 5, 0));
+    }
+
+    #[test]
+    fn omitted_errors_still_abort_in_strict_mode() {
+        for p in [
+            ReadPolicy {
+                ignore_all_errors: true,
+                retries: 4,
+                chunk_sectors: 16,
+                ..ReadPolicy::default()
+            },
+            ReadPolicy {
+                skip_error_codes: vec![CRC],
+                retries: 4,
+                chunk_sectors: 16,
+                ..ReadPolicy::default()
+            },
+        ] {
+            let d = faulty(64).with_bad_code([37], CRC);
+            match collect(&d, 0, 64, &p).r {
+                Err(e @ IoError::Read { offset, len, .. }) => {
+                    assert_eq!((offset, len), (37 * 512, 512));
+                    assert_eq!(e.os_error_code(), Some(CRC));
+                }
+                other => panic!("{other:?}"),
+            }
+            // Sin reintentos: bloque + un intento individual.
+            assert_eq!(d.reads_of(37), 2);
+        }
+    }
+
+    #[test]
+    fn omitted_errors_combine_with_jump_and_read_back() {
+        let p = ReadPolicy {
+            retries: 4,
+            skip_error_codes: vec![CRC],
+            ..fill_policy(1, 10, true)
+        };
+        let d = faulty(100).with_bad_code(20..=24, CRC);
+        let g = collect(&d, 0, 100, &p);
+        assert_honest(&g, 0, 512, &p);
+        assert_eq!(
+            runs(&g),
+            vec![
+                (0, 20, Read),
+                (20, 1, Unreadable),
+                (21, 3, Skipped),
+                (24, 1, Unreadable),
+                (25, 75, Read)
+            ]
+        );
+        let r = g.r.as_ref().unwrap();
+        // El 20 no se reintenta (sin omisión serían 1 + 1 + 4 lecturas).
+        assert_eq!(d.reads_of(20), 2);
+        // Los saltados no se leen; el 24 solo lo toca la lectura hacia atrás (un intento).
+        assert!(d.sectors_touched(21..24).is_empty());
+        assert_eq!(d.reads_of(24), 1);
+        assert_eq!(r.omitted_errors, 1);
+        // Se registra el código de ambos ilegibles, incluido el de la lectura hacia atrás.
+        assert_eq!(codes(r), vec![(CRC, 2)]);
+        // Sin lectura hacia atrás, todo el salto queda `Skipped` y sin leer.
+        let p = ReadPolicy {
+            ignore_all_errors: true,
+            ..fill_policy(1, 10, false)
+        };
+        let d = faulty(100).with_bad_code(20..=24, IO_DEVICE).with_bad([60]);
+        let g = collect(&d, 0, 100, &p);
+        assert_honest(&g, 0, 512, &p);
+        assert_eq!(
+            runs(&g),
+            vec![
+                (0, 20, Read),
+                (20, 1, Unreadable),
+                (21, 10, Skipped),
+                (31, 29, Read),
+                (60, 1, Unreadable),
+                (61, 10, Skipped),
+                (71, 29, Read)
+            ]
+        );
+        assert!(d.sectors_touched(21..31).is_empty());
+        assert!(d.sectors_touched(61..71).is_empty());
+        let r = g.r.unwrap();
+        assert_eq!((r.omitted_errors, codes(&r)), (2, vec![(IO_DEVICE, 1)]));
+    }
+
+    #[test]
+    fn omitted_errors_at_the_edges_of_the_range() {
+        // Rango 10–19 de un origen de 64 sectores, con errores omitidos en el primer y el último
+        // sector del rango y también fuera de él (que nunca se leen).
+        let d = faulty(64).with_bad_code([9, 10, 19, 20], CRC);
+        let p = ReadPolicy {
+            retries: 3,
+            skip_error_codes: vec![CRC],
+            ..fill_policy(4, 0, false)
+        };
+        let g = collect(&d, 10, 10, &p);
+        assert_honest(&g, 10, 512, &p);
+        assert_eq!(
+            runs(&g),
+            vec![(10, 1, Unreadable), (11, 8, Read), (19, 1, Unreadable)]
+        );
+        assert_eq!((d.reads_of(10), d.reads_of(19)), (2, 2));
+        assert_eq!((d.reads_of(9), d.reads_of(20)), (0, 0));
+        assert_eq!(g.r.as_ref().unwrap().omitted_errors, 2);
+        // Con salto mayor que el rango y lectura hacia atrás: el salto acaba en el final del rango
+        // y la lectura hacia atrás falla enseguida en el 19.
+        let d = faulty(64).with_bad_code([9, 10, 19, 20], CRC);
+        let p = ReadPolicy {
+            jump_sectors: 100,
+            read_back: true,
+            ..p
+        };
+        let g = collect(&d, 10, 10, &p);
+        assert_honest(&g, 10, 512, &p);
+        assert_eq!(
+            runs(&g),
+            vec![(10, 1, Unreadable), (11, 8, Skipped), (19, 1, Unreadable)]
+        );
+        // 11–13 solo los tocó la lectura del bloque 10–13 que falló; 14–18 nunca se leen.
+        for l in 11..14 {
+            assert_eq!(d.reads_of(l), 1, "sector {l}");
+        }
+        assert!(d.sectors_touched(14..19).is_empty());
+        assert_eq!((d.reads_of(9), d.reads_of(19), d.reads_of(20)), (0, 1, 0));
+        let r = g.r.unwrap();
+        assert_eq!((r.omitted_errors, codes(&r)), (1, vec![(CRC, 2)]));
+        // Rango de un solo sector ilegible.
+        let d = faulty(64).with_bad_code([63], CRC);
+        let p = ReadPolicy {
+            ignore_all_errors: true,
+            ..fill_policy(8, 5, true)
+        };
+        let g = collect(&d, 63, 1, &p);
+        assert_honest(&g, 63, 512, &p);
+        assert_eq!(runs(&g), vec![(63, 1, Unreadable)]);
+        assert_eq!(d.reads_of(63), 2);
+    }
+
+    #[test]
+    fn policy_omits_by_code_or_all() {
+        let err = |c: Option<i32>| IoError::Read {
+            offset: 0,
+            len: 512,
+            source: c.map_or_else(
+                || std::io::Error::other("x"),
+                std::io::Error::from_raw_os_error,
+            ),
+        };
+        let p = ReadPolicy {
+            skip_error_codes: vec![CRC, IO_DEVICE],
+            ..ReadPolicy::default()
+        };
+        assert!(p.omits(&err(Some(CRC))));
+        assert!(p.omits(&err(Some(IO_DEVICE))));
+        assert!(!p.omits(&err(Some(ACCESS_DENIED))));
+        assert!(!p.omits(&err(None)));
+        assert!(!p.omits(&IoError::Cancelled));
+        assert!(!ReadPolicy::default().omits(&err(Some(CRC))));
+        let all = ReadPolicy {
+            ignore_all_errors: true,
+            ..ReadPolicy::default()
+        };
+        assert!(all.omits(&err(None)));
+        assert!(all.omits(&err(Some(ACCESS_DENIED))));
+        assert_eq!(
+            IoError::Io(std::io::Error::from_raw_os_error(CRC)).os_error_code(),
+            Some(CRC)
+        );
     }
 
     #[test]
@@ -1213,6 +1531,8 @@ mod tests {
                 r: Ok(ReadReport {
                     sectors_requested: 8,
                     retry_reads: 0,
+                    omitted_errors: 0,
+                    error_codes: BTreeMap::new(),
                     map: {
                         let mut m = ValidityMap::new();
                         for (i, s) in states.iter().enumerate() {

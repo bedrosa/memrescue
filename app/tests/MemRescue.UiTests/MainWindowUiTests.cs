@@ -226,4 +226,29 @@ public sealed class MainWindowUiTests(TestImages images)
         app.WaitForLba(2);
         app.WaitUntil(() => range.Current.Value == 2d, "la barra de posición sincronizada con la LBA 2");
     }
+
+    [Fact]
+    public void Comprobacion_con_politica_de_errores()
+    {
+        using var app = AppSession.Launch(images.GptBasic);
+        ((SelectionItemPattern)app.ById("ChecksTab").GetCurrentPattern(SelectionItemPattern.Pattern)).Select();
+        string Results() => ((ValuePattern)app.ById("VerifyResults").GetCurrentPattern(ValuePattern.Pattern)).Current.Value;
+
+        app.SetText("SkipCodesBox", "1117, 23");
+        app.Invoke("VerifyStartButton");
+        app.WaitUntil(() => Results().Contains("Política de errores: sin reintentos para los códigos 23, 1117", StringComparison.Ordinal),
+            "el informe con la lista de códigos", TimeSpan.FromSeconds(60));
+        Assert.Contains("errores omitidos (ilegibles sin reintentar)  0", Results(), StringComparison.Ordinal);
+
+        var ignore = (TogglePattern)app.ById("IgnoreErrorsBox").GetCurrentPattern(TogglePattern.Pattern);
+        ignore.Toggle();
+        app.WaitUntil(() => !app.ById("SkipCodesBox").Current.IsEnabled, "la lista de códigos deshabilitada");
+        app.WaitUntil(() => app.ById("VerifyStartButton").Current.IsEnabled, "el botón Comprobar habilitado");
+        app.Invoke("VerifyStartButton");
+        app.WaitUntil(() => Results().Contains("Política de errores: ignorar todos los errores (sin reintentos)", StringComparison.Ordinal),
+            "el informe con «ignorar todo»", TimeSpan.FromSeconds(60));
+        Assert.Contains("ilegibles          0", Results(), StringComparison.Ordinal);
+        ignore.Toggle();
+        app.WaitUntil(() => app.ById("SkipCodesBox").Current.IsEnabled, "la lista de códigos habilitada de nuevo");
+    }
 }

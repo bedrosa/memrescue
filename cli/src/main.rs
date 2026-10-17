@@ -22,7 +22,8 @@ USO:
   memrescue-cli image-info <imagen> [ORIGEN] [--json]
   memrescue-cli split-list <imagen.001>
   memrescue-cli sectors <imagen> --lba N [--count M] [--retries N] [ORIGEN]
-  memrescue-cli verify <imagen> [--retries N] [--jump N] [--read-back] [ORIGEN] [--json]
+  memrescue-cli verify <imagen> [--retries N] [--jump N] [--read-back]
+                       [--skip-codes 23,1117] [--ignore-errors] [ORIGEN] [--json]
   memrescue-cli hash <imagen> [--algo crc32,md5,sha1,sha256] [ORIGEN] [--db trabajo.mrdb] [--json]
   memrescue-cli db-init <trabajo.mrdb>
   memrescue-cli jobs <trabajo.mrdb>
@@ -32,6 +33,11 @@ ORIGEN (opcional):
   --force-raw        leer como volcado sector a sector aunque parezca un contenedor
   --split            abrir la imagen dividida que empieza en <imagen.001> (ver split-list)
   --range INI:NUM    trabajar solo con NUM sectores desde el LBA INI (partición o rango)
+
+POLÍTICA DE ERRORES (verify):
+  --skip-codes LISTA códigos de error del sistema que no se reintentan (p. ej. 23,1117)
+  --ignore-errors    ignorar todos los errores: ningún sector se reintenta
+  Los sectores afectados quedan ILEGIBLES (patrón de relleno), nunca como datos.
 
 Formatos: RAW, VHD (fijo/dinámico), VHDX (fijo/dinámico), VMDK monolithicSparse e imágenes
 divididas. Tamaños de sector habituales: 512, 1024, 2048, 4096.
@@ -53,6 +59,38 @@ struct Args {
     range: Option<(u64, u64)>,
     jump: u64,
     read_back: bool,
+    /// Política de omisión de errores (`verify`).
+    skip_codes: Vec<i32>,
+    ignore_errors: bool,
+}
+
+/// Analiza `--skip-codes`: códigos positivos separados por comas (decimal o `0x…`), sin
+/// duplicados y como máximo 256.
+fn parse_skip_codes(v: &str) -> Result<Vec<i32>, String> {
+    let mut codes = Vec::new();
+    for part in v.split(',').map(str::trim).filter(|x| !x.is_empty()) {
+        let n = match part.strip_prefix("0x").or_else(|| part.strip_prefix("0X")) {
+            Some(h) => i32::from_str_radix(h, 16).ok(),
+            None => part.parse::<i32>().ok(),
+        };
+        match n {
+            Some(c) if c > 0 => codes.push(c),
+            _ => {
+                return Err(format!(
+                    "código de error no válido en --skip-codes: {part} (debe ser positivo)"
+                ))
+            }
+        }
+    }
+    codes.sort_unstable();
+    codes.dedup();
+    if codes.is_empty() {
+        return Err("--skip-codes necesita al menos un código".into());
+    }
+    if codes.len() > 256 {
+        return Err("--skip-codes admite como máximo 256 códigos".into());
+    }
+    Ok(codes)
 }
 
 fn num<T: std::str::FromStr>(
@@ -79,6 +117,8 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
         range: None,
         jump: 0,
         read_back: false,
+        skip_codes: Vec::new(),
+        ignore_errors: false,
     };
     while let Some(s) = it.next() {
         match s.as_str() {
@@ -88,6 +128,11 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
             "--retries" => a.retries = num(&mut it, "--retries")?,
             "--jump" => a.jump = num(&mut it, "--jump")?,
             "--read-back" => a.read_back = true,
+            "--skip-codes" => {
+                let v = it.next().ok_or("falta el valor de --skip-codes")?;
+                a.skip_codes = parse_skip_codes(&v)?;
+            }
+            "--ignore-errors" => a.ignore_errors = true,
             "--force-raw" => a.force_raw = true,
             "--split" => a.split = true,
             "--range" => {
@@ -299,6 +344,8 @@ fn run(args: Vec<String>) -> Result<(), (u8, String)> {
                     on_error: OnError::FillAndContinue,
                     jump_sectors: a.jump,
                     read_back: a.read_back,
+                    skip_error_codes: a.skip_codes.clone(),
+                    ignore_all_errors: a.ignore_errors,
                     ..ReadPolicy::default()
                 },
                 ..VerifyOptions::default()
@@ -333,13 +380,25 @@ fn run(args: Vec<String>) -> Result<(), (u8, String)> {
                     .iter()
                     .map(|&s| format!("\"{}\":{}", state_name(s), m.count(s)))
                     .collect();
+                // Política de errores aplicada y su efecto (IO-09).
+                let skip: Vec<String> = a.skip_codes.iter().map(i32::to_string).collect();
+                let codes: Vec<String> = r
+                    .error_codes
+                    .iter()
+                    .map(|(c, n)| format!("\"{c}\":{n}"))
+                    .collect();
                 println!(
-                    "{{\"sectors\":{},\"ok\":{ok},\"bad\":{bad},\"bad_ranges\":[{}],\"states\":{{{}}},\"untrusted_ranges\":[{}],\"ranges_truncated\":{}}}",
+                    "{{\"sectors\":{},\"ok\":{ok},\"bad\":{bad},\"bad_ranges\":[{}],\"states\":{{{}}},\"untrusted_ranges\":[{}],\"ranges_truncated\":{},\"error_policy\":{{\"retries\":{},\"skip_codes\":[{}],\"ignore_all\":{}}},\"omitted_errors\":{},\"error_codes\":{{{}}}}}",
                     r.sectors_requested,
                     ranges.join(","),
                     states.join(","),
                     untrusted_runs.join(","),
-                    m.truncated()
+                    m.truncated(),
+                    a.retries,
+                    skip.join(","),
+                    a.ignore_errors,
+                    r.omitted_errors,
+                    codes.join(",")
                 );
             } else {
                 println!(
@@ -349,6 +408,28 @@ fn run(args: Vec<String>) -> Result<(), (u8, String)> {
                 );
                 for s in SectorState::ALL {
                     println!("  {:<11} {}", state_label(s), m.count(s));
+                }
+                // Política de errores aplicada y su efecto (IO-09).
+                if a.ignore_errors {
+                    println!("Política de errores: ignorar todos (sin reintentos)");
+                } else if !a.skip_codes.is_empty() {
+                    let l: Vec<String> = a.skip_codes.iter().map(i32::to_string).collect();
+                    println!(
+                        "Política de errores: sin reintentos para los códigos {}",
+                        l.join(", ")
+                    );
+                }
+                if a.ignore_errors || !a.skip_codes.is_empty() {
+                    println!(
+                        "  errores omitidos (ilegibles sin reintentar): {}",
+                        r.omitted_errors
+                    );
+                }
+                if !r.error_codes.is_empty() {
+                    println!("Códigos de error del sistema en sectores ilegibles:");
+                    for (c, n) in &r.error_codes {
+                        println!("  código {c}: {n} sectores");
+                    }
                 }
                 if untrusted > 0 {
                     println!("Tramos NO fiables (el contenido es un patrón de relleno, no datos):");

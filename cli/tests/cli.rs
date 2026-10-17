@@ -216,3 +216,84 @@ fn hash_json_and_job_recorded() {
     let jobs = String::from_utf8_lossy(&j.stdout);
     assert!(jobs.contains("completed"), "{jobs}");
 }
+
+#[test]
+fn verify_error_policy_options() {
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("p.img");
+    std::fs::write(&img, vec![0u8; 256 * 512]).unwrap();
+    let f = img.to_str().unwrap();
+    let o = cli()
+        .args([
+            "verify",
+            f,
+            "--skip-codes",
+            "1117, 23,0x17",
+            "--retries",
+            "3",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        out.contains("\"sectors\":256,\"ok\":256,\"bad\":0"),
+        "{out}"
+    );
+    assert!(
+        out.contains(
+            "\"error_policy\":{\"retries\":3,\"skip_codes\":[23,1117],\"ignore_all\":false},\"omitted_errors\":0,\"error_codes\":{}"
+        ),
+        "{out}"
+    );
+    let o = cli()
+        .args([
+            "verify",
+            f,
+            "--ignore-errors",
+            "--jump",
+            "16",
+            "--read-back",
+            "--range",
+            "10:100",
+        ])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(out.contains("100 de 100"), "{out}");
+    assert!(
+        out.contains("Política de errores: ignorar todos (sin reintentos)"),
+        "{out}"
+    );
+    assert!(
+        out.contains("errores omitidos (ilegibles sin reintentar): 0"),
+        "{out}"
+    );
+    let o = cli()
+        .args(["verify", f, "--skip-codes", "23"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&o.stdout)
+        .contains("Política de errores: sin reintentos para los códigos 23"));
+    // Sin política no se muestra nada nuevo.
+    let o = cli().args(["verify", f]).output().unwrap();
+    assert!(!String::from_utf8_lossy(&o.stdout).contains("Política de errores"));
+    // Listas no válidas: uso incorrecto (código 2).
+    for bad in ["abc", "0", "-5", "23,,x", "", "0x"] {
+        let o = cli()
+            .args(["verify", f, "--skip-codes", bad])
+            .output()
+            .unwrap();
+        assert_eq!(o.status.code(), Some(2), "--skip-codes {bad:?}");
+    }
+    let many: Vec<String> = (1..=257).map(|i| i.to_string()).collect();
+    let o = cli()
+        .args(["verify", f, "--skip-codes", &many.join(",")])
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(2));
+    let o = cli().args(["verify", f, "--skip-codes"]).output().unwrap();
+    assert_eq!(o.status.code(), Some(2));
+}

@@ -637,8 +637,19 @@ public partial class MainWindow : Window
         }
         var retries = uint.Parse(((ComboBoxItem)RetriesBox.SelectedItem).Content.ToString()!, CultureInfo.InvariantCulture);
         var jump = ulong.Parse(((ComboBoxItem)JumpBox.SelectedItem).Content.ToString()!, CultureInfo.InvariantCulture);
-        await RunVerifyAsync(s, retries, jump, ReadBackBox.IsChecked == true && jump > 0);
+        var ignoreAll = IgnoreErrorsBox.IsChecked == true;
+        int[] skipCodes = [];
+        if (!ignoreAll && !ErrorCodeList.TryParse(SkipCodesBox.Text, out skipCodes, out var codeError))
+        {
+            MessageBox.Show(this, codeError, "MemRescue", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+        await RunVerifyAsync(s, retries, jump, ReadBackBox.IsChecked == true && jump > 0, skipCodes, ignoreAll);
     }
+
+    /// <summary>Con «ignorar todos los errores», la lista de códigos no tiene efecto.</summary>
+    private void IgnoreErrorsBox_Changed(object sender, RoutedEventArgs e) =>
+        SkipCodesBox.IsEnabled = IgnoreErrorsBox.IsChecked != true;
 
     private void VerifyCancel_Click(object sender, RoutedEventArgs e)
     {
@@ -646,8 +657,12 @@ public partial class MainWindow : Window
         Log("Cancelación de la comprobación de legibilidad solicitada.");
     }
 
-    internal async Task<VerifyReport?> RunVerifyAsync(SourceEntry s, uint retries, ulong jump = 0, bool readBack = false)
+    internal async Task<VerifyReport?> RunVerifyAsync(SourceEntry s, uint retries, ulong jump = 0, bool readBack = false,
+        IReadOnlyCollection<int>? skipCodes = null, bool ignoreAll = false)
     {
+        var policy = ignoreAll ? "ignorar todos los errores (sin reintentos)"
+            : skipCodes is { Count: > 0 } ? $"sin reintentos para los códigos {ErrorCodeList.Format(skipCodes)}"
+            : null;
         VerifyStartButton.IsEnabled = false;
         VerifyCancelButton.IsEnabled = true;
         VerifyResults.Clear();
@@ -655,10 +670,12 @@ public partial class MainWindow : Window
         _verifyCts = new CancellationTokenSource();
         var started = DateTime.Now;
         Log($"Comprobando la legibilidad de {s.FileName} ({s.Info.SectorCount:N0} sectores, {retries} reintentos" +
-            (jump > 0 ? $", salto de {jump} sectores{(readBack ? " con lectura hacia atrás" : "")}" : "") + ")…");
+            (jump > 0 ? $", salto de {jump} sectores{(readBack ? " con lectura hacia atrás" : "")}" : "") +
+            (policy is null ? "" : $", política de errores: {policy}") + ")…");
         try
         {
-            using var task = s.Source.StartVerify(retries: retries, jumpSectors: jump, readBack: readBack);
+            using var task = s.Source.StartVerify(retries: retries, jumpSectors: jump, readBack: readBack,
+                skipErrorCodes: skipCodes, ignoreAllErrors: ignoreAll);
             var progress = new Progress<TaskProgress>(p =>
             {
                 VerifyProgress.Value = p.Fraction;
@@ -681,6 +698,15 @@ public partial class MainWindow : Window
             sb.AppendLine(CultureInfo.CurrentCulture, $"  ilegibles          {r.SectorsUnreadable:N0}");
             sb.AppendLine(CultureInfo.CurrentCulture, $"  saltados           {r.SectorsSkipped:N0}");
             sb.AppendLine(CultureInfo.CurrentCulture, $"Lecturas repetidas:  {r.RetryReads:N0}");
+            if (policy is not null)
+            {
+                sb.AppendLine(CultureInfo.CurrentCulture, $"Política de errores: {policy}");
+                sb.AppendLine(CultureInfo.CurrentCulture, $"  errores omitidos (ilegibles sin reintentar)  {r.OmittedErrors:N0}");
+            }
+            foreach (var c in r.ErrorCodes)
+            {
+                sb.AppendLine(CultureInfo.CurrentCulture, $"  código de error {c.Code}: {c.Sectors:N0} sectores ilegibles");
+            }
             foreach (var b in r.UntrustedRanges)
             {
                 sb.AppendLine(CultureInfo.CurrentCulture, $"  LBA {b.Lba:N0} – {b.Lba + b.Count - 1:N0} ({b.Count:N0} sectores, {b.State.Label()})");
