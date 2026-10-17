@@ -180,8 +180,31 @@ FFI provisionales (dañado → E/S) sustituidos por 12/13/14.
   cubierta por pruebas léxicas, de uniones y por la verificación de atributos tras abrir.
 - Las pruebas de UI necesitan una sesión de escritorio desbloqueada; no cubren diálogos modales.
 
+## Etapa 6 · Repositorio público, auditoría y seguimiento por issues (2026-10-17)
+
+**Auditoría de publicación** (ficheros versionados, historial, ramas, issues, milestones, labels y
+descripción del repositorio):
+
+| Comprobación | Resultado |
+|---|---|
+| Rutas personales, nombre de usuario, correos privados | 0 en los 4 commits de `main` y en GitHub |
+| Credenciales y tokens | 0 |
+| Material de la herramienta de referencia (decompilado, volcados del ejecutable) | 0 ficheros versionados; se conservan solo en local |
+| Carácter U+2014 | 0 en ficheros, commits, issues, comentarios, milestones, labels y descripción (issue #2) |
+| Identidad de los commits | Dirección `noreply` de GitHub, sin trailers de coautoría |
+| Binarios versionados | Solo el icono propio, reproducible con `tools/make_icon.py` |
+
+La limpieza del carácter U+2014 sustituyó 224 apariciones en 28 ficheros (dos puntos, coma o, en celdas
+vacías de tablas, `-`); el resto del contenido no cambió. Verificado con `scripts\test.ps1`: 13/13 pasos.
+
+**GitHub**: repositorio público `bedrosa/memrescue`; `main` protegida (PR obligatoria sin aprobación de
+terceros, sin push directo, sin force push ni borrado, historial lineal, conversaciones resueltas, sin
+excepciones para administradores); fusión solo por squash o rebase; auto-merge desactivado; token de
+Actions de solo lectura; escaneo de secretos con bloqueo en el push. 30 issues (#1 a #30) con labels de
+tipo, prioridad y área y milestones M1 a M12. Decisión del propietario sobre contenedores con tablas de
+asignación dañadas (issue #4): modo estricto por defecto y modo tolerante solo por activación explícita.
+
 ## Siguiente tarea (pendiente de revisión del propietario; no se avanza a M2)
 
-1. Revisión de M1-iteración 2.
-2. Decidir los pendientes de M1 (`ROADMAP.md`): IO-09, `NullDevice`, diferenciales/streamOptimized y la
-   política ante tablas parcialmente dañadas.
+1. Integrar la CI (#1) y exigir sus checks en `main` cuando hayan pasado en GitHub Actions.
+2. Completar M1 según los issues del milestone M1 (prioridad: #3, #4, #5, #6).
