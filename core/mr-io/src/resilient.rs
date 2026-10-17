@@ -35,6 +35,10 @@ use crate::{
     MAX_READ_REQUEST,
 };
 
+/// Máximo de reintentos por sector que aplica el lector, sea cual sea `ReadPolicy::retries`
+/// (el mismo límite que validan la FFI y la CLI).
+pub const MAX_RETRIES: u32 = 100;
+
 /// Qué hacer con un sector que no se puede leer tras los reintentos.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnError {
@@ -48,7 +52,7 @@ pub enum OnError {
 pub struct ReadPolicy {
     /// Sectores por petición de lectura normal (se acota a `MAX_READ_REQUEST`).
     pub chunk_sectors: u32,
-    /// Reintentos adicionales por sector tras un fallo.
+    /// Reintentos adicionales por sector tras un fallo (el lector los acota a [`MAX_RETRIES`]).
     pub retries: u32,
     pub on_error: OnError,
     /// Patrón de 4 bytes con que se rellenan los sectores ilegibles (`Unreadable`).
@@ -507,6 +511,7 @@ where
     fn data_run(&mut self, lba: u64, c: u64) -> Result<Option<u64>> {
         let dev = self.dev;
         let policy = self.policy;
+        let retries = policy.retries.min(MAX_RETRIES);
         let buf = self.out.append(lba, c, SectorState::Read, [0; 4])?;
         if dev.read_sectors(lba, c, buf).is_ok() {
             return Ok(None);
@@ -524,7 +529,7 @@ where
                         self.omitted_errors += 1;
                         break Err(e);
                     }
-                    Err(e) if attempt >= policy.retries => break Err(e),
+                    Err(e) if attempt >= retries => break Err(e),
                     Err(_) => {
                         attempt += 1;
                         self.retry_reads += 1;
@@ -958,6 +963,21 @@ mod tests {
         let g = collect(&d, 0, 16, &pf);
         assert_honest(&g, 0, 512, &pf);
         assert_eq!(g.r.unwrap().map.count(Unreadable), 1);
+    }
+
+    #[test]
+    fn retries_are_capped_at_max_retries() {
+        // Un sector siempre ilegible con `retries` desmesurado: bloque + 1 + MAX_RETRIES lecturas.
+        let d = faulty(8).with_bad([2]);
+        let p = ReadPolicy {
+            retries: u32::MAX,
+            ..fill_policy(8, 0, false)
+        };
+        let g = collect(&d, 0, 8, &p);
+        let r = g.r.unwrap();
+        assert_eq!(r.map.count(Unreadable), 1);
+        assert_eq!(d.reads_of(2), 2 + u64::from(MAX_RETRIES));
+        assert_eq!(r.retry_reads, 1 + u64::from(MAX_RETRIES));
     }
 
     /// Códigos de error del sistema de Windows usados en las pruebas (simulados).

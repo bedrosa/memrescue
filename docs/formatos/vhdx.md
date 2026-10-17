@@ -69,8 +69,15 @@ Todo error de E/S del fichero se devuelve como `IoError::Read`; no hay pánicos 
   obsoletos; rechazarlo es lo seguro. Las cabeceras antiguas con LogGuid ≠ 0 pero menor secuencia
   no afectan.
 - **Tablas de regiones**: se toma la primera copia válida; no se exige que ambas coincidan.
-- **UNDEFINED/UNMAPPED** se leen como ceros (la especificación permite contenido arbitrario; ceros es
-  la interpretación conservadora y coincide con qemu).
+- **UNDEFINED/UNMAPPED** se entregan como **dispersos** (`Allocation::Sparse`, ceros; en el mapa de
+  validez, estado `Sparse`), igual que `qemu-img` (que los convierte a RAW como ceros). Motivos: solo
+  se abren discos sin padre (HasParent es `ExternalReference`), así que no hay otro disco del que
+  heredar el contenido; la especificación declara indefinido el contenido de un bloque UNDEFINED y
+  permite que uno UNMAPPED se lea como ceros o como datos anteriores, de modo que ningún contenido es
+  «el del disco». No son daño (no se marcan `Unreadable`) ni datos (no se lee el desplazamiento que
+  pudiera conservar la entrada, que podría apuntar a datos obsoletos o a otro bloque). Consecuencia
+  para la recuperación: los restos que un bloque UNMAPPED (descartado con TRIM) aún conserve en el
+  fichero no se exponen por esta vía; quedan al alcance de un análisis del fichero VHDX como RAW.
 - Bits reservados de la BAT (3–19) no se validan, para no rechazar imágenes de otros escritores.
 - El último bloque solo necesita estar en el fichero en la parte que cubre el tamaño virtual.
 

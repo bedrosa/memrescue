@@ -42,3 +42,6 @@ all = { level = "warn", priority = -1 }
 [profile.release]
 debug = 1
 lto = "thin"
+# Un desbordamiento aritmético en Release es un pánico (capturado en la FFI), nunca un valor
+# truncado en silencio que acabe en un desplazamiento o tamaño erróneo.
+overflow-checks = true

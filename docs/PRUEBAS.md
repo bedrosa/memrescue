@@ -112,6 +112,24 @@ verificación termina con el bloque `Unreadable` y los demás estados correctos,
 aborta con la posición exacta. VHDX y VMDK no necesitan prueba equivalente: su `allocation` no lee del
 fichero (mapas cargados al abrir).
 
+Endurecimiento de la capa de bloques (issue #40): `core/mr-image/tests/corruption.rs` (8 pruebas, ≈20 s
+en perfil de depuración) con contenedores sintéticos construidos en la propia prueba según las
+especificaciones públicas: **inversión aleatoria determinista** de 1 a 4 bytes (semillas fijas; 300
+iteraciones en VHDX, la mitad con las CRC-32C de cabeceras y tablas de regiones recalculadas; 400 en VMDK;
+200 en una imagen dividida), **truncado en cada frontera de estructura** a ±1 byte (VHDX: identificador,
+cabeceras, tablas de regiones, registro, tabla y elementos de metadatos, BAT, bloques; VMDK: cabecera,
+descriptor, GD, GT, granos) y **fichero acortado después de abrir** (VHDX, VMDK y dividida). Se comprueba
+que abrir devuelve `Ok` o un error tipado sin pánicos (un vigilante de tiempo convierte un bloqueo en
+fallo); que lo que el modo estricto abre se lee entero y que estricto y tolerante leen igual cuando el
+estricto abre; que el lector resiliente marca `Unreadable` exactamente los sectores cuya lectura directa
+falla y nunca entrega datos de lo rechazado; que lo truncado o acortado se lee como el original o da
+error (nunca otro contenido); y que el fichero de origen no cambia. Además: `ReadPolicy.retries` se acota
+a `resilient::MAX_RETRIES` (100) dentro del lector (`retries_are_capped_at_max_retries`), apertura de una
+imagen dividida con `MAX_SEGMENTS` segmentos y un repetido al final
+(`open_with_max_segments_and_late_duplicate_is_fast`, comprobación de repetidos con `HashSet`), consulta
+O(1) de 10 000 tramos no fiables por la FFI (`untrusted_ranges_are_indexed_in_constant_time`) y el perfil
+Release compila con `overflow-checks = true` (`cargo test --release --workspace` pasa con ellas).
+
 **Integración continua** (`.github/workflows/ci.yml`, detalle en `CONTRIBUTING.md`): las mismas
 comprobaciones se ejecutan en GitHub Actions en cada rama `feat/` o `fix/` y en cada PR, más la auditoría
 de higiene del repositorio (`tools/check_repo_hygiene.py`: rutas personales, correos, credenciales,
