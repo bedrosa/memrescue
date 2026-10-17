@@ -299,3 +299,46 @@ validaban al leerlos): una imagen con esos daños se rechaza en la apertura. Las
 cambian (pruebas contra qemu-img). Memoria: VMDK guarda las GT presentes (≤ `MAX_TABLE_BYTES`); la
 detección de solapes usa 8 bytes por entrada asignada durante la apertura. Detalle por formato en
 `formatos/vhd.md`, `formatos/vhdx.md` y `formatos/vmdk.md`.
+
+---
+
+## ADR-021 · Patrones de relleno configurables y colores por estado en el visor (Aceptada, 2026-10-17)
+
+**Contexto.** Issue #7 (IO-08, HX-01). Los rellenos de sectores ilegibles (`BAD!`) y saltados (`SKIP`)
+eran fijos y el visor solo distinguía el estado por texto. Se pide configurarlos desde la interfaz, de
+forma persistente, y colorear cada sector según su estado sin que el relleno pueda pasar por datos.
+
+**Decisión.**
+1. **Motor y ABI.** Nueva función `mr_source_read_mapped_ex` con `mr_read_options` (32 bytes,
+   `struct_size` como `mr_verify_options`): reintentos, salto, lectura hacia atrás (`MR_READ_READ_BACK`),
+   `bad_fill[4]` y `skip_fill[4]`. Ampliación compatible de la ABI 3: `mr_source_read_mapped` conserva su
+   firma y su comportamiento (`BAD!`, sin salto). En Rust: `mr_api::read_sectors_mapped_with` y
+   `MappedReadOptions`; en C#: parámetros opcionales de `Source.ReadSectorsMapped`.
+2. **Regla de admisión** (motor, CLI e interfaz, misma regla): ningún patrón puede tener sus cuatro bytes
+   iguales y ilegibles y saltados deben usar patrones distintos. `00 00 00 00` se confundiría con los
+   sectores dispersos (ceros legítimos) y con datos a cero; `FF FF FF FF`, `E5 E5 E5 E5`, `F6 F6 F6 F6` y
+   similares son rellenos habituales en discos reales (flash borrada, formateo). El motor rechaza el par
+   con `MR_ERR_INVALID_ARGUMENT` antes de leer. La regla solo evita volcados engañosos: la autoridad
+   sigue siendo el estado de cada sector (ADR-019) y un patrón que aparezca en los datos del origen sigue
+   siendo `Read`.
+3. **Verificación sin rellenos configurables.** La verificación no entrega datos (solo recuentos y mapa de
+   tramos), así que el patrón no cambia su resultado; `mr_verify_options` no se amplía. Los hashes siguen
+   siendo estrictos y nunca incluyen relleno, sea cual sea el patrón (pruebas en mr-api, mr-ffi y C#).
+4. **Preferencias por usuario.** `%APPDATA%\MemRescue\settings.json` (JSON con los patrones en 8 dígitos
+   hexadecimales, sin ambigüedad), sustituible con la variable de entorno `MEMRESCUE_SETTINGS_DIR` (las
+   pruebas la usan siempre: nunca escriben en el perfil real). Escritura atómica (temporal + sustitución);
+   un fichero ausente, dañado, desmesurado (> 64 KiB) o con patrones no admitidos se ignora con un aviso en
+   el registro y se usan los valores por defecto, sin sobrescribirlo hasta que el usuario guarde. Nunca se
+   escribe junto a las imágenes.
+5. **Visor.** Un bloque por sector con fondo y texto según su estado (`SectorStatePalette`, contraste
+   ≥ 7:1 comprobado por prueba), barra lateral gruesa en los no fiables, cabecera con el estado en texto,
+   línea «!! SECTOR NO FIABLE … PATRÓN DE RELLENO <patrón> … NO datos del origen», fila de estados por
+   sector (`SectorState<LBA>`) y leyenda (`Legend<Estado>`, `FillPatternsText`). El color nunca es la
+   única señal. Con un tema de alto contraste se usan solo colores del sistema (resaltado para los no
+   fiables) y el texto distingue los estados.
+
+**Consecuencias.** El visor lee siempre con `mr_source_read_mapped_ex` y los patrones guardados. Sin salto
+en el visor, los sectores `Skipped` solo aparecen en lecturas con salto (CLI `sectors --jump`, API); la
+paleta y los textos ya los cubren. El volcado pasa de `TextBox` a `RichTextBox` con el mismo
+`AutomationId` (`HexView`); UI Automation lo lee con `TextPattern`. Detalle en
+`formatos/mapa-de-validez.md` y `API_FFI.md`.

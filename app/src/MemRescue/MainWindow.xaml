@@ -45,9 +45,12 @@
                 <Separator />
                 <MenuItem Header="_Salir" Click="Exit_Click" InputGestureText="Alt+F4" />
             </MenuItem>
-            <MenuItem Header="_Herramientas">
+            <MenuItem Header="_Herramientas" AutomationProperties.AutomationId="ToolsMenu">
                 <MenuItem Header="Calcular _hashes del origen…" Click="ShowChecksTab_Click" />
                 <MenuItem Header="Comprobar _legibilidad (leer todos los sectores)…" Click="ShowChecksTab_Click" />
+                <MenuItem Header="_Patrones de relleno de sectores no fiables…" AutomationProperties.AutomationId="FillPatternsMenuItem"
+                          Click="FillPatterns_Click"
+                          ToolTip="Patrones de 4 bytes con que se rellenan los sectores ilegibles y saltados (nunca son datos del origen)" />
                 <Separator />
                 <MenuItem Header="_Escaneo completo…" IsEnabled="False" InputGestureText="(M6)" ToolTip="Pendiente (hito M6)" />
                 <MenuItem Header="Todo lo encontrado / _FS virtual…" IsEnabled="False" InputGestureText="(M6)" ToolTip="Pendiente (hito M6)" />
@@ -191,6 +194,12 @@
                             <TextBlock x:Name="UntrustedBannerText" Foreground="#FFB71C1C" FontWeight="SemiBold" TextWrapping="Wrap"
                                        AutomationProperties.AutomationId="UntrustedBannerText" />
                         </Border>
+                        <!-- Estado de cada sector de la página (texto + color; también para UI Automation). -->
+                        <WrapPanel x:Name="SectorStatesPanel" DockPanel.Dock="Top" Margin="0,0,0,4" />
+                        <!-- Leyenda de colores y patrones de relleno en uso. -->
+                        <WrapPanel x:Name="StateLegend" DockPanel.Dock="Bottom" Margin="0,4,0,0">
+                            <TextBlock Text="Leyenda:" VerticalAlignment="Center" Margin="0,0,6,0" Foreground="{StaticResource MutedBrush}" />
+                        </WrapPanel>
                         <Grid>
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="*" />
@@ -198,11 +207,18 @@
                             </Grid.ColumnDefinitions>
                             <TextBlock x:Name="NoSourceSectorsText" Text="Abra una imagen de disco (Disco → Abrir imagen…, Ctrl+O) para ver sus sectores."
                                        Foreground="{StaticResource MutedBrush}" TextWrapping="Wrap" Margin="4" />
-                            <TextBox x:Name="HexView" IsReadOnly="True" FontFamily="Consolas" FontSize="13"
-                                     TextWrapping="NoWrap" AcceptsReturn="True" BorderThickness="1"
-                                     BorderBrush="{StaticResource BorderBrush}"
-                                     HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto"
-                                     PreviewKeyDown="HexView_PreviewKeyDown" Visibility="Collapsed" />
+                            <!--
+                                Volcado con un bloque coloreado por sector según su estado (ver SectorStatePalette).
+                                El color nunca es la única señal: cada bloque conserva su cabecera con el estado y
+                                los no fiables, la línea «!! SECTOR NO FIABLE» y una barra lateral gruesa.
+                            -->
+                            <RichTextBox x:Name="HexView" IsReadOnly="True" IsReadOnlyCaretVisible="True" FontFamily="Consolas" FontSize="13"
+                                         AutomationProperties.AutomationId="HexView" BorderThickness="1"
+                                         BorderBrush="{StaticResource BorderBrush}"
+                                         HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto"
+                                         PreviewKeyDown="HexView_PreviewKeyDown" Visibility="Collapsed">
+                                <FlowDocument PagePadding="2" />
+                            </RichTextBox>
                             <ScrollBar x:Name="LbaScrollBar" Grid.Column="1" Orientation="Vertical" Minimum="0" Maximum="0"
                                        SmallChange="1" Visibility="Collapsed" Margin="2,0,0,0"
                                        AutomationProperties.AutomationId="LbaScrollBar"

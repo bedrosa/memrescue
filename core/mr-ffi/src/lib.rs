@@ -51,6 +51,8 @@ pub const MR_VERIFY_IGNORE_ALL_ERRORS: u32 = 2;
 /// Máximo de códigos de error a omitir en `MrVerifyOptions::skip_codes`.
 pub const MAX_SKIP_CODES: u32 = 256;
 pub const MR_ERR_PANIC: i32 = 99;
+/// `mr_read_options.flags`: tras un salto, leer hacia atrás hasta el siguiente error.
+pub const MR_READ_READ_BACK: u32 = 1;
 
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]
@@ -108,6 +110,26 @@ pub struct MrVerifyOptions {
     pub skip_code_count: u32,
     /// Códigos de error del sistema que no se reintentan (positivos); nulo si `skip_code_count` = 0.
     pub skip_codes: *const i32,
+}
+
+/// Opciones de `mr_source_read_mapped_ex` (32 bytes). Mismo esquema de versión que
+/// `MrVerifyOptions`: `struct_size` = `sizeof(mr_read_options)` de la cabecera del llamador.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct MrReadOptions {
+    pub struct_size: u32,
+    /// `MR_READ_READ_BACK`; otros bits se rechazan.
+    pub flags: u32,
+    /// Sectores que se marcan saltados tras cada ilegible (0 = sin salto).
+    pub jump_sectors: u64,
+    /// Reintentos por sector (0–100).
+    pub retries: u32,
+    /// Relleno de los sectores ilegibles (estado 2), repetido cada 4 bytes.
+    pub bad_fill: [u8; 4],
+    /// Relleno de los sectores saltados (estado 3), repetido cada 4 bytes.
+    pub skip_fill: [u8; 4],
+    /// Reservado: debe ser 0.
+    pub reserved: u32,
 }
 
 thread_local! {
@@ -551,6 +573,7 @@ pub unsafe extern "C" fn mr_source_open_range(
 /// Lectura tolerante para el visor: `buf` recibe los datos (relleno en los ilegibles) y `states`
 /// un byte por sector con su estado (0 leído, 1 recuperado, 2 ilegible, 3 saltado, 4 disperso).
 /// Devuelve `MR_OK` aunque haya sectores ilegibles: el llamador **debe** consultar `states`.
+/// Rellenos por defecto (`BAD!`); sin salto.
 ///
 /// # Safety
 /// `buf` con `cap` bytes y `states` con `states_cap` bytes escribibles; `out_len` válido o nulo.
@@ -568,48 +591,134 @@ pub unsafe extern "C" fn mr_source_read_mapped(
     out_len: *mut usize,
 ) -> i32 {
     guard(|| {
-        if retries > MAX_RETRIES {
+        let opts = mr_api::MappedReadOptions {
+            retries,
+            ..mr_api::MappedReadOptions::default()
+        };
+        // SAFETY: mismo contrato que esta función.
+        unsafe {
+            read_mapped(
+                source_h, lba, count, &opts, buf, cap, states, states_cap, out_len,
+            )
+        }
+    })
+}
+
+/// Lectura tolerante con opciones: como `mr_source_read_mapped`, con salto tras cada ilegible,
+/// lectura hacia atrás y **patrones de relleno configurables**. Los patrones no pueden tener sus
+/// cuatro bytes iguales (`00 00 00 00` incluido) ni coincidir entre sí (`MR_ERR_INVALID_ARGUMENT`).
+///
+/// # Safety
+/// `options` válido; `buf` con `cap` bytes y `states` con `states_cap` bytes escribibles; `out_len`
+/// válido o nulo.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn mr_source_read_mapped_ex(
+    source_h: u64,
+    lba: u64,
+    count: u32,
+    options: *const MrReadOptions,
+    buf: *mut u8,
+    cap: usize,
+    states: *mut u8,
+    states_cap: usize,
+    out_len: *mut usize,
+) -> i32 {
+    guard(|| {
+        if options.is_null() {
+            return fail(MR_ERR_INVALID_ARGUMENT, "puntero nulo");
+        }
+        // Se lee primero solo `struct_size`, para no leer más allá de una estructura más pequeña.
+        // SAFETY: `options` no es nulo y contiene al menos su primer campo.
+        let size = unsafe { options.cast::<u32>().read_unaligned() };
+        let expected = std::mem::size_of::<MrReadOptions>();
+        if size as usize != expected {
             return fail(
                 MR_ERR_INVALID_ARGUMENT,
-                "demasiados reintentos (máximo 100)",
+                format!("tamaño de mr_read_options no válido: {size} (se esperaba {expected})"),
             );
         }
-        let s = match source(source_h) {
-            Ok(s) => s,
-            Err(c) => return c,
+        // SAFETY: el tamaño declarado coincide con el de la estructura.
+        let o = unsafe { options.read_unaligned() };
+        if o.flags & !MR_READ_READ_BACK != 0 || o.reserved != 0 {
+            return fail(MR_ERR_INVALID_ARGUMENT, "opciones de lectura no válidas");
+        }
+        let opts = mr_api::MappedReadOptions {
+            retries: o.retries,
+            jump_sectors: o.jump_sectors,
+            read_back: o.flags & MR_READ_READ_BACK != 0,
+            bad_fill: o.bad_fill,
+            skip_fill: o.skip_fill,
         };
-        let len = match mr_io::sector_span(s.as_ref(), lba, u64::from(count)) {
-            Ok((_, len)) => len,
-            Err(e) => return fail(io_error_code(&e), e.to_string()),
-        };
-        if !out_len.is_null() {
-            // SAFETY: puntero válido por contrato.
-            unsafe { *out_len = len };
-        }
-        let n = count as usize;
-        if buf.is_null() || cap < len || states.is_null() || states_cap < n {
-            return fail(
-                MR_ERR_BUFFER_TOO_SMALL,
-                format!("se necesitan {len} bytes de datos y {n} de estados"),
-            );
-        }
-        let (data, st) =
-            match mr_api::read_sectors_mapped(s.as_ref(), lba, u64::from(count), retries) {
-                Ok(v) => v,
-                Err(e) => return api_fail(&e),
-            };
-        if data.len() != len || st.len() != n {
-            return fail(MR_ERR_IO, "lectura incompleta del motor");
-        }
-        // SAFETY: `buf` tiene ≥ len bytes y `states` ≥ n bytes escribibles (comprobado arriba).
+        // SAFETY: mismo contrato que esta función.
         unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), buf, len);
-            for (i, v) in st.iter().enumerate() {
-                *states.add(i) = state_code(*v);
-            }
+            read_mapped(
+                source_h, lba, count, &opts, buf, cap, states, states_cap, out_len,
+            )
         }
-        MR_OK
     })
+}
+
+/// Cuerpo común de las lecturas tolerantes.
+///
+/// # Safety
+/// `buf` con `cap` bytes y `states` con `states_cap` bytes escribibles; `out_len` válido o nulo.
+#[allow(clippy::too_many_arguments)]
+unsafe fn read_mapped(
+    source_h: u64,
+    lba: u64,
+    count: u32,
+    opts: &mr_api::MappedReadOptions,
+    buf: *mut u8,
+    cap: usize,
+    states: *mut u8,
+    states_cap: usize,
+    out_len: *mut usize,
+) -> i32 {
+    if opts.retries > MAX_RETRIES {
+        return fail(
+            MR_ERR_INVALID_ARGUMENT,
+            "demasiados reintentos (máximo 100)",
+        );
+    }
+    if let Err(e) = mr_io::resilient::validate_fill_patterns(opts.bad_fill, opts.skip_fill) {
+        return fail(MR_ERR_INVALID_ARGUMENT, e.to_string());
+    }
+    let s = match source(source_h) {
+        Ok(s) => s,
+        Err(c) => return c,
+    };
+    let len = match mr_io::sector_span(s.as_ref(), lba, u64::from(count)) {
+        Ok((_, len)) => len,
+        Err(e) => return fail(io_error_code(&e), e.to_string()),
+    };
+    if !out_len.is_null() {
+        // SAFETY: puntero válido por contrato.
+        unsafe { *out_len = len };
+    }
+    let n = count as usize;
+    if buf.is_null() || cap < len || states.is_null() || states_cap < n {
+        return fail(
+            MR_ERR_BUFFER_TOO_SMALL,
+            format!("se necesitan {len} bytes de datos y {n} de estados"),
+        );
+    }
+    let (data, st) = match mr_api::read_sectors_mapped_with(s.as_ref(), lba, u64::from(count), opts)
+    {
+        Ok(v) => v,
+        Err(e) => return api_fail(&e),
+    };
+    if data.len() != len || st.len() != n {
+        return fail(MR_ERR_IO, "lectura incompleta del motor");
+    }
+    // SAFETY: `buf` tiene ≥ len bytes y `states` ≥ n bytes escribibles (comprobado arriba).
+    unsafe {
+        std::ptr::copy_nonoverlapping(data.as_ptr(), buf, len);
+        for (i, v) in st.iter().enumerate() {
+            *states.add(i) = state_code(*v);
+        }
+    }
+    MR_OK
 }
 
 /// Lee `count` sectores desde `lba` en `buf` (al menos `count × sector_size` bytes).

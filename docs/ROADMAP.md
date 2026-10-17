@@ -68,7 +68,9 @@ Pendiente en M1 (no se avanza a M2 sin revisión del propietario):
   confirmación y aviso en la interfaz); los bloques descartados se entregan como ilegibles.
 - VHD/VHDX diferenciales, VHDX con registro pendiente, VMDK streamOptimized / multiextensión / flat
   (exigen abrir otros ficheros con confirmación explícita del usuario o descomprimir).
-- Patrones de relleno configurables desde la interfaz; colores por estado dentro del volcado.
+- ✔ Patrones de relleno configurables desde la interfaz (preferencias por usuario) y colores por estado
+  dentro del volcado (issue #7, ADR-021): `mr_source_read_mapped_ex` sin cambiar la ABI 3, CLI
+  `sectors --bad-fill/--skip-fill`, leyenda y estados por sector accesibles.
 
 - **Paridad objetivo**: IM-01, IM-02, IM-03, IM-04, IM-05, IO-06…IO-09 (simulados).
 

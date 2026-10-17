@@ -4,7 +4,10 @@ using System.IO;
 using System.Text;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Automation;
+using System.Windows.Documents;
 using System.Windows.Input;
+using System.Windows.Media;
 using MemRescue.Core.Interop;
 using Microsoft.Win32;
 
@@ -43,17 +46,33 @@ public partial class MainWindow : Window
     private int _pageRequest;
     private bool _syncingScroll;
 
+    /// <summary>Preferencias del usuario (patrones de relleno). Nunca se guardan junto a las imágenes.</summary>
+    private readonly SettingsStore _settingsStore = SettingsStore.ForCurrentUser();
+    private UserSettings _settings;
+
+    /// <summary>Texto plano del volcado mostrado (copiar al portapapeles, autodiagnóstico).</summary>
+    private string _hexText = "";
+
     public MainWindow()
     {
         InitializeComponent();
         SourcesList.ItemsSource = _sources;
         EngineStatusText.Text = $"Motor {Engine.EngineVersion} · ABI {Engine.AbiVersion}";
         Log($"Motor cargado: versión {Engine.EngineVersion}, ABI {Engine.AbiVersion}.");
+        _settings = _settingsStore.Load(out var settingsWarning);
+        if (settingsWarning is not null)
+        {
+            Log($"Aviso: {settingsWarning} ({_settingsStore.Path})");
+        }
+        Log($"Patrones de relleno: ilegibles {_settings.BadFill.Describe()}, saltados {_settings.SkipFill.Describe()}.");
+        BuildLegend();
         InputBindings.Add(new KeyBinding(ApplicationCommands.Close, Key.F4, ModifierKeys.Control));
         PreviewKeyDown += Window_PreviewKeyDown;
         ContentRendered += OnContentRendered;
+        SystemParameters.StaticPropertyChanged += SystemParameters_Changed;
         Closed += (_, _) =>
         {
+            SystemParameters.StaticPropertyChanged -= SystemParameters_Changed;
             foreach (var s in _sources)
             {
                 s.Dispose();
@@ -347,7 +366,8 @@ public partial class MainWindow : Window
         LbaScrollBar.Visibility = PropsGrid.Visibility;
         if (s is null)
         {
-            HexView.Clear();
+            SetHexMessage("");
+            SectorStatesPanel.Children.Clear();
             SectorInfoText.Text = "";
             PositionText.Text = "";
             UntrustedBanner.Visibility = Visibility.Collapsed;
@@ -394,7 +414,8 @@ public partial class MainWindow : Window
         var total = s.Info.SectorCount;
         if (total == 0)
         {
-            HexView.Text = "(la imagen tiene menos de un sector completo)";
+            SetHexMessage("(la imagen tiene menos de un sector completo)");
+            SectorStatesPanel.Children.Clear();
             SectorInfoText.Text = "";
             return false;
         }
@@ -403,29 +424,15 @@ public partial class MainWindow : Window
         var request = Interlocked.Increment(ref _pageRequest);
         try
         {
-            var page = await Task.Run(() => s.Source.ReadSectorsMapped(lba, count, retries: 1));
+            var fills = _settings;
+            var page = await Task.Run(() => s.Source.ReadSectorsMapped(lba, count, retries: 1,
+                badFill: fills.BadFill, skipFill: fills.SkipFill));
             if (request != _pageRequest || Selected != s)
             {
                 return false; // llegó una petición más reciente
             }
             var ss = s.Info.SectorSize;
-            var sb = new StringBuilder();
-            var untrusted = 0;
-            for (uint i = 0; i < count; i++)
-            {
-                var sectorLba = lba + i;
-                var offset = sectorLba * ss;
-                var state = page.States[i];
-                sb.Append(CultureInfo.CurrentCulture, $"── LBA {sectorLba:N0} · desplazamiento {offset:N0} (0x{offset:X}) · {state.Label()} ──\n");
-                if (!state.IsTrustworthy())
-                {
-                    // Nunca se presenta el relleno como si fueran datos del origen.
-                    untrusted++;
-                    sb.Append("!! SECTOR NO FIABLE: los bytes siguientes son un PATRÓN DE RELLENO generado por MemRescue, NO datos del origen.\n");
-                }
-                sb.Append(HexDump.Format(page.Data.AsSpan((int)(i * ss), (int)ss), offset));
-            }
-            HexView.Text = sb.ToString();
+            var untrusted = RenderPage(lba, count, ss, page, fills);
             HexView.ScrollToHome();
             s.CurrentLba = lba;
             LbaBox.Text = lba.ToString(CultureInfo.InvariantCulture);
@@ -445,7 +452,7 @@ public partial class MainWindow : Window
                 : $"LBA {lba:N0} – {endLba:N0} de {total - 1:N0} · desplazamiento {lba * ss:N0} (0x{lba * ss:X}) · {count} sectores de {ss} B") + states;
             UntrustedBanner.Visibility = untrusted > 0 ? Visibility.Visible : Visibility.Collapsed;
             UntrustedBannerText.Text = untrusted > 0
-                ? $"{untrusted} de {count} sectores de esta página no se pudieron leer: su contenido es un patrón de relleno («BAD!»/«SKIP»), no datos del origen."
+                ? $"{untrusted} de {count} sectores de esta página no se pudieron leer: su contenido es un patrón de relleno («{fills.BadFill}»/«{fills.SkipFill}»), no datos del origen."
                 : "";
             PositionText.Text = $"LBA {lba:N0} / {total - 1:N0}";
             return true;
@@ -453,10 +460,215 @@ public partial class MainWindow : Window
         catch (EngineException ex)
         {
             Log($"Error leyendo LBA {lba}: [{ex.Status}] {ex.Message}");
-            HexView.Text = $"No se pudo leer la LBA {lba:N0}:\n{ex.Message}";
+            SetHexMessage($"No se pudo leer la LBA {lba:N0}:\n{ex.Message}");
+            SectorStatesPanel.Children.Clear();
             return false;
         }
     }
+
+    // ---------- Colores por estado y patrones de relleno ----------
+
+    /// <summary>Ancho de página del volcado: cabe una línea de volcado completa sin ajuste.</summary>
+    private const double HexPageWidth = 760;
+
+    private static SolidColorBrush RgbBrush(uint rgb)
+    {
+        var b = new SolidColorBrush(Color.FromRgb((byte)(rgb >> 16), (byte)(rgb >> 8), (byte)rgb));
+        b.Freeze();
+        return b;
+    }
+
+    /// <summary>
+    /// Fondo y texto de un estado. Con un tema de alto contraste se usan solo colores del sistema: los
+    /// sectores no fiables, con los de resaltado; el resto, con los de la ventana (el texto los distingue).
+    /// </summary>
+    private static (Brush Background, Brush Foreground) StateBrushes(SectorState state)
+    {
+        if (SystemParameters.HighContrast)
+        {
+            return state.IsTrustworthy()
+                ? (SystemColors.WindowBrush, SystemColors.WindowTextBrush)
+                : (SystemColors.HighlightBrush, SystemColors.HighlightTextBrush);
+        }
+        var st = SectorStatePalette.For(state);
+        return (RgbBrush(st.Background), RgbBrush(st.Foreground));
+    }
+
+    /// <summary>
+    /// Sustituye el contenido del visor. Se reutiliza siempre el mismo <see cref="FlowDocument"/>: el
+    /// proveedor de UI Automation del control (TextPattern) queda ligado al documento inicial.
+    /// </summary>
+    private void SetHexBlocks(IEnumerable<Block> blocks, string plainText)
+    {
+        var doc = HexView.Document;
+        doc.PagePadding = new Thickness(2);
+        doc.PageWidth = HexPageWidth;
+        doc.Blocks.Clear();
+        doc.Blocks.AddRange(blocks.ToList());
+        _hexText = plainText;
+    }
+
+    /// <summary>Muestra un mensaje en el visor en lugar de un volcado.</summary>
+    private void SetHexMessage(string message) => SetHexBlocks([new Paragraph(new Run(message))], message);
+
+    /// <summary>
+    /// Compone el volcado de la página: un bloque por sector con el color de su estado, la cabecera con el
+    /// estado en texto y, en los no fiables, la advertencia de relleno con el patrón en uso y una barra
+    /// lateral gruesa. Rellena también la fila de estados por sector. Devuelve los sectores no fiables.
+    /// </summary>
+    private int RenderPage(ulong lba, uint count, uint ss, MappedSectors page, UserSettings fills)
+    {
+        var blocks = new List<Block>();
+        var text = new StringBuilder();
+        var untrusted = 0;
+        SectorStatesPanel.Children.Clear();
+        SectorStatesPanel.Children.Add(new TextBlock
+        {
+            Text = count == 1 ? "Estado:" : "Estados:",
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(0, 0, 6, 2),
+            Foreground = (Brush)FindResource("MutedBrush"),
+        });
+        for (uint i = 0; i < count; i++)
+        {
+            var sectorLba = lba + i;
+            var offset = sectorLba * ss;
+            var state = page.States[i];
+            var trusted = state.IsTrustworthy();
+            var (bg, fg) = StateBrushes(state);
+            var para = new Paragraph
+            {
+                Background = bg,
+                Foreground = fg,
+                BorderBrush = fg,
+                BorderThickness = new Thickness(trusted ? 1 : 6, 0, 0, 0),
+                Padding = new Thickness(trusted ? 8 : 3, 2, 2, 2),
+                Margin = new Thickness(0, 0, 0, 3),
+            };
+            var header = string.Create(CultureInfo.CurrentCulture, $"── LBA {sectorLba:N0} · desplazamiento {offset:N0} (0x{offset:X}) · {state.Label()} ──");
+            para.Inlines.Add(new Bold(new Run(header)));
+            text.Append(header).Append('\n');
+            if (!trusted)
+            {
+                // Nunca se presenta el relleno como si fueran datos del origen.
+                untrusted++;
+                var pattern = state == SectorState.Skipped ? fills.SkipFill : fills.BadFill;
+                var warning = $"!! SECTOR NO FIABLE: los bytes siguientes son un PATRÓN DE RELLENO {pattern.Describe()} generado por MemRescue, NO datos del origen.";
+                para.Inlines.Add(new LineBreak());
+                para.Inlines.Add(new Bold(new Run(warning)));
+                text.Append(warning).Append('\n');
+            }
+            var dump = HexDump.Format(page.Data.AsSpan((int)(i * ss), (int)ss), offset);
+            text.Append(dump);
+            foreach (var line in dump.TrimEnd('\n').Split('\n'))
+            {
+                para.Inlines.Add(new LineBreak());
+                para.Inlines.Add(new Run(line));
+            }
+            blocks.Add(para);
+            SectorStatesPanel.Children.Add(StateChip(
+                string.Create(CultureInfo.CurrentCulture, $"LBA {sectorLba:N0}: {SectorStatePalette.For(state).Tag}"),
+                "SectorState" + sectorLba.ToString(CultureInfo.InvariantCulture), state));
+        }
+        SetHexBlocks(blocks, text.ToString());
+        return untrusted;
+    }
+
+    /// <summary>Etiqueta con el color de un estado; el texto lo nombra (no depende solo del color).</summary>
+    private static Border StateChip(string text, string automationId, SectorState state)
+    {
+        var (bg, fg) = StateBrushes(state);
+        var label = new TextBlock
+        {
+            Text = text,
+            Foreground = fg,
+            FontWeight = state.IsTrustworthy() ? FontWeights.Normal : FontWeights.Bold,
+        };
+        AutomationProperties.SetAutomationId(label, automationId);
+        AutomationProperties.SetHelpText(label, state.Label());
+        return new Border
+        {
+            Background = bg,
+            BorderBrush = fg,
+            BorderThickness = new Thickness(state.IsTrustworthy() ? 1 : 2),
+            Padding = new Thickness(4, 1, 4, 1),
+            Margin = new Thickness(0, 0, 4, 2),
+            Child = label,
+        };
+    }
+
+    /// <summary>Leyenda de colores por estado y patrones de relleno en uso.</summary>
+    private void BuildLegend()
+    {
+        while (StateLegend.Children.Count > 1)
+        {
+            StateLegend.Children.RemoveAt(1);
+        }
+        foreach (var state in SectorStatePalette.AllStates)
+        {
+            StateLegend.Children.Add(StateChip(SectorStatePalette.For(state).Tag, "Legend" + state, state));
+        }
+        var fills = new TextBlock
+        {
+            Text = $"Relleno (nunca son datos): ilegibles {_settings.BadFill.Describe()}, saltados {_settings.SkipFill.Describe()}",
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(6, 0, 0, 2),
+            Foreground = (Brush)FindResource("MutedBrush"),
+        };
+        AutomationProperties.SetAutomationId(fills, "FillPatternsText");
+        StateLegend.Children.Add(fills);
+    }
+
+    /// <summary>Al activar o desactivar un tema de alto contraste se recomponen la leyenda y la página.</summary>
+    private void SystemParameters_Changed(object? sender, System.ComponentModel.PropertyChangedEventArgs e)
+    {
+        if (e.PropertyName == nameof(SystemParameters.HighContrast))
+        {
+            Dispatcher.BeginInvoke(() =>
+            {
+                BuildLegend();
+                if (Selected is { } s)
+                {
+                    _ = ShowSectorAsync(s.CurrentLba);
+                }
+            });
+        }
+    }
+
+    /// <summary>
+    /// Herramientas → Patrones de relleno. El cuadro se abre de forma asíncrona para que el menú (y los
+    /// clientes de UI Automation) no queden bloqueados mientras está abierto.
+    /// </summary>
+    private void FillPatterns_Click(object sender, RoutedEventArgs e) =>
+        Dispatcher.BeginInvoke(ShowFillPatternsDialog);
+
+    private void ShowFillPatternsDialog()
+    {
+        var dlg = new FillPatternsDialog(_settings) { Owner = this };
+        if (dlg.ShowDialog() != true || dlg.Result is not { } chosen)
+        {
+            return;
+        }
+        try
+        {
+            _settingsStore.Save(chosen);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+        {
+            Log($"No se pudieron guardar las preferencias: {ex.Message}");
+            MessageBox.Show(this, $"No se pudieron guardar las preferencias:\n\n{ex.Message}", "MemRescue",
+                MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+        _settings = chosen;
+        Log($"Patrones de relleno guardados: ilegibles {chosen.BadFill.Describe()}, saltados {chosen.SkipFill.Describe()}.");
+        BuildLegend();
+        if (Selected is { } s)
+        {
+            _ = ShowSectorAsync(s.CurrentLba);
+        }
+    }
+
 
     private void Navigate(Func<SourceEntry, ulong> target)
     {
@@ -585,9 +797,9 @@ public partial class MainWindow : Window
 
     private void CopyHex_Executed(object sender, ExecutedRoutedEventArgs e)
     {
-        if (!string.IsNullOrEmpty(HexView.Text))
+        if (!string.IsNullOrEmpty(_hexText))
         {
-            Clipboard.SetText(HexView.Text);
+            Clipboard.SetText(_hexText);
             Log("Volcado hexadecimal copiado al portapapeles.");
         }
     }
@@ -851,7 +1063,7 @@ public partial class MainWindow : Window
                     {
                         var sector = entry.Source.ReadSectors(st.ReadLba, 1);
                         lines.Add($"lba{st.ReadLba}_hex16={Convert.ToHexString(sector, 0, 16)}");
-                        lines.Add($"viewer_first_line={HexView.Text.Split('\n')[1]}");
+                        lines.Add($"viewer_first_line={_hexText.Split('\n')[1]}");
                     }
                     else
                     {

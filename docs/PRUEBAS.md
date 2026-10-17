@@ -91,6 +91,16 @@ Modo tolerante de contenedores (issue #4, ADR-020): pruebas unitarias por format
 a sector contenido ↔ estado, 2 pruebas más contra qemu-img (11 ignoradas en total), y pruebas de API,
 FFI, CLI (`cli/tests/tolerant.rs`), C# e interfaz (11 pruebas de UI Automation).
 
+Patrones de relleno configurables y colores por estado (issue #7, ADR-021): mr-io (formato y regla de
+admisión, patrones propios con salto comprobados sector a sector con `assert_honest`), mr-api
+(`read_sectors_mapped_with`, hash estricto con cualquier patrón), mr-ffi (`mr_read_options`: patrones,
+salto, lectura hacia atrás, igualdad con `mr_source_read_mapped` por defecto, validación de tamaño, bits,
+patrones y punteros), CLI (`sectors --bad-fill/--skip-fill/--jump` sobre el VHD dañado y rechazo de
+patrones no admitidos con código 2), C# (`FillPatternTests`: 27 casos de patrones, preferencias con
+fichero ausente, dañado o desmesurado, ubicación sustituible y paleta con contraste ≥ 7:1) e interfaz
+(13 pruebas de UI Automation, 2 nuevas en `FillPatternUiTests`). Las preferencias de las pruebas viven
+siempre en directorios temporales (`MEMRESCUE_SETTINGS_DIR`); nunca se toca el perfil del usuario.
+
 **Integración continua** (`.github/workflows/ci.yml`, detalle en `CONTRIBUTING.md`): las mismas
 comprobaciones se ejecutan en GitHub Actions en cada rama `feat/` o `fix/` y en cada PR, más la auditoría
 de higiene del repositorio (`tools/check_repo_hygiene.py`: rutas personales, correos, credenciales,

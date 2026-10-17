@@ -297,3 +297,48 @@ fn verify_error_policy_options() {
     let o = cli().args(["verify", f, "--skip-codes"]).output().unwrap();
     assert_eq!(o.status.code(), Some(2));
 }
+
+#[test]
+fn sectors_use_the_configured_fill_patterns() {
+    // Validación de las opciones; el relleno sobre sectores ilegibles se prueba en tolerant.rs.
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("f.img");
+    std::fs::write(&img, vec![0x11u8; 8 * 512]).unwrap();
+    let f = img.to_str().unwrap();
+    // Patrón inválido: uso incorrecto (2), sin abrir la imagen.
+    for args in [
+        vec!["--bad-fill", "00000000"],
+        vec!["--skip-fill", "FFFFFFFF"],
+        vec!["--bad-fill", "SAME", "--skip-fill", "SAME"],
+        vec!["--bad-fill", "BAD"],
+    ] {
+        let o = cli()
+            .args(["sectors", f, "--lba", "0"])
+            .args(&args)
+            .output()
+            .unwrap();
+        assert_eq!(o.status.code(), Some(2), "{args:?}");
+    }
+    // Solo en sectors.
+    let o = cli()
+        .args(["verify", f, "--bad-fill", "DEADBEEF"])
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(2));
+    // Patrones válidos sobre sectores legibles: datos sin cambios.
+    let o = cli()
+        .args([
+            "sectors",
+            f,
+            "--lba",
+            "0",
+            "--bad-fill",
+            "0xDEADBEEF",
+            "--skip-fill",
+            "sk1p",
+        ])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(String::from_utf8_lossy(&o.stdout).contains("11 11 11 11"));
+}

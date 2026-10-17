@@ -101,6 +101,7 @@ mr_task_free(handle)
 | `mr_source_describe(source, buf, cap, out_len)` | Descripción legible: variante del contenedor, segmentos, rango |
 | `mr_source_read(source, lba, count, buf, cap, out_len)` | Lectura **estricta** de `count` sectores (máx. 64 MiB); falla ante cualquier error |
 | `mr_source_read_mapped(source, lba, count, retries, buf, cap, states, states_cap, out_len)` | Lectura **tolerante** con un byte de estado por sector (0 leído, 1 recuperado, 2 ilegible, 3 saltado, 4 disperso). Devuelve `MR_OK` aunque haya ilegibles: el llamador **debe** consultar `states` |
+| `mr_source_read_mapped_ex(source, lba, count, options, buf, cap, states, states_cap, out_len)` | Igual que la anterior con `mr_read_options` (32 bytes; `struct_size` = `sizeof`, otro tamaño se rechaza; `reserved` = 0): `retries` (0–100), `jump_sectors` (saltados tras cada ilegible), `flags` 1 = `MR_READ_READ_BACK` y los **patrones de relleno** `bad_fill[4]` / `skip_fill[4]`. Patrones con los cuatro bytes iguales (`00 00 00 00` incluido) o iguales entre sí → `MR_ERR_INVALID_ARGUMENT` (ADR-021). `mr_source_read_mapped` no cambia |
 | `mr_source_open_range(source, start_lba, count, out_source)` | Rango de sectores como origen independiente (vista acotada; anidable; sobrevive al cierre del padre) |
 | `mr_split_discover(path, len, buf, cap, out_len, out_count)` | Lista los segmentos de una imagen dividida (uno por línea) **sin abrirlos** |
 | `mr_source_close(source)` | Cierra el origen (las tareas en curso conservan su referencia) |
@@ -117,7 +118,8 @@ mr_task_free(handle)
 | `mr_task_free(task)` | Libera el handle (cancela si sigue en marcha) |
 
 Códigos añadidos en ABI 2: 10 y 11; en ABI 3: 12, 13 y 14. Las tres funciones de la política
-de errores (IO-09) se añadieron sin cambiar la versión: no modifican firmas ni estructuras existentes. Límites:
+de errores (IO-09) y `mr_source_read_mapped_ex` con `mr_read_options` (IO-08) se añadieron sin cambiar la
+versión: no modifican firmas ni estructuras existentes. Límites:
 cadenas de entrada ≤ 64 KiB (`MR_MAX_STRING_BYTES`), lecturas ≤ 64 MiB (`MR_MAX_READ_BYTES`).
 
 ## Modo tolerante de contenedores (`MR_OPEN_TOLERANT`, ADR-020)
@@ -133,11 +135,15 @@ en RAW (también con `MR_OPEN_FORCE_RAW`) ni en imágenes divididas. En C#:
 
 ## Garantía sobre datos sustituidos (ABI 3)
 
-- Los sectores ilegibles o saltados se entregan con un patrón de relleno (`BAD!` / `SKIP`) **y** su estado.
+- Los sectores ilegibles o saltados se entregan con un patrón de relleno (`BAD!` / `SKIP` por defecto,
+  configurables con `mr_source_read_mapped_ex`) **y** su estado.
   Ninguna función presenta el relleno como dato: `mr_source_read` y los hashes son estrictos (fallan) y
   `mr_source_read_mapped` / la verificación devuelven siempre el estado de cada sector.
-- En C#, `Source.ReadSectorsMapped` devuelve `MappedSectors(Data, States)` y el visor marca cada sector
-  no fiable con «NO FIABLE: patrón de relleno, no datos del origen».
+- En C#, `Source.ReadSectorsMapped(lba, count, retries, badFill, skipFill, jumpSectors, readBack)`
+  devuelve `MappedSectors(Data, States)` (sin patrones ni salto usa `mr_source_read_mapped`; si no,
+  `mr_source_read_mapped_ex`). `FillPattern` (`TryParse`, `Validate`, `Describe`) aplica la misma regla
+  que el motor. El visor colorea cada sector según su estado y marca cada sector no fiable con «NO
+  FIABLE: patrón de relleno, no datos del origen».
 
 ## Propiedad en C#
 
@@ -147,15 +153,18 @@ después de liberarlos.
 
 ## Pruebas que garantizan el contrato
 
-- Rust (`core/mr-ffi/src/tests.rs`, 19 pruebas): tamaños de estructuras, verificación extendida con
+- Rust (`core/mr-ffi/src/tests.rs`, 21 pruebas): tamaños de estructuras, verificación extendida con
   códigos de error simulados (origen `FaultyDevice` registrado con `mr_api::source_from_device`) y
   validación de `mr_verify_options`, protocolo de búfer pequeño, rutas
   de dispositivo, UTF-8 inválido, punteros nulos y cadenas desmesuradas, handles inválidos o de otro
   tipo, orígenes en los 4 tamaños de sector, cierre con tarea en curso, verificación con salto y lectura
-  hacia atrás, códigos 10/12/13/14, lectura con estados, rangos anidados, imágenes divididas, modo tolerante
+  hacia atrás, códigos 10/12/13/14, lectura con estados, `mr_read_options` (patrones configurables con
+  salto y lectura hacia atrás, valores por defecto idénticos a `mr_source_read_mapped`, hash estricto,
+  validación de patrones, tamaño, bits y punteros), rangos anidados, imágenes divididas, modo tolerante
   (`MR_OPEN_TOLERANT`: estricto → 12, tolerante → descripción, sectores ilegibles con relleno, lectura
   estricta → 2, sin efecto con RAW forzado, inmutabilidad).
 - C# (`app/tests/MemRescue.Core.Interop.Tests`): los mismos contratos desde .NET contra la DLL
-  real (política de errores y `ErrorCodeList` en `VerifyPolicyTests`, incluidos VHD fijo construido según la especificación, descriptor VMDK malicioso, rangos, estados y
+  real (política de errores y `ErrorCodeList` en `VerifyPolicyTests`; patrones de relleno, preferencias y
+  paleta en `FillPatternTests`, incluidos VHD fijo construido según la especificación, descriptor VMDK malicioso, rangos, estados y
   divididas y modo tolerante con un VHD dinámico dañado), finalizadores, rutas no ASCII, cancelación, base de datos de trabajo, inmutabilidad del origen y el
   corpus sintético (lectura de marcadores en LBA exactas y cabeceras GPT).
