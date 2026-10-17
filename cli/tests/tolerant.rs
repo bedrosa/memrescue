@@ -97,6 +97,39 @@ fn tolerant_option_is_explicit_and_reports_untrusted_sectors() {
     assert_eq!(o.status.code(), Some(3));
     assert!(String::from_utf8_lossy(&o.stdout).contains("NO FIABLE"));
 
+    // Patrones de relleno configurados: el ilegible lleva el suyo y los saltados el suyo, marcados.
+    let o = cli()
+        .args([
+            "sectors",
+            p,
+            "--lba",
+            "8",
+            "--count",
+            "2",
+            "--jump",
+            "1",
+            "--tolerant",
+            "--bad-fill",
+            "DEADBEEF",
+            "--skip-fill",
+            "sk1p",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(3));
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        out.contains("== LBA 8 (desplazamiento 4096 = 0x1000) [ILEGIBLE]"),
+        "{out}"
+    );
+    assert!(out.contains("001000  DE AD BE EF DE AD BE EF"), "{out}");
+    assert!(
+        out.contains("== LBA 9 (desplazamiento 4608 = 0x1200) [SALTADO (no leído)]"),
+        "{out}"
+    );
+    assert!(out.contains("001200  73 6B 31 70 73 6B 31 70"), "{out}");
+    assert_eq!(out.matches("NO FIABLE").count(), 2, "{out}");
+
     // Hash estricto: falla.
     let o = cli().args(["hash", p, "--tolerant"]).output().unwrap();
     assert_eq!(o.status.code(), Some(1));

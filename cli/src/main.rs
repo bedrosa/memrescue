@@ -21,7 +21,8 @@ USO:
   memrescue-cli probe <fichero>
   memrescue-cli image-info <imagen> [ORIGEN] [--json]
   memrescue-cli split-list <imagen.001>
-  memrescue-cli sectors <imagen> --lba N [--count M] [--retries N] [ORIGEN]
+  memrescue-cli sectors <imagen> --lba N [--count M] [--retries N] [--jump N] [--read-back]
+                        [--bad-fill PATRÓN] [--skip-fill PATRÓN] [ORIGEN]
   memrescue-cli verify <imagen> [--retries N] [--jump N] [--read-back]
                        [--skip-codes 23,1117] [--ignore-errors] [ORIGEN] [--json]
   memrescue-cli hash <imagen> [--algo crc32,md5,sha1,sha256] [ORIGEN] [--db trabajo.mrdb] [--json]
@@ -41,6 +42,13 @@ POLÍTICA DE ERRORES (verify):
   --skip-codes LISTA códigos de error del sistema que no se reintentan (p. ej. 23,1117)
   --ignore-errors    ignorar todos los errores: ningún sector se reintenta
   Los sectores afectados quedan ILEGIBLES (patrón de relleno), nunca como datos.
+
+PATRONES DE RELLENO (sectors):
+  --bad-fill P       relleno de los sectores ilegibles (por defecto BAD!)
+  --skip-fill P      relleno de los sectores saltados con --jump (por defecto SKIP)
+  P: 4 caracteres ASCII (BAD!) u 8 dígitos hexadecimales (DEADBEEF). No se admiten patrones con
+  los cuatro bytes iguales (00000000 se confundiría con sectores dispersos) ni el mismo patrón
+  para ambos. El relleno nunca son datos: cada sector indica su estado.
 
 Formatos: RAW, VHD (fijo/dinámico), VHDX (fijo/dinámico), VMDK monolithicSparse e imágenes
 divididas. Tamaños de sector habituales: 512, 1024, 2048, 4096.
@@ -66,6 +74,9 @@ struct Args {
     /// Política de omisión de errores (`verify`).
     skip_codes: Vec<i32>,
     ignore_errors: bool,
+    /// Patrones de relleno (`sectors`); `None` = por defecto.
+    bad_fill: Option<[u8; 4]>,
+    skip_fill: Option<[u8; 4]>,
 }
 
 /// Analiza `--skip-codes`: códigos positivos separados por comas (decimal o `0x…`), sin
@@ -124,6 +135,8 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
         read_back: false,
         skip_codes: Vec::new(),
         ignore_errors: false,
+        bad_fill: None,
+        skip_fill: None,
     };
     while let Some(s) = it.next() {
         match s.as_str() {
@@ -138,6 +151,16 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
                 a.skip_codes = parse_skip_codes(&v)?;
             }
             "--ignore-errors" => a.ignore_errors = true,
+            "--bad-fill" | "--skip-fill" => {
+                let v = it.next().ok_or(format!("falta el valor de {s}"))?;
+                let p =
+                    mr_io::resilient::parse_fill_pattern(&v).map_err(|e| format!("{s}: {e}"))?;
+                if s == "--bad-fill" {
+                    a.bad_fill = Some(p);
+                } else {
+                    a.skip_fill = Some(p);
+                }
+            }
             "--force-raw" => a.force_raw = true,
             "--tolerant" => a.tolerant = true,
             "--split" => a.split = true,
@@ -285,6 +308,9 @@ fn run(args: Vec<String>) -> Result<(), (u8, String)> {
         }
     };
     let op = |e: &dyn std::fmt::Display| (1u8, e.to_string());
+    if cmd != "sectors" && (a.bad_fill.is_some() || a.skip_fill.is_some()) {
+        return Err(usage("--bad-fill y --skip-fill solo se aplican a sectors"));
+    }
 
     match cmd.as_str() {
         "version" | "--version" => {
@@ -321,10 +347,24 @@ fn run(args: Vec<String>) -> Result<(), (u8, String)> {
             if a.retries > 100 {
                 return Err(usage("--retries debe estar entre 0 y 100"));
             }
+            if a.read_back && a.jump == 0 {
+                return Err(usage("--read-back requiere --jump N (N > 0)"));
+            }
+            let defaults = mr_api::MappedReadOptions::default();
+            let opts = mr_api::MappedReadOptions {
+                retries: a.retries,
+                jump_sectors: a.jump,
+                read_back: a.read_back,
+                bad_fill: a.bad_fill.unwrap_or(defaults.bad_fill),
+                skip_fill: a.skip_fill.unwrap_or(defaults.skip_fill),
+            };
+            mr_io::resilient::validate_fill_patterns(opts.bad_fill, opts.skip_fill)
+                .map_err(|e| usage(&e.to_string()))?;
             let src = open_src(&a, &p).map_err(|e| op(&e))?;
             let ss = src.info().sector_size;
-            let (data, states) = mr_api::read_sectors_mapped(src.as_ref(), lba, a.count, a.retries)
-                .map_err(|e| op(&e))?;
+            let (data, states) =
+                mr_api::read_sectors_mapped_with(src.as_ref(), lba, a.count, &opts)
+                    .map_err(|e| op(&e))?;
             let mut untrusted = 0u64;
             for (i, (sector, st)) in data.chunks(ss as usize).zip(&states).enumerate() {
                 let l = lba + i as u64;

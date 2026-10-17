@@ -215,13 +215,14 @@ checks obligatorios de `main`; pruebas de interfaz a demanda; `CONTRIBUTING.md` 
 | #3 | #33 | Claves de MSYS2 fijadas a un commit y con SHA-256 comprobado en `tools/fetch_qemu_img.py` |
 | #6 | #34 | `NullDevice` (todo disperso) y `PatternDevice` (patrón constante) |
 | #5 | #35 | Omisión de errores por código y modo «ignorar todo» (IO-09); `mr_source_verify_start_ex` sin cambiar la ABI 3 |
-| #4 | este PR | Tablas de asignación dañadas en VHD/VHDX/VMDK (ADR-020): estricto por defecto (ahora también rechaza bloques solapados o duplicados y valida todas las GT de VMDK al abrir) y modo tolerante solo explícito (`OpenOptions.tolerant`, `MR_OPEN_TOLERANT`, `--tolerant`, confirmación en la interfaz); un bloque solo se usa si su zona del fichero es inequívoca; los descartados se leen como ilegibles, nunca como datos |
+| #4 | #36 | Tablas de asignación dañadas en VHD/VHDX/VMDK (ADR-020): estricto por defecto (ahora también rechaza bloques solapados o duplicados y valida todas las GT de VMDK al abrir) y modo tolerante solo explícito (`OpenOptions.tolerant`, `MR_OPEN_TOLERANT`, `--tolerant`, confirmación en la interfaz); un bloque solo se usa si su zona del fichero es inequívoca; los descartados se leen como ilegibles, nunca como datos |
+| #7 | este PR | Patrones de relleno configurables (ADR-021): `mr_source_read_mapped_ex` con `mr_read_options` (ABI 3 sin cambios en lo existente), validación común (ni ceros, ni cuatro bytes iguales, ni ambos iguales), ajustes por usuario en `%APPDATA%\MemRescue\settings.json` con escritura atómica, colores por estado con texto, barra lateral y leyenda (contraste mínimo 7:1, alto contraste del sistema), diálogo de opciones y CLI `sectors --bad-fill/--skip-fill/--jump/--read-back` |
 
 Verificación de #4: 213 pruebas Rust, 11 contra qemu-img 11.1.2 (2 nuevas en modo tolerante), 67 de interop
-C#, 11 de interfaz y auditoría de higiene sin problemas.
+C#, 11 de interfaz y auditoría de higiene sin problemas. Verificación de #7: 219 pruebas Rust, 94 de
+interop C#, 13 de interfaz; las pruebas nunca escriben en el perfil real (`MEMRESCUE_SETTINGS_DIR`).
 
 ## Siguiente tarea (no se avanza a M2)
 
-1. Completar M1 según los issues abiertos del milestone M1: #7 (patrones de relleno y colores por estado),
-   #8 (diferenciales VHD/VHDX), #9 (VMDK streamOptimized), #10 (registro VHDX en memoria) y #11 (VMDK
+1. Validación de cierre de M1. Variantes de contenedor pendientes: #8 (diferenciales VHD/VHDX), #9 (VMDK streamOptimized), #10 (registro VHDX en memoria) y #11 (VMDK
    multiextensión y flat).

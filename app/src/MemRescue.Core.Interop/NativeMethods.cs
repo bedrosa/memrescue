@@ -17,6 +17,7 @@ internal static partial class NativeMethods
     internal const uint VerifyReadBack = 1;
     internal const uint VerifyIgnoreAllErrors = 2;
     internal const int MaxSkipCodes = 256;
+    internal const uint ReadReadBack = 1;
 
     [LibraryImport(Dll)]
     internal static partial uint mr_abi_version();
@@ -48,6 +49,11 @@ internal static partial class NativeMethods
     [LibraryImport(Dll)]
     internal static partial int mr_source_read_mapped(
         ulong source, ulong lba, uint count, uint retries,
+        byte[] buf, nuint cap, byte[] states, nuint statesCap, out nuint outLen);
+
+    [LibraryImport(Dll)]
+    internal static partial int mr_source_read_mapped_ex(
+        ulong source, ulong lba, uint count, in MrReadOptions options,
         byte[] buf, nuint cap, byte[] states, nuint statesCap, out nuint outLen);
 
     [LibraryImport(Dll)]
@@ -135,6 +141,22 @@ public struct MrVerifyOptions
     public uint Retries;
     public uint SkipCodeCount;
     public nint SkipCodes;
+}
+
+/// <summary>
+/// Espejo de <c>mr_read_options</c> (32 bytes). <c>bad_fill</c>/<c>skip_fill</c> son <c>uint8_t[4]</c>:
+/// se guardan como <see cref="uint"/> cuyo orden de bytes en memoria (little-endian, x64) es el del patrón.
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct MrReadOptions
+{
+    public uint StructSize;
+    public uint Flags;
+    public ulong JumpSectors;
+    public uint Retries;
+    public uint BadFill;
+    public uint SkipFill;
+    public uint Reserved;
 }
 
 /// <summary>Espejo de <c>mr_verify_report</c> (72 bytes).</summary>

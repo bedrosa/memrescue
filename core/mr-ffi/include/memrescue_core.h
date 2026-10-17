@@ -24,6 +24,8 @@
  * Añadido sin cambiar la ABI 3: verificación extendida con política de omisión de errores
  * (mr_source_verify_start_ex, mr_verify_options, mr_verify_error_summary, mr_verify_error_code)
  * y bit MR_OPEN_TOLERANT en las opciones de mr_source_open (modo tolerante de contenedores).
+ * Añadido sin cambiar la ABI 3: lectura con estado y patrones de relleno configurables
+ * (mr_source_read_mapped_ex, mr_read_options). mr_source_read_mapped no cambia.
  */
 #ifndef MEMRESCUE_CORE_H
 #define MEMRESCUE_CORE_H
@@ -104,6 +106,9 @@ typedef int32_t mr_status;
 #define MR_VERIFY_IGNORE_ALL_ERRORS 2u
 #define MR_MAX_SKIP_CODES  256u   /* máximo de elementos en mr_verify_options.skip_codes */
 
+/* Opciones de mr_source_read_mapped_ex (flags de mr_read_options). */
+#define MR_READ_READ_BACK    1u   /* tras un salto, leer hacia atrás hasta el siguiente error */
+
 typedef struct mr_image_info {   /* 32 bytes */
     uint64_t size_bytes;
     uint64_t sector_count;
@@ -148,6 +153,22 @@ typedef struct mr_verify_options {
     const int32_t *skip_codes;   /* códigos del sistema (> 0), p. ej. 23, 1117; NULL si count = 0 */
 } mr_verify_options;
 
+/* Opciones de mr_source_read_mapped_ex (32 bytes). struct_size = sizeof(mr_read_options); un tamaño
+ * desconocido se rechaza. Patrones de relleno: 4 bytes que se repiten en todo el sector, en este orden.
+ * Regla (MR_ERR_INVALID_ARGUMENT si no se cumple): ningún patrón puede tener sus cuatro bytes iguales
+ * (00 00 00 00 se confundiría con sectores dispersos; FF FF FF FF y similares, con datos reales) y
+ * bad_fill y skip_fill deben ser distintos. El estado de cada sector sigue siendo la única fuente de
+ * verdad: el contenido de un sector MR_SECTOR_UNREADABLE o MR_SECTOR_SKIPPED nunca son datos. */
+typedef struct mr_read_options {
+    uint32_t struct_size;
+    uint32_t flags;              /* MR_READ_READ_BACK */
+    uint64_t jump_sectors;       /* 0 = sin salto tras un ilegible */
+    uint32_t retries;            /* 0–100 */
+    uint8_t  bad_fill[4];        /* relleno de MR_SECTOR_UNREADABLE (por defecto "BAD!") */
+    uint8_t  skip_fill[4];       /* relleno de MR_SECTOR_SKIPPED (por defecto "SKIP") */
+    uint32_t reserved;           /* debe ser 0 */
+} mr_read_options;
+
 uint32_t  mr_abi_version(void);
 mr_status mr_engine_version(uint8_t *buf, size_t cap, size_t *out_len);
 mr_status mr_last_error(uint8_t *buf, size_t cap, size_t *out_len);
@@ -170,6 +191,11 @@ mr_status mr_source_read(uint64_t source, uint64_t lba, uint32_t count,
 mr_status mr_source_read_mapped(uint64_t source, uint64_t lba, uint32_t count, uint32_t retries,
                                 uint8_t *buf, size_t cap, uint8_t *states, size_t states_cap,
                                 size_t *out_len);
+/* Lectura tolerante con salto, lectura hacia atrás y patrones de relleno configurables. */
+mr_status mr_source_read_mapped_ex(uint64_t source, uint64_t lba, uint32_t count,
+                                   const mr_read_options *options,
+                                   uint8_t *buf, size_t cap, uint8_t *states, size_t states_cap,
+                                   size_t *out_len);
 /* Rango de sectores de un origen como origen propio (partición o rango elegido). */
 mr_status mr_source_open_range(uint64_t source, uint64_t start_lba, uint64_t count,
                                uint64_t *out_source);

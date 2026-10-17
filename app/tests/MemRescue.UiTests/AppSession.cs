@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Globalization;
+using System.IO;
 using System.Text.RegularExpressions;
 using System.Windows.Automation;
 
@@ -22,22 +23,33 @@ internal sealed partial class AppSession : IDisposable
 
     private readonly Process _process;
 
+    /// <summary>Directorio de preferencias propio de la sesión (se borra al cerrar si lo creó ella).</summary>
+    private readonly string? _ownedSettingsDir;
+
     public AutomationElement Window { get; }
 
-    private AppSession(Process process, AutomationElement window)
+    private AppSession(Process process, AutomationElement window, string? ownedSettingsDir)
     {
         _process = process;
         Window = window;
+        _ownedSettingsDir = ownedSettingsDir;
     }
+
+    /// <summary>Crea un directorio temporal vacío para preferencias (el llamador lo borra).</summary>
+    public static string NewSettingsDirectory() =>
+        Directory.CreateTempSubdirectory("memrescue-uitests-settings-").FullName;
 
     /// <summary>
     /// Lanza MemRescue con la imagen indicada y espera a que el visor muestre la LBA 0 (o solo a la
     /// ventana principal si <paramref name="waitForViewer"/> es <c>false</c>, p. ej. cuando la apertura
-    /// pide una confirmación).
+    /// pide una confirmación). Las preferencias se leen y guardan en <paramref name="settingsDir"/> o, si
+    /// es nulo, en un directorio temporal propio de la sesión: nunca en el perfil real del usuario.
     /// </summary>
-    public static AppSession Launch(string image, uint? sectorSize = null, bool waitForViewer = true)
+    public static AppSession Launch(string image, uint? sectorSize = null, bool waitForViewer = true, string? settingsDir = null)
     {
+        var owned = settingsDir is null ? NewSettingsDirectory() : null;
         var psi = new ProcessStartInfo(RepoPaths.MemRescueExe) { UseShellExecute = false };
+        psi.Environment["MEMRESCUE_SETTINGS_DIR"] = settingsDir ?? owned;
         psi.ArgumentList.Add("--open");
         psi.ArgumentList.Add(image);
         if (sectorSize is { } ss)
@@ -60,7 +72,7 @@ internal sealed partial class AppSession : IDisposable
                 var w = AutomationElement.RootElement.FindFirst(TreeScope.Children, cond);
                 return w is not null && w.Current.Name == "MemRescue" ? w : null;
             }, "la ventana «MemRescue»", StartupTimeout);
-            var session = new AppSession(process, window);
+            var session = new AppSession(process, window, owned);
             if (!waitForViewer)
             {
                 return session;
@@ -73,6 +85,7 @@ internal sealed partial class AppSession : IDisposable
         {
             KillQuietly(process);
             process.Dispose();
+            DeleteQuietly(owned);
             throw;
         }
     }
@@ -116,8 +129,24 @@ internal sealed partial class AppSession : IDisposable
         WaitFor(() => Window.FindFirst(TreeScope.Descendants,
             new PropertyCondition(AutomationElement.AutomationIdProperty, automationId)), $"el control «{automationId}»");
 
-    /// <summary>Texto completo del visor hexadecimal (<c>HexView</c>).</summary>
-    public string HexText => ((ValuePattern)ById("HexView").GetCurrentPattern(ValuePattern.Pattern)).Current.Value;
+    /// <summary>
+    /// Texto completo del visor hexadecimal (<c>HexView</c>, documento con un bloque coloreado por sector),
+    /// con los saltos de línea normalizados a <c>\n</c>.
+    /// </summary>
+    public string HexText
+    {
+        get
+        {
+            var view = ById("HexView");
+            var text = view.TryGetCurrentPattern(TextPattern.Pattern, out var tp)
+                ? ((TextPattern)tp).DocumentRange.GetText(-1)
+                : ((ValuePattern)view.GetCurrentPattern(ValuePattern.Pattern)).Current.Value;
+            return text.Replace("\r\n", "\n", StringComparison.Ordinal).Replace('\r', '\n');
+        }
+    }
+
+    /// <summary>Texto de la etiqueta de estado de la LBA indicada en la fila de estados de la página.</summary>
+    public string SectorStateChip(ulong lba) => ById("SectorState" + lba.ToString(CultureInfo.InvariantCulture)).Current.Name;
 
     public string SectorInfo => ById("SectorInfoText").Current.Name;
 
@@ -270,6 +299,22 @@ internal sealed partial class AppSession : IDisposable
         {
             KillQuietly(_process);
             _process.Dispose();
+            DeleteQuietly(_ownedSettingsDir);
+        }
+    }
+
+    private static void DeleteQuietly(string? dir)
+    {
+        try
+        {
+            if (dir is not null && Directory.Exists(dir))
+            {
+                Directory.Delete(dir, recursive: true);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Temporal: si no se puede borrar ahora, lo hará el sistema.
         }
     }
 

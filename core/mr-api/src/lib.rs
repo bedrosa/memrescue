@@ -7,7 +7,8 @@
 //! - [`discover_split`] / [`open_split_source`]: imágenes divididas (apertura explícita).
 //! - [`open_range`]: un rango de sectores de otro origen como origen propio.
 //! - [`read_sectors`]: lectura estricta de un rango de sectores; [`read_sectors_mapped`]: lectura
-//!   tolerante con el estado de cada sector (visor hexadecimal).
+//!   tolerante con el estado de cada sector (visor hexadecimal); [`read_sectors_mapped_with`]: la
+//!   misma con salto y patrones de relleno configurables.
 //! - [`start_hash_task`]: hashes del fichero completo en segundo plano.
 //! - [`start_verify_task`]: lectura completa tolerante a errores con mapa de validez por sector.
 
@@ -235,6 +236,60 @@ pub fn read_sectors_mapped(
     let policy = ReadPolicy {
         retries,
         on_error: OnError::FillAndContinue,
+        ..ReadPolicy::default()
+    };
+    Ok(mr_io::resilient::read_sectors_mapped(
+        src, lba, count, &policy,
+    )?)
+}
+
+/// Opciones de [`read_sectors_mapped_with`]: reintentos, salto tras un ilegible y patrones de
+/// relleno. Por defecto equivale a [`read_sectors_mapped`] con 1 reintento.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MappedReadOptions {
+    /// Reintentos por sector tras un fallo.
+    pub retries: u32,
+    /// Tras un sector ilegible, sectores que se marcan `Skipped` sin leerlos (0 = sin salto).
+    pub jump_sectors: u64,
+    /// Tras un salto, leer hacia atrás desde su final hasta el siguiente error.
+    pub read_back: bool,
+    /// Relleno de los sectores `Unreadable`.
+    pub bad_fill: [u8; 4],
+    /// Relleno de los sectores `Skipped`.
+    pub skip_fill: [u8; 4],
+}
+
+impl Default for MappedReadOptions {
+    fn default() -> Self {
+        Self {
+            retries: 1,
+            jump_sectors: 0,
+            read_back: false,
+            bad_fill: mr_io::resilient::DEFAULT_BAD_FILL,
+            skip_fill: mr_io::resilient::DEFAULT_SKIP_FILL,
+        }
+    }
+}
+
+/// Como [`read_sectors_mapped`], con salto y patrones de relleno configurables. Los patrones se
+/// validan con [`mr_io::resilient::validate_fill_patterns`] (ni uniformes, como `00 00 00 00`, ni
+/// iguales entre sí) y se rechazan con [`ApiError::InvalidArgument`] antes de leer nada. El estado
+/// de cada sector sigue siendo la única fuente de verdad sobre si su contenido son datos.
+pub fn read_sectors_mapped_with(
+    src: &dyn BlockDevice,
+    lba: u64,
+    count: u64,
+    opts: &MappedReadOptions,
+) -> Result<(Vec<u8>, Vec<SectorState>)> {
+    mr_io::resilient::validate_fill_patterns(opts.bad_fill, opts.skip_fill)
+        .map_err(|e| ApiError::InvalidArgument(e.to_string()))?;
+    let policy = ReadPolicy {
+        retries: opts.retries,
+        on_error: OnError::FillAndContinue,
+        bad_fill: opts.bad_fill,
+        skip_fill: opts.skip_fill,
+        jump_sectors: opts.jump_sectors,
+        read_back: opts.read_back,
         ..ReadPolicy::default()
     };
     Ok(mr_io::resilient::read_sectors_mapped(
@@ -680,5 +735,64 @@ mod tests {
         // El hash estricto se niega a calcularse sobre esa misma zona.
         let ctx = TaskContext::detached();
         assert!(hash_image(&dev, &HashOptions::default(), &ctx).is_err());
+    }
+
+    #[test]
+    fn mapped_read_with_custom_fills_and_jump() {
+        let dev = FaultyDevice::new(MemDevice::new(vec![0x41u8; 512 * 16], 512).unwrap())
+            .with_bad([2])
+            .with_sparse(5, 1);
+        let opts = MappedReadOptions {
+            retries: 0,
+            jump_sectors: 4,
+            bad_fill: [0xDE, 0xAD, 0xBE, 0xEF],
+            skip_fill: *b"skp?",
+            ..MappedReadOptions::default()
+        };
+        let (data, states) = read_sectors_mapped_with(&dev, 0, 8, &opts).unwrap();
+        use SectorState::*;
+        assert_eq!(
+            states,
+            vec![Read, Read, Unreadable, Skipped, Skipped, Sparse, Skipped, Read]
+        );
+        for (l, st) in states.iter().enumerate() {
+            let sec = &data[l * 512..(l + 1) * 512];
+            match st {
+                Unreadable => assert!(sec.chunks(4).all(|c| c == [0xDE, 0xAD, 0xBE, 0xEF])),
+                Skipped => assert!(sec.chunks(4).all(|c| c == b"skp?")),
+                Sparse => assert!(sec.iter().all(|&b| b == 0)),
+                _ => assert!(sec.iter().all(|&b| b == 0x41)),
+            }
+        }
+        // Por defecto, igual que read_sectors_mapped.
+        assert_eq!(
+            read_sectors_mapped_with(&dev, 0, 8, &MappedReadOptions::default()).unwrap(),
+            read_sectors_mapped(&dev, 0, 8, 1).unwrap()
+        );
+        // Patrones rechazados antes de leer: uniformes (ceros incluidos) o iguales entre sí.
+        for (bad, skip) in [
+            ([0u8; 4], *b"SKIP"),
+            (*b"BAD!", [0xFF; 4]),
+            (*b"BAD!", *b"BAD!"),
+        ] {
+            let o = MappedReadOptions {
+                bad_fill: bad,
+                skip_fill: skip,
+                ..MappedReadOptions::default()
+            };
+            assert!(matches!(
+                read_sectors_mapped_with(&dev, 0, 8, &o),
+                Err(ApiError::InvalidArgument(_))
+            ));
+        }
+        // El hash nunca incluye relleno, sea cual sea el patrón configurado: sigue siendo estricto.
+        let ctx = TaskContext::detached();
+        assert!(hash_image(&dev, &HashOptions::default(), &ctx).is_err());
+        let clean = MemDevice::new(vec![0x41u8; 512 * 16], 512).unwrap();
+        let h = hash_image(&clean, &HashOptions::default(), &ctx).unwrap();
+        let (cd, _) = read_sectors_mapped_with(&clean, 0, 16, &opts).unwrap();
+        let mut hasher = MultiHasher::new(&[HashAlgorithm::Sha256]);
+        hasher.update(&cd);
+        assert_eq!(hasher.finish(), h.digests);
     }
 }

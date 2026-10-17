@@ -11,6 +11,9 @@ fn struct_layouts_match_header() {
     assert_eq!(std::mem::size_of::<MrTaskStatus>(), 24);
     assert_eq!(std::mem::size_of::<MrVerifyReport>(), 72);
     assert_eq!(std::mem::size_of::<MrVerifyOptions>(), 48);
+    assert_eq!(std::mem::size_of::<MrReadOptions>(), 32);
+    assert_eq!(std::mem::offset_of!(MrReadOptions, bad_fill), 20);
+    assert_eq!(std::mem::offset_of!(MrReadOptions, skip_fill), 24);
     assert_eq!(mr_abi_version(), 3);
 }
 
@@ -875,4 +878,156 @@ fn tolerant_flag_opens_damaged_containers_with_untrusted_blocks() {
         std::fs::metadata(&path).unwrap().modified().unwrap(),
         modified
     );
+}
+
+// ---------- Lectura con patrones de relleno configurables (IO-08) ----------
+
+fn read_options(retries: u32, jump: u64, bad: [u8; 4], skip: [u8; 4]) -> MrReadOptions {
+    MrReadOptions {
+        struct_size: std::mem::size_of::<MrReadOptions>() as u32,
+        flags: 0,
+        jump_sectors: jump,
+        retries,
+        bad_fill: bad,
+        skip_fill: skip,
+        reserved: 0,
+    }
+}
+
+fn read_ex(src: u64, lba: u64, count: u32, o: &MrReadOptions) -> Result<(Vec<u8>, Vec<u8>), i32> {
+    let mut buf = vec![0u8; count as usize * 512];
+    let mut states = vec![0xEEu8; count as usize];
+    let mut n = 0usize;
+    let rc = unsafe {
+        mr_source_read_mapped_ex(
+            src,
+            lba,
+            count,
+            o,
+            buf.as_mut_ptr(),
+            buf.len(),
+            states.as_mut_ptr(),
+            states.len(),
+            &mut n,
+        )
+    };
+    if rc == MR_OK {
+        assert_eq!(n, buf.len());
+        Ok((buf, states))
+    } else {
+        Err(rc)
+    }
+}
+
+#[test]
+fn read_mapped_ex_uses_the_configured_fill_patterns() {
+    // Sectores 10, 20 y 30 ilegibles; el resto vale 0x5A.
+    let src = faulty_source();
+    let bad = [0xDE, 0xAD, 0xBE, 0xEF];
+    let skip = *b"skp?";
+    let (buf, states) = read_ex(src, 8, 16, &read_options(0, 3, bad, skip)).unwrap();
+    // 10 ilegible, 11–13 saltados, 14–23 con 20 ilegible y 21–23 saltados.
+    let expected: Vec<u8> = (8..24u64)
+        .map(|l| match l {
+            10 | 20 => 2,
+            11..=13 | 21..=23 => 3,
+            _ => 0,
+        })
+        .collect();
+    assert_eq!(states, expected);
+    for (i, &st) in states.iter().enumerate() {
+        let sec = &buf[i * 512..(i + 1) * 512];
+        match st {
+            2 => assert!(sec.chunks(4).all(|c| c == bad)),
+            3 => assert!(sec.chunks(4).all(|c| c == skip)),
+            _ => assert!(sec.iter().all(|&b| b == 0x5A)),
+        }
+    }
+    // Lectura hacia atrás: los saltados legibles pasan a leídos.
+    let mut o = read_options(0, 3, bad, skip);
+    o.flags = MR_READ_READ_BACK;
+    let (_, states) = read_ex(src, 8, 16, &o).unwrap();
+    assert!(states.iter().all(|&s| s != 3), "{states:?}");
+    // Los valores por defecto de la función nueva coinciden con mr_source_read_mapped.
+    let (b1, s1) = read_ex(src, 8, 4, &read_options(1, 0, *b"BAD!", *b"SKIP")).unwrap();
+    let mut b2 = vec![0u8; 4 * 512];
+    let mut s2 = vec![0u8; 4];
+    let mut n = 0usize;
+    let rc = unsafe {
+        mr_source_read_mapped(
+            src,
+            8,
+            4,
+            1,
+            b2.as_mut_ptr(),
+            b2.len(),
+            s2.as_mut_ptr(),
+            s2.len(),
+            &mut n,
+        )
+    };
+    assert_eq!(rc, MR_OK);
+    assert_eq!((b1, s1), (b2, s2));
+    // El hash del origen sigue siendo estricto: nunca se calcula sobre relleno.
+    let mut task = 0u64;
+    assert_eq!(
+        unsafe { mr_source_hash_start(src, 8, std::ptr::null(), 0, &mut task) },
+        MR_OK
+    );
+    assert_eq!(wait(task).state, 3);
+    assert_eq!(mr_task_free(task), MR_OK);
+    assert_eq!(mr_source_close(src), MR_OK);
+}
+
+#[test]
+fn read_mapped_ex_rejects_invalid_options() {
+    let src = faulty_source();
+    let ok = read_options(1, 0, *b"BAD!", *b"SKIP");
+    let cases: Vec<(MrReadOptions, &str)> = vec![
+        (read_options(1, 0, [0; 4], *b"SKIP"), "00 00 00 00"),
+        (read_options(1, 0, *b"BAD!", [0; 4]), "saltados"),
+        (
+            read_options(1, 0, [0xFF; 4], *b"SKIP"),
+            "cuatro bytes iguales",
+        ),
+        (read_options(1, 0, *b"SAME", *b"SAME"), "distintos"),
+        (read_options(101, 0, *b"BAD!", *b"SKIP"), "reintentos"),
+        (MrReadOptions { flags: 2, ..ok }, "opciones"),
+        (MrReadOptions { reserved: 1, ..ok }, "opciones"),
+        (
+            MrReadOptions {
+                struct_size: 24,
+                ..ok
+            },
+            "tamaño",
+        ),
+        (
+            MrReadOptions {
+                struct_size: 40,
+                ..ok
+            },
+            "tamaño",
+        ),
+    ];
+    for (o, msg) in cases {
+        assert_eq!(read_ex(src, 0, 1, &o), Err(MR_ERR_INVALID_ARGUMENT));
+        assert!(last_error().contains(msg), "{msg}: {}", last_error());
+    }
+    // Puntero nulo, handle inválido, fuera de rango y búfer pequeño.
+    let mut buf = vec![0u8; 512];
+    let mut st = vec![0u8; 1];
+    let mut n = 0usize;
+    let (bp, sp) = (buf.as_mut_ptr(), st.as_mut_ptr());
+    let call = |h: u64, o: *const MrReadOptions, lba: u64, cap: usize, n: &mut usize| unsafe {
+        mr_source_read_mapped_ex(h, lba, 1, o, bp, cap.min(512), sp, 1, n)
+    };
+    assert_eq!(
+        call(src, std::ptr::null(), 0, 512, &mut n),
+        MR_ERR_INVALID_ARGUMENT
+    );
+    assert_eq!(call(999_999, &ok, 0, 512, &mut n), MR_ERR_INVALID_HANDLE);
+    assert_eq!(call(src, &ok, 64, 512, &mut n), MR_ERR_OUT_OF_RANGE);
+    assert_eq!(call(src, &ok, 0, 100, &mut n), MR_ERR_BUFFER_TOO_SMALL);
+    assert_eq!(n, 512);
+    assert_eq!(mr_source_close(src), MR_OK);
 }

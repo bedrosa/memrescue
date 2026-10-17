@@ -21,6 +21,27 @@ incluye un mapa de validez con recuentos exactos.
 
 `SectorState::is_trustworthy()` es `false` solo para `Unreadable` y `Skipped`.
 
+## Patrones de relleno configurables (IO-08, ADR-021)
+
+Los dos patrones son de 4 bytes y se repiten en todo el sector en el orden escrito. Por defecto
+`DEFAULT_BAD_FILL` = `BAD!` (42 41 44 21) y `DEFAULT_SKIP_FILL` = `SKIP` (53 4B 49 50).
+
+- **Regla de admisión** (`validate_fill_patterns(bad, skip)`, `FillPatternError`): ningún patrón puede
+  tener sus cuatro bytes iguales (`Zero` para `00 00 00 00`, indistinguible de los sectores `Sparse` y de
+  datos a cero; `Uniform` para `FF FF FF FF`, `E5 E5 E5 E5`…, rellenos habituales en discos reales) y
+  ilegibles y saltados deben ser distintos (`Identical`). La aplican igual el motor (`mr-api`, `mr-ffi`),
+  la CLI y la interfaz (`FillPattern.Validate` en C#).
+- **Formato de entrada** (`parse_fill_pattern`, `FillPattern.TryParse`): exactamente 4 caracteres ASCII
+  imprimibles (`BAD!`) o exactamente 8 dígitos hexadecimales con prefijo `0x` y espacios opcionales
+  (`DEADBEEF`, `0xDE AD BE EF`). Las preferencias guardan siempre los 8 dígitos.
+- La regla solo evita volcados engañosos: la **autoridad es el estado** de cada sector. Un sector del
+  origen que contenga el patrón configurado sigue siendo `Read` (`fill_pattern_in_source_does_not_change_states`).
+- Los hashes nunca incluyen relleno, sea cual sea el patrón: `hash_image` es estricto (pruebas
+  `mapped_read_with_custom_fills_and_jump` en mr-api, `read_mapped_ex_uses_the_configured_fill_patterns` en
+  mr-ffi y `HashNeverIncludesFillWhateverThePattern` en C#).
+- La verificación no admite patrones: no entrega datos, solo recuentos y tramos, así que el patrón no
+  cambiaría su resultado.
+
 ## API (`mr_io::resilient`)
 
 - `ReadPolicy { chunk_sectors (2048), retries (1), on_error (Fail), bad_fill (BAD!),
@@ -32,6 +53,11 @@ incluye un mapa de validez con recuentos exactos.
   creciente, contiguos y sin huecos ni solapes; `progress(hechos, total)` en sectores, `false` cancela.
 - `read_sectors_mapped(dev, lba, count, policy) -> Result<(Vec<u8>, Vec<SectorState>)>`: lectura
   acotada a `MAX_READ_REQUEST` para el visor hexadecimal.
+- `validate_fill_patterns`, `parse_fill_pattern`, `FillPatternError`, `DEFAULT_BAD_FILL`,
+  `DEFAULT_SKIP_FILL` (ver la sección anterior).
+- En `mr-api`: `read_sectors_mapped(src, lba, count, retries)` (rellenos por defecto, sin salto) y
+  `read_sectors_mapped_with(src, lba, count, &MappedReadOptions { retries, jump_sectors, read_back,
+  bad_fill, skip_fill })`, que valida los patrones antes de leer (`ApiError::InvalidArgument`).
 - `ReadReport { sectors_requested, retry_reads, omitted_errors, error_codes, map: ValidityMap }`:
   `omitted_errors` cuenta los sectores cuyo error se omitió por la política; `error_codes`
   (`BTreeMap<i32, u64>`) cuenta, por código del sistema, los sectores `Unreadable` cuyo último
@@ -122,10 +148,20 @@ Independientes del tamaño del rango y del salto:
   lector los entrega como `Unreadable` con `bad_fill`; nunca aparecen como `Read` ni como `Sparse`.
 
 - `mr_api::verify` devuelve el `ReadReport` con el mapa.
-- `mr-ffi` (ABI 3): `mr_source_verify_start` (reintentos, salto, lectura hacia atrás) y
+- `mr-ffi` (ABI 3): `mr_source_read_mapped` (rellenos por defecto) y `mr_source_read_mapped_ex` con
+  `mr_read_options` (reintentos, salto, lectura hacia atrás y los dos patrones; patrones no admitidos →
+  `MR_ERR_INVALID_ARGUMENT`);
+  `mr_source_verify_start` (reintentos, salto, lectura hacia atrás) y
   `mr_source_verify_start_ex` con `mr_verify_options` (además, `skip_codes` y
   `MR_VERIFY_IGNORE_ALL_ERRORS`); `mr_verify_error_summary` / `mr_verify_error_code` exponen
   `omitted_errors` y `error_codes`. Ver `docs/API_FFI.md`.
+- Interfaz, visor: cada sector se muestra en un bloque con el color de su estado (`SectorStatePalette`),
+  su cabecera con el estado en texto y, si no es fiable, la línea «!! SECTOR NO FIABLE … PATRÓN DE
+  RELLENO <patrón> … NO datos del origen» y una barra lateral gruesa; fila de estados por sector y
+  leyenda con los patrones en uso. Herramientas → «Patrones de relleno de sectores no fiables…» edita y
+  guarda los patrones (preferencias por usuario, ADR-021).
+- CLI `sectors`: `--bad-fill P`, `--skip-fill P`, `--jump N` y `--read-back` (patrones no admitidos →
+  código 2; solo se aceptan en `sectors`).
 - Interfaz: pestaña Comprobaciones, casilla «Ignorar todos los errores (sin reintentos)»
   (`IgnoreErrorsBox`) y lista «No reintentar los códigos de error» (`SkipCodesBox`).
 - CLI `verify`: muestra el recuento por estado y los tramos no fiables; con `--json` añade
@@ -167,7 +203,9 @@ contenido corresponde al estado y que mapa, recuentos y `all_trustworthy()` coin
 | `omitted_errors_combine_with_jump_and_read_back` | omisión + salto (con y sin lectura hacia atrás), saltados sin leer |
 | `omitted_errors_at_the_edges_of_the_range` | primer/último sector del rango, vecinos fuera del rango nunca leídos, salto acotado, rango de 1 sector |
 | `policy_omits_by_code_or_all` | `ReadPolicy::omits` y `IoError::os_error_code` |
+| `fill_patterns_are_parsed_and_validated` | formato ASCII/hex, textos rechazados, regla de admisión (ceros, uniformes, iguales) |
+| `custom_fills_are_delivered_with_their_state` | patrones propios con salto: cada relleno solo con su estado, dispersos intactos |
 | `fault::tests` (4) | superposición de dispersos, solapes rechazados, contador por sector, códigos por sector |
 
-Resultado: `cargo test --workspace` correcto (mr-io: 58 pruebas, de ellas 26 de este módulo y 4 de
+Resultado: `cargo test --workspace` correcto (mr-io: 68 pruebas, de ellas 28 de este módulo y 4 de
 `fault`), `cargo clippy --workspace --all-targets -- -D warnings` sin avisos, `cargo fmt --all` aplicado.

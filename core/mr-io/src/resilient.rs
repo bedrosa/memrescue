@@ -84,14 +84,108 @@ impl Default for ReadPolicy {
             chunk_sectors: 2048,
             retries: 1,
             on_error: OnError::Fail,
-            bad_fill: *b"BAD!",
-            skip_fill: *b"SKIP",
+            bad_fill: DEFAULT_BAD_FILL,
+            skip_fill: DEFAULT_SKIP_FILL,
             jump_sectors: 0,
             read_back: false,
             skip_error_codes: Vec::new(),
             ignore_all_errors: false,
         }
     }
+}
+
+/// Patrón de relleno por defecto de los sectores ilegibles (`Unreadable`).
+pub const DEFAULT_BAD_FILL: [u8; 4] = *b"BAD!";
+/// Patrón de relleno por defecto de los sectores saltados (`Skipped`).
+pub const DEFAULT_SKIP_FILL: [u8; 4] = *b"SKIP";
+
+/// Motivo por el que un par de patrones de relleno no es admisible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FillPatternError {
+    /// Patrón de cuatro ceros: indistinguible de los sectores dispersos y de datos a cero.
+    Zero { skip: bool },
+    /// Los cuatro bytes son iguales (`FF FF FF FF`, `E5 E5 E5 E5`…): rellenos uniformes habituales
+    /// en datos reales (memoria flash borrada, formateo).
+    Uniform { skip: bool },
+    /// Ilegibles y saltados usarían el mismo patrón: no se podrían distinguir en un volcado.
+    Identical,
+}
+
+impl std::fmt::Display for FillPatternError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let which = |skip: bool| if skip { "saltados" } else { "ilegibles" };
+        match self {
+            Self::Zero { skip } => write!(
+                f,
+                "el patrón de relleno de los sectores {} no puede ser 00 00 00 00 (se confundiría con \
+                 sectores dispersos o datos a cero)",
+                which(*skip)
+            ),
+            Self::Uniform { skip } => write!(
+                f,
+                "el patrón de relleno de los sectores {} no puede tener los cuatro bytes iguales (se \
+                 confundiría con rellenos habituales en datos reales)",
+                which(*skip)
+            ),
+            Self::Identical => write!(
+                f,
+                "los patrones de relleno de ilegibles y saltados deben ser distintos"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for FillPatternError {}
+
+/// Comprueba que un par de patrones de relleno se distingue de los datos y entre sí. Reglas:
+/// ninguno puede tener sus cuatro bytes iguales (incluido `00 00 00 00`, indistinguible de los
+/// sectores dispersos) y ilegibles y saltados deben usar patrones distintos. El estado por sector
+/// sigue siendo la única fuente de verdad: esta regla solo evita volcados engañosos.
+pub fn validate_fill_patterns(
+    bad: [u8; 4],
+    skip: [u8; 4],
+) -> std::result::Result<(), FillPatternError> {
+    for (p, is_skip) in [(bad, false), (skip, true)] {
+        if p == [0; 4] {
+            return Err(FillPatternError::Zero { skip: is_skip });
+        }
+        if p.iter().all(|&b| b == p[0]) {
+            return Err(FillPatternError::Uniform { skip: is_skip });
+        }
+    }
+    if bad == skip {
+        return Err(FillPatternError::Identical);
+    }
+    Ok(())
+}
+
+/// Analiza un patrón de relleno escrito por el usuario: exactamente 4 caracteres ASCII imprimibles
+/// (`BAD!`) o exactamente 8 dígitos hexadecimales, con prefijo `0x` y espacios opcionales
+/// (`DEADBEEF`, `0xDE AD BE EF`). Los bytes se repiten en ese orden en cada grupo de 4 bytes del
+/// sector. No aplica la regla de [`validate_fill_patterns`].
+pub fn parse_fill_pattern(text: &str) -> std::result::Result<[u8; 4], String> {
+    if text.len() == 4 && text.bytes().all(|b| (0x20..0x7f).contains(&b)) {
+        let b = text.as_bytes();
+        return Ok([b[0], b[1], b[2], b[3]]);
+    }
+    let t = text.trim();
+    let t = t
+        .strip_prefix("0x")
+        .or_else(|| t.strip_prefix("0X"))
+        .unwrap_or(t);
+    let hex: Vec<u8> = t.bytes().filter(|c| !c.is_ascii_whitespace()).collect();
+    if hex.len() == 8 && hex.iter().all(u8::is_ascii_hexdigit) {
+        let digit = |c: u8| (c as char).to_digit(16).unwrap_or(0) as u8;
+        let mut out = [0u8; 4];
+        for (i, o) in out.iter_mut().enumerate() {
+            *o = (digit(hex[2 * i]) << 4) | digit(hex[2 * i + 1]);
+        }
+        return Ok(out);
+    }
+    Err(format!(
+        "patrón de relleno no válido: «{text}» (4 caracteres ASCII, p. ej. BAD!, u 8 dígitos \
+         hexadecimales, p. ej. DEADBEEF)"
+    ))
 }
 
 /// Tamaño máximo del búfer de la lectura hacia atrás tras un salto. Si se llena sin encontrar
@@ -1571,5 +1665,81 @@ mod tests {
             read_sectors_mapped(&Huge, 0, 1 << 40, &ReadPolicy::default()),
             Err(IoError::RequestTooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn fill_patterns_are_parsed_and_validated() {
+        assert_eq!(parse_fill_pattern("BAD!"), Ok(*b"BAD!"));
+        assert_eq!(parse_fill_pattern("a b "), Ok(*b"a b "));
+        assert_eq!(parse_fill_pattern("DEADBEEF"), Ok([0xDE, 0xAD, 0xBE, 0xEF]));
+        assert_eq!(
+            parse_fill_pattern("0xde ad be ef"),
+            Ok([0xDE, 0xAD, 0xBE, 0xEF])
+        );
+        assert_eq!(parse_fill_pattern(" 0X0102A0FF "), Ok([1, 2, 0xA0, 0xFF]));
+        for bad in [
+            "",
+            "BAD",
+            "BAD!!",
+            "DEADBEEG",
+            "0xDEADBE",
+            "ñañ",
+            "DEADBEEF00",
+            "AB	C",
+        ] {
+            assert!(parse_fill_pattern(bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(
+            validate_fill_patterns(DEFAULT_BAD_FILL, DEFAULT_SKIP_FILL),
+            Ok(())
+        );
+        assert_eq!(
+            validate_fill_patterns([0; 4], *b"SKIP"),
+            Err(FillPatternError::Zero { skip: false })
+        );
+        assert_eq!(
+            validate_fill_patterns(*b"BAD!", [0; 4]),
+            Err(FillPatternError::Zero { skip: true })
+        );
+        assert_eq!(
+            validate_fill_patterns([0xFF; 4], *b"SKIP"),
+            Err(FillPatternError::Uniform { skip: false })
+        );
+        assert_eq!(
+            validate_fill_patterns(*b"BAD!", *b"BAD!"),
+            Err(FillPatternError::Identical)
+        );
+        assert!(validate_fill_patterns([0, 0, 0, 1], [1, 0, 0, 0]).is_ok());
+        assert!(FillPatternError::Identical
+            .to_string()
+            .contains("distintos"));
+    }
+
+    #[test]
+    fn custom_fills_are_delivered_with_their_state() {
+        // Salto con patrones propios: cada relleno solo aparece con su estado.
+        let d = faulty(64).with_bad([10]).with_sparse(13, 1);
+        let p = ReadPolicy {
+            bad_fill: [0xDE, 0xAD, 0xBE, 0xEF],
+            skip_fill: *b"skp?",
+            ..fill_policy(8, 4, false)
+        };
+        let g = collect(&d, 0, 64, &p);
+        assert_honest(&g, 0, 512, &p);
+        assert_eq!(
+            runs(&g),
+            vec![
+                (0, 10, Read),
+                (10, 1, Unreadable),
+                (11, 2, Skipped),
+                (13, 1, Sparse),
+                (14, 1, Skipped),
+                (15, 49, Read)
+            ]
+        );
+        assert!(g.data[10 * 512..11 * 512]
+            .chunks(4)
+            .all(|c| c == [0xDE, 0xAD, 0xBE, 0xEF]));
+        assert!(g.data[11 * 512..13 * 512].chunks(4).all(|c| c == b"skp?"));
     }
 }

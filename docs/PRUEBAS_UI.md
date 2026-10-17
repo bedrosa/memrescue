@@ -35,13 +35,18 @@ vez por ejecución en un directorio temporal propio (`%TEMP%\memrescue-uitests-*
 | `Sector_de_4096_bytes` | `gpt_4kn.img` con `--sector-size 4096`: «sector de 4096 B»; ▶ → LBA 1 en `0x1000` con `EFI PART`; la página tiene 256 líneas de volcado (4096 B). |
 | `Particion_MBR_en_LBA_2048` | `mbr_basic.img`: la LBA 2048 empieza por el marcador `MEMRESCUE-TEST|mbr_basic|P1|LBA=…`. |
 | `Contenedor_danado_pide_confirmacion_para_el_modo_tolerante` | VHD dinámico con una entrada de la BAT fuera del fichero: la apertura estricta falla y aparece el diálogo «Modo tolerante» (con «MODO TOLERANTE» y «1 bloque descartado»); «No» → ningún origen abierto; «Sí» → visor en la LBA 0, aviso `TolerantBannerText` visible, la LBA 8 muestra `BAD!` y el aviso de no fiables; el fichero no cambia. |
+| `Cada_sector_muestra_su_estado_con_color_y_texto` (`FillPatternUiTests`) | VHD dañado en modo tolerante: leyenda con un elemento por estado (`LegendRead`, `LegendRecovered`, `LegendUnreadable`, `LegendSkipped`, `LegendSparse`) y patrones en uso (`FillPatternsText`: «BAD!»/«SKIP», «nunca son datos»); página de 8 sectores desde la LBA 6 con `SectorState6`…`SectorState13` = leído / «ILEGIBLE · RELLENO», 6 líneas «!! SECTOR NO FIABLE … PATRÓN DE RELLENO «BAD!» (42 41 44 21) …», aviso «6 de 8 sectores»; LBA 24–31 «DISPERSO · CEROS» sin aviso de relleno; la imagen no cambia. |
+| `Patrones_de_relleno_se_validan_y_persisten` (`FillPatternUiTests`) | Herramientas → «Patrones de relleno…» (`ToolsMenu`, `FillPatternsMenuItem`): cuadro con `BadFillBox`/`SkipFillBox` en `BAD!`/`SKIP`; `00000000`, `FFFFFFFF`, texto no válido y el mismo patrón para ambos muestran su error en `FillPatternsError` y deshabilitan `FillPatternsSaveButton`; `FillPatternsResetButton` restablece; `DEADBEEF`/`sk1p` se guardan, el visor se recompone con `DE AD BE EF` marcado como relleno y `settings.json` aparece en el directorio de preferencias de la prueba; una segunda ejecución usa el patrón guardado; con el fichero dañado se usan los valores por defecto sin sobrescribirlo; nada se escribe junto a la imagen. |
 | `Las_imagenes_no_se_modifican` | SHA-256, fecha de modificación y tamaño de las tres imágenes idénticos antes y después de abrirlas y navegar por ellas en tres instancias; cada instancia termina con código 0. |
 
 Para localizar controles se usan los `x:Name` existentes (`LbaBox`, `HexView`, `SectorInfoText`,
 `PositionText`, `StatusText`, `SourcesList`) y `AutomationProperties.AutomationId` añadidos en
 `MainWindow.xaml` a los botones de navegación (`FirstSectorButton`, `PrevSectorButton`, `GoLbaButton`,
 `NextSectorButton`, `LastSectorButton`) y a algunos menús (`DiskMenu`, `PartitionsMenuItem`, `EditorMenu`,
-`GoToSectorMenuItem`, `GoToClusterMenuItem`). Las comprobaciones numéricas no dependen del separador de
+`GoToSectorMenuItem`, `GoToClusterMenuItem`, `ToolsMenu`, `FillPatternsMenuItem`). El visor `HexView` es un
+documento (`RichTextBox`, un bloque coloreado por sector): su texto se lee con `TextPattern` y
+`AppSession.HexText` normaliza los saltos de línea. El estado de cada sector visible se expone en
+`SectorState<LBA>` (p. ej. `SectorState8` = «LBA 8: ILEGIBLE · RELLENO»). Las comprobaciones numéricas no dependen del separador de
 miles de la referencia cultural del sistema.
 
 ## Cómo ejecutarlas
@@ -61,6 +66,9 @@ $env:DOTNET_ROOT = "$PWD\.tools\dotnet"; $env:DOTNET_CLI_TELEMETRY_OPTOUT = '1';
   (`app\src\MemRescue\bin\<Config>\net10.0-windows\win-x64\`), localizado subiendo desde la carpeta de
   las pruebas hasta encontrar `app\MemRescue.slnx`. El proyecto de pruebas referencia a `MemRescue.csproj`
   (sin usar su ensamblado) para que la compilación lo genere antes.
+- Preferencias: `AppSession.Launch` fija siempre `MEMRESCUE_SETTINGS_DIR` a un directorio temporal (propio
+  de la sesión, o el que indique la prueba para comprobar la persistencia) y lo borra al terminar: las
+  pruebas nunca leen ni escriben `%APPDATA%\MemRescue`.
 - Variables opcionales: `MEMRESCUE_EXE` (otro ejecutable) y `MEMRESCUE_PYTHON` (intérprete de Python;
   por defecto `python` del PATH).
 
@@ -87,14 +95,20 @@ $env:DOTNET_ROOT = "$PWD\.tools\dotnet"; $env:DOTNET_CLI_TELEMETRY_OPTOUT = '1';
 
 - `WindowPattern.Close` de UIA se ignora si antes se ha abierto un menú por UI Automation; por eso el
   cierre usa `WM_CLOSE` (`Process.CloseMainWindow`) y deja `WindowPattern.Close` como alternativa.
-- No se prueban los cuadros de diálogo modales («Abrir imagen…», «Ir a sector…», avisos): bloquearían la
-  prueba si algo fallara y su lógica ya está cubierta por otras vías. Tampoco hashes ni legibilidad desde
+- No se prueban los cuadros de diálogo modales «Abrir imagen…» e «Ir a sector…»: bloquearían la prueba si
+  algo fallara y su lógica ya está cubierta por otras vías. Sí se prueban el aviso «Modo tolerante» y el
+  cuadro «Patrones de relleno», que se abre de forma asíncrona (`Dispatcher.BeginInvoke`) para que la
+  llamada `Invoke` de UI Automation no quede bloqueada. Tampoco hashes ni legibilidad desde
   la pestaña «Comprobaciones» (cubiertos por `--selftest` y las pruebas de interop).
-- El aspecto visual (colores, disposición) no se verifica; para eso está la captura `--screenshot`.
+- Los colores no se leen por UI Automation: se comprueba el texto de cada estado y la leyenda, y la
+  paleta (distinción y contraste ≥ 7:1) en `FillPatternTests`; el aspecto se revisa con `--screenshot`.
+  Con alto contraste el visor usa los colores del sistema; no hay prueba automática de ese modo.
 - Si se cuelga `testhost` a mitad de una prueba, puede quedar abierta una ventana de MemRescue (no hay
   objeto de trabajo de Windows que la ate al proceso de pruebas).
 
 ## Resultados reales (2026-10-17, Windows 11 Pro 26200, sesión interactiva)
+
+- Issue #7: `MemRescue.UiTests` **13 de 13 superadas** (~29 s), 94 de interop.
 
 - `dotnet build app\MemRescue.slnx -c Debug`: 0 advertencias, 0 errores.
 - `MemRescue.UiTests`: **7 de 7 superadas**, ~12–16 s en total (≈1 s por prueba; 3 s la de

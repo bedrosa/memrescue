@@ -1,4 +1,5 @@
-﻿using System.Runtime.InteropServices;
+﻿using System.Buffers.Binary;
+using System.Runtime.InteropServices;
 using System.Text;
 
 namespace MemRescue.Core.Interop;
@@ -332,7 +333,20 @@ public sealed class Source : EngineHandle
     /// Lee sectores tolerando errores, con el estado de cada uno. Los ilegibles llegan con un patrón
     /// de relleno que NUNCA debe presentarse como datos: consulte <see cref="MappedSectors.States"/>.
     /// </summary>
-    public MappedSectors ReadSectorsMapped(ulong lba, uint count, uint retries = 1)
+    /// <param name="lba">Primer sector.</param>
+    /// <param name="count">Nº de sectores (al menos 1).</param>
+    /// <param name="retries">Reintentos por sector ilegible (0–100).</param>
+    /// <param name="badFill">Relleno de los ilegibles; <c>null</c> = <see cref="FillPattern.DefaultBad"/>.</param>
+    /// <param name="skipFill">Relleno de los saltados; <c>null</c> = <see cref="FillPattern.DefaultSkip"/>.</param>
+    /// <param name="jumpSectors">Tras un ilegible, sectores que se marcan saltados sin leerlos (0 = sin salto).</param>
+    /// <param name="readBack">Tras un salto, leer hacia atrás hasta el siguiente error.</param>
+    /// <remarks>
+    /// Los patrones deben cumplir <see cref="FillPattern.Validate"/>; si no, el motor responde con
+    /// <see cref="EngineStatus.InvalidArgument"/>. Sin patrones ni salto se usa
+    /// <c>mr_source_read_mapped</c>; en otro caso, <c>mr_source_read_mapped_ex</c>.
+    /// </remarks>
+    public MappedSectors ReadSectorsMapped(ulong lba, uint count, uint retries = 1, FillPattern? badFill = null,
+        FillPattern? skipFill = null, ulong jumpSectors = 0, bool readBack = false)
     {
         if (count == 0)
         {
@@ -341,7 +355,24 @@ public sealed class Source : EngineHandle
         var len = checked((int)(count * Info.SectorSize));
         var buf = new byte[len];
         var states = new byte[count];
-        Engine.Check(NativeMethods.mr_source_read_mapped(Handle, lba, count, retries, buf, (nuint)buf.Length, states, (nuint)states.Length, out var n));
+        nuint n;
+        if (badFill is null && skipFill is null && jumpSectors == 0 && !readBack)
+        {
+            Engine.Check(NativeMethods.mr_source_read_mapped(Handle, lba, count, retries, buf, (nuint)buf.Length, states, (nuint)states.Length, out n));
+        }
+        else
+        {
+            var o = new MrReadOptions
+            {
+                StructSize = (uint)Marshal.SizeOf<MrReadOptions>(),
+                Flags = readBack ? NativeMethods.ReadReadBack : 0,
+                JumpSectors = jumpSectors,
+                Retries = retries,
+                BadFill = BinaryPrimitives.ReadUInt32LittleEndian((badFill ?? FillPattern.DefaultBad).ToArray()),
+                SkipFill = BinaryPrimitives.ReadUInt32LittleEndian((skipFill ?? FillPattern.DefaultSkip).ToArray()),
+            };
+            Engine.Check(NativeMethods.mr_source_read_mapped_ex(Handle, lba, count, in o, buf, (nuint)buf.Length, states, (nuint)states.Length, out n));
+        }
         if ((int)n != len)
         {
             throw new EngineException(EngineStatus.Io, $"Lectura incompleta: {n} de {len} bytes.");
