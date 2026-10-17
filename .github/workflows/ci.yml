@@ -1,0 +1,140 @@
+name: CI
+
+on:
+  push:
+    branches: ["feat/**", "fix/**"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+  DOTNET_NOLOGO: "1"
+
+jobs:
+  hygiene:
+    name: Repository hygiene
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      - name: Personal paths, credentials, excluded material, punctuation and binary assets
+        run: python -I -X utf8 tools/check_repo_hygiene.py
+
+  rust:
+    name: Rust (fmt, clippy, tests, corpus)
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install && rustup show active-toolchain
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            target
+          key: rust-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: rust-${{ runner.os }}-
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: cargo test
+        run: cargo test --workspace --locked
+      - name: Generate synthetic corpus
+        run: python -I -X utf8 tests/generators/gen_partition_images.py tests/corpus/generated
+      - name: Validate corpus against versioned manifests
+        run: python -I -X utf8 tests/generators/validate_partition_images.py tests/corpus/generated tests/corpus/manifests
+      - name: Validator negative tests
+        run: python -I -X utf8 tests/generators/test_validator.py tests/corpus/generated tests/corpus/manifests
+      - name: Engine cross-checks against the corpus
+        run: cargo test -p memrescue-cli --test corpus --locked -- --ignored
+
+  dotnet:
+    name: .NET build and interop tests
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          global-json-file: global.json
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install && rustup show active-toolchain
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            target
+          key: rust-dotnet-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: rust-dotnet-${{ runner.os }}-
+      - name: Generate synthetic corpus (used by interop tests)
+        run: python -I -X utf8 tests/generators/gen_partition_images.py tests/corpus/generated
+      - name: Build solution (warnings as errors, builds the native engine)
+        run: dotnet build app/MemRescue.slnx -c Debug
+      - name: Interop tests (C# against the real memrescue_core.dll)
+        run: dotnet test app/tests/MemRescue.Core.Interop.Tests/MemRescue.Core.Interop.Tests.csproj -c Debug --no-build
+
+  formats:
+    name: Container readers against qemu-img
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install && rustup show active-toolchain
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            target
+          key: rust-formats-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: rust-formats-${{ runner.os }}-
+      - name: Cache verified qemu-img
+        id: qemu-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .tools/qemu/bin
+          key: qemu-img-${{ runner.os }}-${{ hashFiles('tools/fetch_qemu_img.py') }}
+      - name: Fetch qemu-img (signed MSYS2 packages, verified with GPG and SHA-256)
+        if: steps.qemu-cache.outputs.cache-hit != 'true'
+        run: python -I -X utf8 tools/fetch_qemu_img.py .tools/qemu
+      - name: Generate synthetic corpus
+        run: python -I -X utf8 tests/generators/gen_partition_images.py tests/corpus/generated
+      - name: Readers compared byte by byte with qemu-img conversions
+        shell: pwsh
+        run: |
+          $env:MR_QEMU_IMG = (Resolve-Path .tools/qemu/bin/qemu-img.exe).Path
+          cargo test --release --locked -p mr-image -p mr-api -- --ignored

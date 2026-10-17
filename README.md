@@ -12,17 +12,20 @@ legibilidad (con salto y lectura hacia atrás); el resto aparece deshabilitado c
 
 ## Compilar y probar
 
-Requisitos ya presentes en el equipo: Rust (MSVC), Visual Studio Build Tools, Python 3, Git.
-El SDK de .NET 10 está en `.tools\dotnet` (local al proyecto, no versionado).
+Requisitos: Rust (MSVC; la versión exacta la fija `rust-toolchain.toml`), Visual Studio Build Tools,
+Python 3.14 y Git. El SDK de .NET 10 se puede instalar en `.tools\dotnet` (local al proyecto, no
+versionado); los scripts lo usan si existe.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\build.ps1     # compila motor, CLI, DLL y WPF
-powershell -ExecutionPolicy Bypass -File scripts\test.ps1      # 10 pasos de verificación
+powershell -ExecutionPolicy Bypass -File scripts\test.ps1      # 14 pasos de verificación
 powershell -ExecutionPolicy Bypass -File scripts\build.ps1 -Configuration Release -Publish
 #   → artifacts\MemRescue\MemRescue.exe (autocontenido, no necesita .NET instalado)
 ```
 
 CLI: `target\debug\memrescue-cli.exe help`.
+
+Flujo de trabajo, ramas, issues, integración continua y normas del repositorio: [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Estructura
 
