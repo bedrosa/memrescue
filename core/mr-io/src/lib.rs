@@ -5,6 +5,7 @@
 //! - [`MemDevice`]: búfer en memoria (pruebas).
 //! - [`FaultyDevice`]: envoltorio que simula sectores ilegibles y regiones dispersas (pruebas).
 //! - [`RangeView`]: rango de sectores de otro dispositivo presentado como dispositivo propio.
+//! - [`NullDevice`] / [`PatternDevice`]: dispositivos virtuales de ceros (dispersos) o de patrón constante.
 //!
 //! El acceso a dispositivos físicos está **prohibido** en esta fase: ver [`path_policy`].
 //! Los contenedores (VHD, VHDX, VMDK…) se **detectan** aquí ([`format`]) y se interpretan en
@@ -14,6 +15,7 @@ pub mod fault;
 pub mod format;
 mod image;
 mod mem;
+mod null;
 pub mod path_policy;
 pub mod resilient;
 pub mod view;
@@ -22,6 +24,7 @@ pub use fault::FaultyDevice;
 pub use format::{probe_file, probe_format, ImageFormat};
 pub use image::{read_exact_at, ImageFile};
 pub use mem::MemDevice;
+pub use null::{NullDevice, PatternDevice};
 pub use view::RangeView;
 
 /// Estado de validez de cada sector entregado por una lectura. Toda exportación o recuperación debe
