@@ -39,6 +39,9 @@ pub const MR_ERR_UNSUPPORTED_FEATURE: i32 = 14;
 pub const MR_OPEN_FORCE_RAW: u32 = 1;
 /// `mr_source_open`: abrir la imagen dividida que empieza en la ruta indicada.
 pub const MR_OPEN_SPLIT: u32 = 2;
+/// `mr_source_open`: modo tolerante para contenedores con estructuras de asignación parcialmente
+/// dañadas (ADR-020). Compatible con la ABI 3: es un bit nuevo de `flags`.
+pub const MR_OPEN_TOLERANT: u32 = 4;
 /// `mr_source_verify_start`: leer hacia atrás tras un salto.
 pub const MR_VERIFY_READ_BACK: u32 = 1;
 /// Máximo de reintentos por sector aceptado en la frontera C.
@@ -426,7 +429,7 @@ pub unsafe extern "C" fn mr_source_open(
         if out_source.is_null() {
             return fail(MR_ERR_INVALID_ARGUMENT, "puntero de salida nulo");
         }
-        if flags & !(MR_OPEN_FORCE_RAW | MR_OPEN_SPLIT) != 0 {
+        if flags & !(MR_OPEN_FORCE_RAW | MR_OPEN_SPLIT | MR_OPEN_TOLERANT) != 0 {
             return fail(MR_ERR_INVALID_ARGUMENT, "opciones de apertura no válidas");
         }
         // SAFETY: contrato del llamador.
@@ -437,6 +440,7 @@ pub unsafe extern "C" fn mr_source_open(
         let opts = OpenOptions {
             sector_size,
             force_raw: flags & MR_OPEN_FORCE_RAW != 0,
+            tolerant: flags & MR_OPEN_TOLERANT != 0,
         };
         let r = if flags & MR_OPEN_SPLIT != 0 {
             mr_api::open_split_source(p, opts)

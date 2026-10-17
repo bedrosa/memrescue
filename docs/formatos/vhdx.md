@@ -52,10 +52,12 @@ Implementación original a partir de la especificación pública; no se ha usado
      región (que ya está dentro del fichero): la memoria queda acotada por ambos **antes** de reservar.
      Se lee por trozos de 1 MiB y solo se guarda un `u64` por bloque de datos.
    - Estados de bloque: NOT_PRESENT, UNDEFINED, ZERO, UNMAPPED → ceros (`Allocation::Sparse`);
-     FULLY_PRESENT → datos; PARTIALLY_PRESENT (solo válido con padre) y 4/5 → `Corrupt`.
-   - Mapa de bits: solo NOT_PRESENT o PRESENT.
+     FULLY_PRESENT → datos; PARTIALLY_PRESENT (solo válido con padre) y 4/5 → `Corrupt` en modo
+     estricto, bloque descartado en modo tolerante.
+   - Mapa de bits: solo NOT_PRESENT o PRESENT (en modo tolerante, los demás se cuentan y se ignoran).
    - Bloque presente: desplazamiento ≥ 1 MiB, la parte del bloque que cubre el disco virtual dentro
-     del fichero y sin solaparse con cabeceras, registro, metadatos ni BAT.
+     del fichero y sin solaparse con cabeceras, registro, regiones (metadatos, BAT, opcionales) **ni
+     con otro bloque** (entradas duplicadas incluidas).
 7. `read_at` y `allocation` con aritmética comprobada; `allocation` valida el rango como la
    implementación por defecto y devuelve tramos ordenados y fusionados que lo cubren exactamente.
 
@@ -71,6 +73,22 @@ Todo error de E/S del fichero se devuelve como `IoError::Read`; no hay pánicos 
   la interpretación conservadora y coincide con qemu).
 - Bits reservados de la BAT (3–19) no se validan, para no rechazar imágenes de otros escritores.
 - El último bloque solo necesita estar en el fichero en la parte que cubre el tamaño virtual.
+
+## Modo tolerante (ADR-020)
+
+`VhdxImage::open_with(file, true)` (o `OpenOptions::tolerant`). Correspondencia inequívoca de una entrada
+de bloque: estado NOT_PRESENT/UNDEFINED/ZERO/UNMAPPED (ceros) o FULLY_PRESENT con el bloque (parte útil)
+entero en el fichero, a partir de 1 MiB, sin solapar la zona de cabeceras, el registro, ninguna región
+ni el bloque de otra entrada. Estados 4, 5 y PARTIALLY_PRESENT, desplazamientos desbordados, bloques
+fuera del fichero y solapes descartan el bloque (en un solape, **todos** los implicados). Un bloque
+descartado se lee con `IoError::Read` y `allocation` lo informa como `Data`. Las entradas de mapa de
+bits con estado inválido no afectan a los datos de un disco sin padre: se cuentan («N entradas de mapa
+de bits no válidas ignoradas») y se ignoran. `describe()` añade «; modo tolerante: N bloques descartados
+(no fiables)». Identificador, cabeceras, registro, tablas de regiones, metadatos y ubicación de la BAT
+siguen siendo críticos (`Corrupt` en ambos modos). Pruebas (`vhdx.rs`, 3): fuera del fichero,
+desbordado, en la zona de cabeceras, sobre el registro, los metadatos y la BAT, duplicada, estados 4 y 5,
+PARTIALLY_PRESENT y varias a la vez (comparación sector a sector con `mr_io::resilient`, inmutabilidad),
+mapa de bits inválido ignorado y estructuras críticas en ambos modos.
 
 ## Pruebas y resultados reales
 
@@ -105,7 +123,9 @@ dispersión se verifica con las pruebas unitarias.
 ## Limitaciones
 
 - No se reproduce el registro ni se abren discos diferenciales.
-- No se valida que dos bloques de datos no se solapen entre sí.
+- No se valida la ubicación de los bloques de mapa de bits de sectores (no se usan en discos sin padre).
+- El modo tolerante no tiene prueba con qemu-img (la BAT se localiza en la tabla de regiones); se cubre
+  con imágenes sintéticas.
 - No hay prueba con qemu de sector lógico de 4096 B (qemu-img no lo permite crear); cubierto con
   imágenes sintéticas.
 - Los metadatos de usuario y las regiones opcionales desconocidas se ignoran.

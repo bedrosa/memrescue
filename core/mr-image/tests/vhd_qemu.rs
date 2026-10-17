@@ -273,3 +273,105 @@ fn qemu_fixed_and_dynamic_odd_size() {
     check_case(dir.path(), "odd", &raw, "fixed");
     check_case(dir.path(), "odd", &raw, "dynamic");
 }
+
+/// Lectura tolerante completa comparada **sector a sector** con la referencia de qemu-img: los
+/// sectores de `bad` son `Unreadable` con el patrón de relleno; los demás, idénticos a la
+/// referencia. La lectura estricta completa falla.
+fn assert_tolerant_matches(dev: &dyn BlockDevice, reference: &[u8], bad: (u64, u64)) {
+    use mr_io::resilient::{read_range, OnError, ReadPolicy};
+    use mr_io::SectorState;
+    let policy = ReadPolicy {
+        on_error: OnError::FillAndContinue,
+        ..ReadPolicy::default()
+    };
+    let total = dev.sector_count();
+    let mut data = Vec::new();
+    let mut states = Vec::new();
+    read_range(
+        dev,
+        0,
+        total,
+        &policy,
+        |_, d, s| {
+            data.extend_from_slice(d);
+            states.extend_from_slice(s);
+            Ok(())
+        },
+        |_, _| true,
+    )
+    .unwrap();
+    for lba in 0..total {
+        let i = lba as usize;
+        let got = &data[i * 512..(i + 1) * 512];
+        if lba >= bad.0 && lba < bad.0 + bad.1 {
+            assert_eq!(states[i], SectorState::Unreadable, "LBA {lba}");
+            assert!(got.chunks(4).all(|c| c == b"BAD!"), "LBA {lba}");
+        } else {
+            assert!(states[i].is_trustworthy(), "LBA {lba}");
+            assert!(got == &reference[i * 512..(i + 1) * 512], "LBA {lba}");
+        }
+    }
+    let mut all = vec![0u8; dev.size() as usize];
+    assert!(dev.read_at(0, &mut all).is_err());
+}
+
+#[test]
+#[ignore = "requiere qemu-img; lo ejecuta scripts/test.ps1"]
+fn qemu_dynamic_with_damaged_bat_entry_in_tolerant_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let raw = raw_16m();
+    let raw_path = dir.path().join("t.raw");
+    std::fs::write(&raw_path, &raw).unwrap();
+    let vhd_path = dir.path().join("t.vhd");
+    let ref_path = dir.path().join("t.ref.raw");
+    let (raw_s, vhd_s, ref_s) = (
+        raw_path.to_str().unwrap(),
+        vhd_path.to_str().unwrap(),
+        ref_path.to_str().unwrap(),
+    );
+    qemu(&[
+        "convert",
+        "-f",
+        "raw",
+        "-O",
+        "vpc",
+        "-o",
+        "subformat=dynamic,force_size=on",
+        raw_s,
+        vhd_s,
+    ]);
+    qemu(&["convert", "-f", "vpc", "-O", "raw", vhd_s, ref_s]);
+    let reference = std::fs::read(&ref_path).unwrap();
+    // Entrada de la BAT del bloque 2 (con datos) apuntando fuera del fichero.
+    let mut bytes = std::fs::read(&vhd_path).unwrap();
+    let be64 = |o: usize| u64::from_be_bytes(bytes[o..o + 8].try_into().unwrap());
+    let dyn_header = be64(16) as usize;
+    let bat = be64(dyn_header + 16) as usize;
+    assert_ne!(
+        &bytes[bat + 8..bat + 12],
+        &[0xFF; 4],
+        "el bloque 2 debe estar asignado"
+    );
+    bytes[bat + 8..bat + 12].copy_from_slice(&0x7FFF_0000u32.to_be_bytes());
+    std::fs::write(&vhd_path, &bytes).unwrap();
+    let before = fingerprint(&vhd_path);
+
+    assert!(matches!(
+        VhdImage::open(File::open(&vhd_path).unwrap()),
+        Err(mr_io::IoError::Corrupt { .. })
+    ));
+    let img = VhdImage::open_with(File::open(&vhd_path).unwrap(), true).unwrap();
+    assert_eq!(img.discarded_blocks(), 1);
+    let per_block = (BLOCK / 512) as u64;
+    assert_tolerant_matches(&img, &reference, (2 * per_block, per_block));
+    assert_eq!(
+        img.allocation(2 * per_block, per_block).unwrap(),
+        vec![(2 * per_block, per_block, Allocation::Data)]
+    );
+    drop(img);
+    assert_eq!(
+        fingerprint(&vhd_path),
+        before,
+        "el VHD se modificó al leerlo"
+    );
+}

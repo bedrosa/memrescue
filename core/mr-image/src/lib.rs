@@ -9,11 +9,16 @@
 //! - Validación estricta de cabeceras, sumas de control, desplazamientos y tamaños contra el tamaño real
 //!   del fichero; memoria acotada (tablas ≤ 256 MiB); errores `IoError::Corrupt`,
 //!   `IoError::UnsupportedFeature` o `IoError::ExternalReference` (padres, extensiones externas), nunca pánicos.
+//! - Modo estricto por defecto; modo tolerante solo por petición explícita
+//!   ([`OpenOptions::tolerant`], ADR-020): las entradas de asignación inválidas o ambiguas descartan
+//!   solo su bloque o grano, que se lee con error (`IoError::Read`) y se informa como `Data` en
+//!   `allocation`, para que el lector tolerante lo marque `Unreadable` con el patrón de relleno.
 //! - Basado en especificaciones públicas; probado contra `qemu-img` como referencia independiente.
 
 pub mod crc32c;
 pub mod open;
 pub mod split;
+mod tolerant;
 pub mod vhd;
 pub mod vhdx;
 pub mod vmdk;

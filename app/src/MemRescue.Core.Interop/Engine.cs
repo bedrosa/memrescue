@@ -181,10 +181,19 @@ public static class Engine
     /// <param name="sectorSize">Tamaño de sector lógico (potencia de 2, 512–65536); 0 = nativo del formato.</param>
     /// <param name="forceRaw">Interpretar como RAW aunque parezca un contenedor (VHD, VMDK…).</param>
     /// <param name="split">Abrir la imagen dividida que empieza en <paramref name="path"/> (x.001).</param>
-    public static Source OpenSource(string path, uint sectorSize = 0, bool forceRaw = false, bool split = false)
+    /// <param name="tolerant">
+    /// Modo tolerante para VHD, VHDX y VMDK con tablas de asignación parcialmente dañadas (solo por
+    /// petición explícita del usuario): los bloques con entradas inválidas o ambiguas se descartan y
+    /// se leen como ilegibles (patrón de relleno, nunca datos); <see cref="Source.Description"/> lo
+    /// indica con el número de bloques descartados. Sin él, esas imágenes fallan con
+    /// <see cref="EngineStatus.Corrupt"/>.
+    /// </param>
+    public static Source OpenSource(string path, uint sectorSize = 0, bool forceRaw = false, bool split = false,
+        bool tolerant = false)
     {
         var p = Utf8(path);
-        var flags = (forceRaw ? NativeMethods.OpenForceRaw : 0) | (split ? NativeMethods.OpenSplit : 0);
+        var flags = (forceRaw ? NativeMethods.OpenForceRaw : 0) | (split ? NativeMethods.OpenSplit : 0)
+            | (tolerant ? NativeMethods.OpenTolerant : 0);
         Check(NativeMethods.mr_source_open(p, (nuint)p.Length, sectorSize, flags, out var h));
         return new Source(h, path);
     }

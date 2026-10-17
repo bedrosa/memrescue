@@ -13,6 +13,7 @@ internal static partial class NativeMethods
 
     internal const uint OpenForceRaw = 1;
     internal const uint OpenSplit = 2;
+    internal const uint OpenTolerant = 4;
     internal const uint VerifyReadBack = 1;
     internal const uint VerifyIgnoreAllErrors = 2;
     internal const int MaxSkipCodes = 256;

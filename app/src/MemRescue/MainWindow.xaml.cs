@@ -11,9 +11,12 @@ using Microsoft.Win32;
 namespace MemRescue;
 
 /// <summary>Origen abierto en la sesión (imagen, contenedor, imagen dividida o rango), en solo lectura.</summary>
-public sealed class SourceEntry(Source source, ImageFormat detected, bool forcedRaw, string? label = null) : IDisposable
+public sealed class SourceEntry(Source source, ImageFormat detected, bool forcedRaw, string? label = null, bool tolerant = false) : IDisposable
 {
     public Source Source { get; } = source;
+
+    /// <summary>Contenedor abierto en modo tolerante (bloques con entradas de asignación dañadas descartados).</summary>
+    public bool Tolerant { get; } = tolerant;
 
     public ImageInfo Info => Source.Info;
 
@@ -26,7 +29,8 @@ public sealed class SourceEntry(Source source, ImageFormat detected, bool forced
 
     public string FileName => label ?? Path.GetFileName(Info.Path);
 
-    public string Summary => $"{MainWindow.FormatSize(Info.SizeBytes)} · {Info.SectorCount:N0} × {Info.SectorSize} B";
+    public string Summary => $"{MainWindow.FormatSize(Info.SizeBytes)} · {Info.SectorCount:N0} × {Info.SectorSize} B"
+        + (Tolerant ? " · MODO TOLERANTE" : "");
 
     public void Dispose() => Source.Dispose();
 }
@@ -175,8 +179,23 @@ public partial class MainWindow : Window
                 }
                 forceRaw = true;
             }
-            var source = await Task.Run(() => Engine.OpenSource(path, sectorSize, forceRaw, split));
-            var entry = new SourceEntry(source, format, forceRaw);
+            Source source;
+            var tolerant = false;
+            try
+            {
+                source = await Task.Run(() => Engine.OpenSource(path, sectorSize, forceRaw, split));
+            }
+            catch (EngineException ex) when (ex.Status == EngineStatus.Corrupt && !forceRaw && !split
+                && format is ImageFormat.Vhd or ImageFormat.Vhdx or ImageFormat.Vmdk)
+            {
+                if (await OfferTolerantAsync(path, sectorSize, ex, interactive) is not { } t)
+                {
+                    return null;
+                }
+                source = t;
+                tolerant = true;
+            }
+            var entry = new SourceEntry(source, format, forceRaw, tolerant: tolerant);
             AddSource(entry);
             Log($"Origen abierto en solo lectura: {path}, {source.Description} ({entry.Info.SizeBytes:N0} bytes, {entry.Info.SectorCount:N0} sectores de {entry.Info.SectorSize} B).");
             if (entry.Info.TrailingBytes > 0)
@@ -201,6 +220,45 @@ public partial class MainWindow : Window
         {
             StatusText.Text = "Listo";
         }
+    }
+
+    /// <summary>
+    /// La apertura estricta de un contenedor falló con <see cref="EngineStatus.Corrupt"/>. Se evalúa
+    /// en solo lectura si el daño se limita a las estructuras de asignación (el modo tolerante solo
+    /// abre la imagen en ese caso; con cabeceras o metadatos críticos dañados vuelve a fallar) y, si
+    /// es así, se pide confirmación explícita antes de abrirla en modo tolerante. Si el usuario no
+    /// confirma, el origen evaluado se cierra sin añadirse a la sesión.
+    /// </summary>
+    private async Task<Source?> OfferTolerantAsync(string path, uint sectorSize, EngineException strictError, bool interactive)
+    {
+        Source candidate;
+        try
+        {
+            candidate = await Task.Run(() => Engine.OpenSource(path, sectorSize, tolerant: true));
+        }
+        catch (EngineException)
+        {
+            throw strictError; // Daño en estructuras críticas: se informa el error original.
+        }
+        Log($"Apertura estricta rechazada ({strictError.Message}); el modo tolerante podría abrirla: {candidate.Description}.");
+        var answer = interactive
+            ? MessageBox.Show(this,
+                $"«{Path.GetFileName(path)}» tiene estructuras de asignación dañadas:\n\n{strictError.Message}\n\n" +
+                $"Puede abrirse en MODO TOLERANTE ({candidate.Description}).\n\n" +
+                "En ese modo solo se leen los bloques cuya ubicación es inequívoca. Los bloques descartados se " +
+                "muestran como ILEGIBLES (patrón de relleno), nunca como datos; los hashes de la imagen completa " +
+                "fallarán y la comprobación los contará como no fiables. El fichero no se modifica.\n\n" +
+                "¿Abrir la imagen en modo tolerante?",
+                "Modo tolerante", MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No)
+            : MessageBoxResult.No;
+        if (answer != MessageBoxResult.Yes)
+        {
+            candidate.Dispose();
+            Log($"No se abrió {path} en modo tolerante.");
+            return null;
+        }
+        Log($"AVISO: {path} abierto en modo tolerante por decisión del usuario.");
+        return candidate;
     }
 
     /// <summary>Formatos con lector en el motor (VMDK descriptor: el motor informa de la referencia externa).</summary>
@@ -249,7 +307,7 @@ public partial class MainWindow : Window
         {
             var src = await Task.Run(() => parent.Source.OpenRange(start, count));
             var entry = new SourceEntry(src, parent.Detected, parent.ForcedRaw,
-                $"{parent.FileName} [LBA {start:N0}–{start + count - 1:N0}]");
+                $"{parent.FileName} [LBA {start:N0}–{start + count - 1:N0}]", parent.Tolerant);
             AddSource(entry);
             Log($"Rango abierto como dispositivo: {src.Description} ({count:N0} sectores).");
             return entry;
@@ -293,8 +351,13 @@ public partial class MainWindow : Window
             SectorInfoText.Text = "";
             PositionText.Text = "";
             UntrustedBanner.Visibility = Visibility.Collapsed;
+            TolerantBanner.Visibility = Visibility.Collapsed;
             return;
         }
+        TolerantBanner.Visibility = s.Tolerant ? Visibility.Visible : Visibility.Collapsed;
+        TolerantBannerText.Text = s.Tolerant
+            ? $"MODO TOLERANTE: {s.Source.Description}. Los bloques descartados se muestran como ilegibles (patrón de relleno), nunca como datos."
+            : "";
         PropPath.Text = s.Info.Path;
         PropFormat.Text = s.Source.Description;
         PropDetails.Text = s.Source.RangeStart is { } rs

@@ -181,6 +181,11 @@
                         </WrapPanel>
                         <TextBlock x:Name="SectorInfoText" DockPanel.Dock="Top" Margin="0,0,0,4" FontFamily="Consolas"
                                    Foreground="{StaticResource BrandBrush}" />
+                        <Border x:Name="TolerantBanner" DockPanel.Dock="Top" Visibility="Collapsed" Margin="0,0,0,4" Padding="6,3"
+                                Background="#FFFFF4E0" BorderBrush="#FFE65100" BorderThickness="1">
+                            <TextBlock x:Name="TolerantBannerText" Foreground="#FFBF360C" FontWeight="SemiBold" TextWrapping="Wrap"
+                                       AutomationProperties.AutomationId="TolerantBannerText" />
+                        </Border>
                         <Border x:Name="UntrustedBanner" DockPanel.Dock="Top" Visibility="Collapsed" Margin="0,0,0,4" Padding="6,3"
                                 Background="#FFFCE4E4" BorderBrush="#FFC62828" BorderThickness="1">
                             <TextBlock x:Name="UntrustedBannerText" Foreground="#FFB71C1C" FontWeight="SemiBold" TextWrapping="Wrap"

@@ -117,6 +117,10 @@ Independientes del tamaño del rango y del salto:
 
 ## Uso en el resto del motor
 
+- Contenedores en modo tolerante (ADR-020): los bloques o granos con entradas de asignación inválidas o
+  ambiguas fallan en `read_at` con `IoError::Read` y se informan como `Data` en `allocation`, así que este
+  lector los entrega como `Unreadable` con `bad_fill`; nunca aparecen como `Read` ni como `Sparse`.
+
 - `mr_api::verify` devuelve el `ReadReport` con el mapa.
 - `mr-ffi` (ABI 3): `mr_source_verify_start` (reintentos, salto, lectura hacia atrás) y
   `mr_source_verify_start_ex` con `mr_verify_options` (además, `skip_codes` y

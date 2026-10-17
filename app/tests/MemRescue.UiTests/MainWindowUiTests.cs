@@ -155,6 +155,45 @@ public sealed class MainWindowUiTests(TestImages images)
     }
 
     [Fact]
+    public void Contenedor_danado_pide_confirmacion_para_el_modo_tolerante()
+    {
+        var before = FileFingerprint.Of(images.DamagedVhd);
+
+        // «No»: la imagen no se abre.
+        using (var app = AppSession.Launch(images.DamagedVhd, waitForViewer: false))
+        {
+            var dialog = app.WaitForDialog("Modo tolerante");
+            var text = AppSession.DialogText(dialog);
+            Assert.Contains("MODO TOLERANTE", text, StringComparison.Ordinal);
+            Assert.Contains("1 bloque descartado", text, StringComparison.Ordinal);
+            AppSession.ClickDialogButton(dialog, "7");
+            app.WaitUntil(() => app.Status == "Listo", "el estado «Listo»");
+            var items = app.ById("SourcesList").FindAll(TreeScope.Children,
+                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.ListItem));
+            Assert.Empty(items);
+            Assert.True(app.CloseGracefully(), "MemRescue debe cerrarse limpiamente (código 0).");
+        }
+
+        // «Sí»: se abre con un aviso visible y los sectores descartados son ilegibles.
+        using (var app = AppSession.Launch(images.DamagedVhd, waitForViewer: false))
+        {
+            AppSession.ClickDialogButton(app.WaitForDialog("Modo tolerante"), "6");
+            app.WaitUntil(() => app.HexText.Contains("── LBA 0 ·", StringComparison.Ordinal), "el visor con la LBA 0");
+            var banner = app.ById("TolerantBannerText").Current.Name;
+            Assert.Contains("MODO TOLERANTE", banner, StringComparison.Ordinal);
+            Assert.Contains("1 bloque descartado", banner, StringComparison.Ordinal);
+            app.SetText("LbaBox", "8");
+            app.Invoke("GoLbaButton");
+            app.WaitForLba(8);
+            app.WaitUntil(() => app.ById("UntrustedBannerText").Current.Name.Length > 0, "el aviso de sectores no fiables");
+            Assert.Contains("BAD!", DumpLine(app.HexText, 8 * 512), StringComparison.Ordinal);
+            Assert.True(app.CloseGracefully(), "MemRescue debe cerrarse limpiamente (código 0).");
+        }
+
+        Assert.Equal(before, FileFingerprint.Of(images.DamagedVhd));
+    }
+
+    [Fact]
     public void Las_imagenes_no_se_modifican()
     {
         string[] paths = [images.GptBasic, images.Gpt4Kn, images.MbrBasic];

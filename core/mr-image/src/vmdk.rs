@@ -10,18 +10,25 @@
 //!
 //! Decisiones:
 //! - Se usa el GD **principal** (`gdOffset`); el redundante (`rgdOffset`) no se lee ni se compara.
-//! - El GD se carga completo al abrir (acotado por [`crate::MAX_TABLE_BYTES`] y por el tamaño del
-//!   fichero); las GT se cargan de forma perezosa con una caché de una sola GT.
+//! - El GD y todas las GT presentes se cargan y validan al abrir (cada una acotada por
+//!   [`crate::MAX_TABLE_BYTES`] y por el tamaño del fichero): una GT o un grano fuera del fichero,
+//!   que solapa la cabecera, el descriptor, el GD, una GT u otro grano (incluidas las entradas
+//!   duplicadas), o una entrada 1 sin el indicador «zeroed-grain», hace que la apertura falle con
+//!   `Corrupt` en modo estricto.
+//! - Modo tolerante ([`VmdkImage::open_with`], ADR-020): esas entradas se descartan. Una entrada de
+//!   GD inválida descarta los granos de su GT; una entrada de GT inválida, solo su grano. Los granos
+//!   descartados se leen con error y se informan como datos no fiables. La cabecera, el descriptor
+//!   y la ubicación del GD siguen siendo críticos (`Corrupt` en ambos modos).
 //! - Nunca se abren otros ficheros: padres, extensiones adicionales, descriptores separados y
 //!   rutas del descriptor solo aparecen como texto (saneado y truncado) en los errores.
 //! - Se rechazan con [`IoError::UnsupportedFeature`]: streamOptimized (compresión, marcadores o
 //!   GD al final), `COWD` (ESX antiguo), versiones e indicadores desconocidos y descriptores de
 //!   texto separados (monolithicFlat, twoGbMaxExtent*, vmfs…).
 
+use crate::tolerant::{self, Damage, Zone};
 use crate::MAX_TABLE_BYTES;
 use mr_io::{Allocation, AllocationRun, BlockDevice, IoError, Result};
 use std::fs::File;
-use std::sync::Mutex;
 
 const FORMAT: &str = "VMDK";
 const SECTOR: u64 = 512;
@@ -45,6 +52,13 @@ const GTES_PER_GT: u64 = 512;
 const GT_BYTES: u64 = GTES_PER_GT * 4;
 /// Entrada de GT que marca un grano a cero (con el indicador «zeroed-grain»).
 const GTE_ZEROED: u32 = 1;
+/// Marca interna (en las GT ya validadas) de un grano descartado en modo tolerante. El valor 1 nunca
+/// es la ubicación de un grano válido: o es un grano a cero (se guarda como 0) o es inválido.
+const GRAIN_DISCARDED: u32 = 1;
+/// Marca interna de una entrada de GD sin GT (todo su tramo es disperso).
+const GT_ABSENT: u32 = u32::MAX;
+/// Marca interna de una entrada de GD descartada en modo tolerante (todos sus granos).
+const GT_DISCARDED: u32 = u32::MAX - 1;
 const MIN_GRAIN_SECTORS: u64 = 8;
 /// Límite propio (512 MiB por grano) para acotar la aritmética; VMware usa 128 sectores.
 const MAX_GRAIN_SECTORS: u64 = 1 << 20;
@@ -445,6 +459,14 @@ impl SparseHeader {
 // Imagen
 // ---------------------------------------------------------------------------------------------
 
+/// Detalle de un error `Corrupt` (sin repetir el prefijo del formato al volver a envolverlo).
+fn detail(e: IoError) -> String {
+    match e {
+        IoError::Corrupt { detail, .. } => detail,
+        other => other.to_string(),
+    }
+}
+
 /// Lectura posicional completa; reintenta `Interrupted` y convierte el fin de fichero prematuro
 /// (fichero acortado tras abrirlo) en error, nunca en datos inventados.
 fn read_exact_at(file: &File, offset: u64, buf: &mut [u8]) -> Result<()> {
@@ -462,12 +484,13 @@ enum Grain {
     Sparse,
     /// Desplazamiento en bytes del grano dentro del fichero.
     Data(u64),
+    /// Descartado en modo tolerante: no fiable.
+    Discarded,
 }
 
 /// Disco VMDK monolithicSparse abierto en solo lectura.
 pub struct VmdkImage {
     file: File,
-    file_len: u64,
     header: SparseHeader,
     /// Tamaño virtual en bytes (`capacity × 512`).
     size: u64,
@@ -475,11 +498,16 @@ pub struct VmdkImage {
     grain_bytes: u64,
     /// Número de granos virtuales (`ceil(capacity / grainSize)`).
     grains: u64,
-    /// Directorio de granos principal.
-    gd: Vec<u32>,
-    /// Caché de la última GT leída: (índice en el GD, entradas).
-    gt_cache: Mutex<Option<(usize, Vec<u32>)>>,
+    /// Por cada entrada del GD principal: ordinal de su GT en `gtes`, [`GT_ABSENT`] o
+    /// [`GT_DISCARDED`].
+    gt_slot: Vec<u32>,
+    /// Entradas validadas de las GT presentes, `GTES_PER_GT` por GT: 0 = disperso (sin asignar o a
+    /// cero), [`GRAIN_DISCARDED`] o el sector del grano en el fichero.
+    gtes: Vec<u32>,
     descriptor: VmdkDescriptor,
+    tolerant: bool,
+    /// Granos descartados en modo tolerante.
+    discarded: u64,
 }
 
 impl std::fmt::Debug for VmdkImage {
@@ -487,14 +515,21 @@ impl std::fmt::Debug for VmdkImage {
         f.debug_struct("VmdkImage")
             .field("size", &self.size)
             .field("grain_bytes", &self.grain_bytes)
-            .field("gd_entries", &self.gd.len())
+            .field("gd_entries", &self.gt_slot.len())
             .finish()
     }
 }
 
 impl VmdkImage {
-    /// Abre un VMDK monolithicSparse. `file` ya está admitido y abierto en solo lectura.
+    /// Abre un VMDK monolithicSparse en modo estricto. `file` ya está admitido y abierto en solo
+    /// lectura.
     pub fn open(file: File) -> Result<Self> {
+        Self::open_with(file, false)
+    }
+
+    /// Como [`Self::open`]; con `tolerant`, las entradas de GD y GT inválidas o ambiguas no impiden
+    /// abrir la imagen: sus granos se descartan (ver la documentación del módulo).
+    pub fn open_with(file: File, tolerant: bool) -> Result<Self> {
         let file_len = file.metadata()?.len();
         let mut head = [0u8; HEADER_LEN];
         let head_len = file_len.min(HEADER_LEN as u64) as usize;
@@ -550,36 +585,201 @@ impl VmdkImage {
         if header.gd_offset == 0 && gd_entries > 0 {
             return Err(corrupt("gdOffset = 0"));
         }
-        let mut gd = Vec::new();
+        let mut raw_gd = Vec::new();
+        let mut zones = vec![
+            Zone::fixed(0, HEADER_LEN as u64),
+            Zone::fixed(desc_off, desc_bytes),
+        ];
         if gd_entries > 0 {
             let gd_off =
                 Self::checked_region("directorio de granos", header.gd_offset, gd_bytes, file_len)?;
+            if desc_off < gd_off + gd_bytes && gd_off < desc_off + desc_bytes {
+                return Err(corrupt(
+                    "el descriptor y el directorio de granos se solapan",
+                ));
+            }
             let mut raw = vec![0u8; gd_bytes as usize];
             read_exact_at(&file, gd_off, &mut raw)?;
-            gd = le_u32_table(&raw);
-            for (i, &gt) in gd.iter().enumerate() {
-                if gt != 0 {
-                    Self::checked_region(
-                        &format!("tabla de granos {i}"),
-                        u64::from(gt),
-                        GT_BYTES,
-                        file_len,
-                    )?;
-                }
-            }
+            raw_gd = le_u32_table(&raw);
+            zones.push(Zone::fixed(gd_off, gd_bytes));
         }
+        let size = header.capacity * SECTOR;
+        let grain_span = |g: u64| -> u64 { grain_bytes.min(size - g * grain_bytes) };
+        let (gt_slot, gtes, discarded) = Self::load_tables(
+            &file, file_len, &header, &raw_gd, grains, grain_span, &zones, tolerant,
+        )?;
 
         Ok(Self {
             file,
-            file_len,
-            size: header.capacity * SECTOR,
+            size,
             grain_bytes,
             grains,
-            gd,
-            gt_cache: Mutex::new(None),
+            gt_slot,
+            gtes,
             descriptor,
             header,
+            tolerant,
+            discarded,
         })
+    }
+
+    /// Valida las GT del GD principal y sus granos, y devuelve `(gt_slot, gtes, descartados)`.
+    ///
+    /// Correspondencia inequívoca: cada GT (2 KiB) y cada grano (su parte útil) quedan enteros dentro
+    /// del fichero y no solapan la cabecera, el descriptor, el GD, otra GT ni otro grano. Si un grano
+    /// solapa una GT se descartan los dos (y con la GT, todos sus granos).
+    #[allow(clippy::too_many_arguments)]
+    fn load_tables(
+        file: &File,
+        file_len: u64,
+        header: &SparseHeader,
+        raw_gd: &[u32],
+        grains: u64,
+        grain_span: impl Fn(u64) -> u64,
+        zones: &[Zone],
+        tolerant: bool,
+    ) -> Result<(Vec<u32>, Vec<u32>, u64)> {
+        // 1) Tablas de granos.
+        let mut gt_damage = Damage::default();
+        let mut candidates = Vec::new();
+        for (i, &gt) in raw_gd.iter().enumerate() {
+            if gt == 0 {
+                continue;
+            }
+            match Self::checked_region(
+                &format!("tabla de granos {i}"),
+                u64::from(gt),
+                GT_BYTES,
+                file_len,
+            ) {
+                Ok(_) => candidates.push(i as u64),
+                Err(e) => gt_damage.add(i as u64, || detail(e)),
+            }
+        }
+        let gt_span = |i: u64| -> (u64, u64) {
+            let start = u64::from(raw_gd[i as usize]) * SECTOR;
+            (start, start + GT_BYTES)
+        };
+        for i in tolerant::overlaps(candidates, gt_span, zones).entries {
+            gt_damage.add(i, || {
+                format!("la tabla de granos {i} solapa la cabecera, el descriptor, el directorio u otra tabla")
+            });
+        }
+        if !gt_damage.is_empty() && !tolerant {
+            return Err(corrupt(gt_damage.first().unwrap_or_default()));
+        }
+        let bad_gts = gt_damage.into_sorted();
+
+        let mut gt_slot = vec![GT_ABSENT; raw_gd.len()];
+        for &i in &bad_gts {
+            gt_slot[i as usize] = GT_DISCARDED;
+        }
+        let present = raw_gd
+            .iter()
+            .zip(&gt_slot)
+            .filter(|(&gt, &slot)| gt != 0 && slot != GT_DISCARDED)
+            .count() as u64;
+        let gt_table_bytes = present * GT_BYTES;
+        if gt_table_bytes > MAX_TABLE_BYTES {
+            return Err(unsupported(format!(
+                "las tablas de granos ocupan {gt_table_bytes} bytes (límite de memoria {MAX_TABLE_BYTES})"
+            )));
+        }
+
+        // 2) Entradas de las GT válidas.
+        let mut gtes: Vec<u32> = Vec::with_capacity((present * GTES_PER_GT) as usize);
+        let mut grain_damage = Damage::default();
+        let mut candidates = Vec::new();
+        let mut gt_zones: Vec<Zone> = zones.to_vec();
+        let mut raw = [0u8; GT_BYTES as usize];
+        for (i, &gt) in raw_gd.iter().enumerate() {
+            if gt == 0 || gt_slot[i] == GT_DISCARDED {
+                continue;
+            }
+            let start = u64::from(gt) * SECTOR;
+            read_exact_at(file, start, &mut raw)?;
+            gt_slot[i] = (gtes.len() as u64 / GTES_PER_GT) as u32;
+            gt_zones.push(Zone {
+                start,
+                end: start + GT_BYTES,
+                tag: Some(i as u64),
+            });
+            for (j, &entry) in le_u32_table(&raw).iter().enumerate() {
+                let g = i as u64 * GTES_PER_GT + j as u64;
+                let value = if g >= grains || entry == 0 {
+                    0
+                } else if entry == GTE_ZEROED {
+                    if header.flags & FLAG_ZEROED_GTE != 0 {
+                        0
+                    } else {
+                        grain_damage.add(g, || {
+                            format!(
+                                "grano {g} apunta al sector 1 sin el indicador de granos a cero"
+                            )
+                        });
+                        GRAIN_DISCARDED
+                    }
+                } else {
+                    match Self::checked_region(
+                        &format!("grano {g}"),
+                        u64::from(entry),
+                        grain_span(g),
+                        file_len,
+                    ) {
+                        Ok(_) => candidates.push(g),
+                        Err(e) => grain_damage.add(g, || detail(e)),
+                    }
+                    entry
+                };
+                gtes.push(value);
+            }
+        }
+
+        // 3) Solapes de los granos entre sí y con las estructuras y las GT.
+        let pos = |g: u64| -> usize {
+            (u64::from(gt_slot[(g / GTES_PER_GT) as usize]) * GTES_PER_GT + g % GTES_PER_GT)
+                as usize
+        };
+        let span = |g: u64| -> (u64, u64) {
+            let start = u64::from(gtes[pos(g)]) * SECTOR;
+            (start, start + grain_span(g))
+        };
+        let found = tolerant::overlaps(candidates, span, &gt_zones);
+        for &g in &found.entries {
+            grain_damage.add(g, || {
+                format!("el grano {g} solapa las estructuras del contenedor, una tabla de granos u otro grano")
+            });
+        }
+        for &i in &found.tags {
+            grain_damage.add(i * GTES_PER_GT, || {
+                format!("la tabla de granos {i} se solapa con un grano")
+            });
+        }
+        if !grain_damage.is_empty() && !tolerant {
+            return Err(corrupt(grain_damage.first().unwrap_or_default()));
+        }
+        let bad_grains = grain_damage.into_sorted();
+        for &g in &bad_grains {
+            let p = pos(g);
+            gtes[p] = GRAIN_DISCARDED;
+        }
+        for &i in &found.tags {
+            gt_slot[i as usize] = GT_DISCARDED;
+        }
+
+        // 4) Recuento de granos descartados (los de las GT descartadas cuentan una sola vez).
+        let covered = |i: u64| GTES_PER_GT.min(grains.saturating_sub(i * GTES_PER_GT));
+        let mut discarded: u64 = gt_slot
+            .iter()
+            .enumerate()
+            .filter(|(_, &s)| s == GT_DISCARDED)
+            .map(|(i, _)| covered(i as u64))
+            .sum();
+        discarded += bad_grains
+            .iter()
+            .filter(|&&g| gt_slot[(g / GTES_PER_GT) as usize] != GT_DISCARDED)
+            .count() as u64;
+        Ok((gt_slot, gtes, discarded))
     }
 
     /// Comprueba que `[sector × 512, + bytes)` está dentro del fichero y devuelve el desplazamiento.
@@ -719,57 +919,51 @@ impl VmdkImage {
         if self.header.unclean_shutdown {
             s.push_str(", cierre no limpio");
         }
+        if self.tolerant {
+            s.push_str(&tolerant::describe_suffix(
+                self.discarded,
+                "grano",
+                "granos",
+            ));
+        }
         s
     }
 
-    /// Entrada de la GT para el grano `g` (`g < grains`).
-    fn gt_entry(&self, g: u64) -> Result<u32> {
-        let gd_idx = usize::try_from(g / GTES_PER_GT).map_err(|_| corrupt("índice de grano"))?;
-        let gt_sector = *self
-            .gd
-            .get(gd_idx)
-            .ok_or_else(|| corrupt(format!("grano {g} fuera del directorio")))?;
-        if gt_sector == 0 {
-            return Ok(0);
-        }
-        let slot = (g % GTES_PER_GT) as usize;
-        let mut cache = self.gt_cache.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((idx, gt)) = cache.as_ref() {
-            if *idx == gd_idx {
-                return Ok(gt[slot]);
-            }
-        }
-        let mut raw = [0u8; GT_BYTES as usize];
-        // Región validada al abrir.
-        read_exact_at(&self.file, u64::from(gt_sector) * SECTOR, &mut raw)?;
-        let gt: Vec<u32> = le_u32_table(&raw);
-        let entry = gt[slot];
-        *cache = Some((gd_idx, gt));
-        Ok(entry)
+    /// `true` si se abrió en modo tolerante.
+    pub fn is_tolerant(&self) -> bool {
+        self.tolerant
     }
 
-    /// Ubicación validada del grano `g`.
+    /// Granos descartados en modo tolerante (0 en modo estricto).
+    pub fn discarded_blocks(&self) -> u64 {
+        self.discarded
+    }
+
+    /// Ubicación validada del grano `g` (`g < grains`).
     fn resolve(&self, g: u64) -> Result<Grain> {
-        let entry = self.gt_entry(g)?;
-        match entry {
-            0 => Ok(Grain::Sparse),
-            GTE_ZEROED if self.header.flags & FLAG_ZEROED_GTE != 0 => Ok(Grain::Sparse),
-            GTE_ZEROED => Err(corrupt(format!(
-                "grano {g} apunta al sector 1 sin el indicador de granos a cero"
-            ))),
-            sector => {
-                // Solo se exige en el fichero la parte del grano que cubre el disco virtual.
-                let start = g * self.grain_bytes;
-                let needed = self.grain_bytes.min(self.size - start);
-                Self::checked_region(
-                    &format!("grano {g}"),
-                    u64::from(sector),
-                    needed,
-                    self.file_len,
-                )
-                .map(Grain::Data)
+        let gd_idx = usize::try_from(g / GTES_PER_GT).map_err(|_| corrupt("índice de grano"))?;
+        let slot = *self
+            .gt_slot
+            .get(gd_idx)
+            .ok_or_else(|| corrupt(format!("grano {g} fuera del directorio")))?;
+        let entry = match slot {
+            GT_ABSENT => return Ok(Grain::Sparse),
+            GT_DISCARDED => return Ok(Grain::Discarded),
+            k => {
+                let p = u64::from(k) * GTES_PER_GT + g % GTES_PER_GT;
+                usize::try_from(p)
+                    .ok()
+                    .and_then(|p| self.gtes.get(p))
+                    .copied()
+                    .ok_or_else(|| corrupt(format!("grano {g} fuera de las tablas")))?
             }
-        }
+        };
+        Ok(match entry {
+            0 => Grain::Sparse,
+            GRAIN_DISCARDED => Grain::Discarded,
+            // Validado al abrir: dentro del fichero y sin solapes.
+            sector => Grain::Data(u64::from(sector) * SECTOR),
+        })
     }
 }
 
@@ -802,6 +996,9 @@ impl BlockDevice for VmdkImage {
             match self.resolve(g)? {
                 Grain::Sparse => chunk.fill(0),
                 Grain::Data(base) => read_exact_at(&self.file, base + within, chunk)?,
+                Grain::Discarded => {
+                    return Err(tolerant::discarded_read(FORMAT, "grano", g, pos, n));
+                }
             }
             pos += n as u64;
             done += n;
@@ -824,21 +1021,24 @@ impl BlockDevice for VmdkImage {
                 return Err(corrupt(format!("sector {s} fuera de los granos")));
             }
             let gd_idx = g / GTES_PER_GT;
-            let gd_entry = usize::try_from(gd_idx)
+            let slot = usize::try_from(gd_idx)
                 .ok()
-                .and_then(|i| self.gd.get(i))
+                .and_then(|i| self.gt_slot.get(i))
                 .copied()
                 .ok_or_else(|| corrupt(format!("grano {g} fuera del directorio")))?;
-            let (kind, span_end) = if gd_entry == 0 {
+            let next_gt = (gd_idx + 1).saturating_mul(GTES_PER_GT).saturating_mul(spg);
+            let (kind, span_end) = match slot {
                 // GT ausente: los 512 granos que cubriría son dispersos.
-                let next = (gd_idx + 1).saturating_mul(GTES_PER_GT).saturating_mul(spg);
-                (Allocation::Sparse, next)
-            } else {
-                let kind = match self.resolve(g)? {
-                    Grain::Sparse => Allocation::Sparse,
-                    Grain::Data(_) => Allocation::Data,
-                };
-                (kind, (g + 1).saturating_mul(spg))
+                GT_ABSENT => (Allocation::Sparse, next_gt),
+                // GT descartada: sus granos no son fiables; hay que «leerlos» para descubrirlo.
+                GT_DISCARDED => (Allocation::Data, next_gt),
+                _ => {
+                    let kind = match self.resolve(g)? {
+                        Grain::Sparse => Allocation::Sparse,
+                        Grain::Data(_) | Grain::Discarded => Allocation::Data,
+                    };
+                    (kind, (g + 1).saturating_mul(spg))
+                }
             };
             let e = span_end.min(end);
             match runs.last_mut() {
@@ -1295,27 +1495,22 @@ mod tests {
         let mut b = Builder::new(64);
         b.raw_gde = vec![(0, u32::MAX)];
         assert!(is_corrupt(b.open()));
-        // Grano fuera del fichero: se detecta al leer y en el mapa, sin pánico.
+        // Grano fuera del fichero: todas las GT se validan al abrir, así que el modo estricto lo
+        // rechaza en la apertura (antes, al leerlo), sin pánico.
         let mut b = Builder::new(64);
         b.raw_gte = vec![(1, u32::MAX)];
-        let img = b.open().unwrap();
-        let mut buf = vec![0u8; 512];
-        assert!(is_corrupt(img.read_at(GRAIN * 512, &mut buf)));
-        assert!(is_corrupt(img.allocation(0, 64)));
-        assert!(img.read_at(0, &mut buf).is_ok());
+        assert!(is_corrupt(b.open()));
         // Entrada 1 sin el indicador de granos a cero.
         let mut b = Builder::new(64);
         b.flags &= !FLAG_ZEROED_GTE;
         b.raw_gte = vec![(0, GTE_ZEROED)];
-        let img = b.open().unwrap();
-        assert!(is_corrupt(img.read_at(0, &mut buf)));
+        assert!(is_corrupt(b.open()));
         // Fichero truncado: el grano queda fuera.
         let mut b = Builder::new(64);
         b.grains = vec![(0, 0xaa)];
         let full = b.build().len();
         b.truncate_to = Some(full - 512);
-        let img = b.open().unwrap();
-        assert!(is_corrupt(img.read_at(0, &mut buf)));
+        assert!(is_corrupt(b.open()));
     }
 
     #[test]
@@ -1471,6 +1666,190 @@ mod tests {
         assert!(buf.iter().all(|&x| x == 0));
         img.read_at(1050 * GRAIN * 512, &mut buf).unwrap();
         assert!(buf.iter().all(|&x| x == 0x77));
+    }
+
+    // ---- modo tolerante (ADR-020) ----
+
+    fn open_mode(bytes: &[u8], tolerant: bool) -> (tempfile::NamedTempFile, Result<VmdkImage>) {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(bytes).unwrap();
+        tmp.flush().unwrap();
+        let r = VmdkImage::open_with(File::open(tmp.path()).unwrap(), tolerant);
+        (tmp, r)
+    }
+
+    /// Imagen de referencia: 601 granos (2 GT), capacidad no múltiplo del grano.
+    fn tolerant_sample() -> Builder {
+        let mut b = Builder::new(600 * GRAIN + 5);
+        b.grains = vec![
+            (0, 0x11),
+            (1, 0x22),
+            (3, 0),
+            (4, 0x44),
+            (513, 0x55),
+            (600, 0x66),
+        ];
+        b
+    }
+
+    /// Entrada `i` del GD (en el sector 5 de las imágenes de prueba) y entrada de GT del grano `g`.
+    fn gde(raw: &[u8], i: usize) -> u32 {
+        le_u32(raw, 5 * 512 + 4 * i)
+    }
+    fn gte(raw: &[u8], g: u64) -> u32 {
+        let gt = gde(raw, (g / GTES_PER_GT) as usize) as usize;
+        le_u32(raw, gt * 512 + (g % GTES_PER_GT) as usize * 4)
+    }
+
+    #[test]
+    fn tolerant_mode_discards_only_invalid_or_ambiguous_grains() {
+        let base = tolerant_sample();
+        let raw = base.build();
+        let (_t, reference) = open_mode(&raw, false);
+        let reference = reference.unwrap();
+        let mut expect = vec![0u8; reference.size() as usize];
+        reference.read_at(0, &mut expect).unwrap();
+        let cap = 600 * GRAIN + 5;
+        let g1 = gte(&raw, 1);
+        let gt0 = gde(&raw, 0);
+        let gt1 = gde(&raw, 1);
+        // Granos de la GT 1 (512 a 600): hasta el final del disco.
+        let second_gt = (512 * GRAIN, cap - 512 * GRAIN);
+        type Edit = Box<dyn Fn(&mut Builder)>;
+        // (caso, cambio, tramos de sectores dañados, granos descartados). 16 sectores por grano.
+        type Case = (&'static str, Edit, Vec<(u64, u64)>, u64);
+        let cases: Vec<Case> = vec![
+            (
+                "grano fuera del fichero",
+                Box::new(|b| b.raw_gte = vec![(1, u32::MAX)]),
+                vec![(GRAIN, GRAIN)],
+                1,
+            ),
+            (
+                // Sus 16 sectores cubren también las dos GT: se descarta todo el disco.
+                "grano sobre el descriptor",
+                Box::new(|b| b.raw_gte = vec![(4, 2)]),
+                vec![(0, cap)],
+                601,
+            ),
+            (
+                // Sus 16 sectores cubren también las dos GT: se descarta todo el disco.
+                "grano sobre el directorio",
+                Box::new(|b| b.raw_gte = vec![(4, 5)]),
+                vec![(0, cap)],
+                601,
+            ),
+            (
+                "grano duplicado",
+                Box::new(move |b| b.raw_gte = vec![(4, g1)]),
+                vec![(GRAIN, GRAIN), (4 * GRAIN, GRAIN)],
+                2,
+            ),
+            (
+                "grano solapado con otro",
+                Box::new(move |b| b.raw_gte = vec![(4, g1 + 8)]),
+                vec![(GRAIN, GRAIN), (4 * GRAIN, GRAIN)],
+                2,
+            ),
+            (
+                "entrada 1 sin el indicador de granos a cero",
+                Box::new(|b| b.flags &= !FLAG_ZEROED_GTE),
+                vec![(3 * GRAIN, GRAIN)],
+                1,
+            ),
+            (
+                "GT fuera del fichero",
+                Box::new(|b| b.raw_gde = vec![(1, u32::MAX)]),
+                vec![second_gt],
+                89,
+            ),
+            (
+                "GT sobre el descriptor",
+                Box::new(|b| b.raw_gde = vec![(1, 1)]),
+                vec![second_gt],
+                89,
+            ),
+            (
+                "GT duplicada",
+                Box::new(move |b| b.raw_gde = vec![(1, gt0)]),
+                vec![(0, cap)],
+                601,
+            ),
+            (
+                // El grano 4 cubre la GT 1 y el principio del grano 0: se descartan los tres.
+                "grano sobre una GT",
+                Box::new(move |b| b.raw_gte = vec![(4, gt1)]),
+                vec![(0, GRAIN), (4 * GRAIN, GRAIN), second_gt],
+                91,
+            ),
+        ];
+        for (what, edit, bad, n) in cases {
+            let mut b = tolerant_sample();
+            edit(&mut b);
+            let bytes = b.build();
+            assert!(is_corrupt(open_mode(&bytes, false).1), "{what}");
+            let (t, img) = open_mode(&bytes, true);
+            let before = crate::tolerant::check::Snapshot::of(t.path());
+            let img = img.unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert_eq!(img.discarded_blocks(), n, "{what}");
+            assert!(img.is_tolerant());
+            let d = img.describe();
+            assert!(
+                d.ends_with(&crate::tolerant::describe_suffix(n, "grano", "granos")),
+                "{what}: {d}"
+            );
+            crate::tolerant::check::tolerant_read_matches(&img, &expect, &bad, what);
+            drop(img);
+            assert_eq!(
+                crate::tolerant::check::Snapshot::of(t.path()),
+                before,
+                "{what}"
+            );
+        }
+        // Sin daños: idéntico al modo estricto.
+        let (_t, img) = open_mode(&raw, true);
+        let img = img.unwrap();
+        assert_eq!(img.discarded_blocks(), 0);
+        assert!(img
+            .describe()
+            .ends_with("; modo tolerante: 0 granos descartados (no fiables)"));
+        assert!(!reference.describe().contains("tolerante"));
+        crate::tolerant::check::tolerant_read_matches(&img, &expect, &[], "sin daños");
+        assert_eq!(
+            img.allocation(0, cap).unwrap(),
+            reference.allocation(0, cap).unwrap()
+        );
+    }
+
+    #[test]
+    fn critical_structures_are_corrupt_in_both_modes() {
+        let good = tolerant_sample().build();
+        let mut cases: Vec<(&str, Vec<u8>)> = Vec::new();
+        let mut raw = good.clone();
+        raw[0] = b'X';
+        cases.push(("firma", raw));
+        let mut raw = good.clone();
+        raw[28..36].copy_from_slice(&1_000_000u64.to_le_bytes());
+        cases.push(("descriptor fuera del fichero", raw));
+        let mut raw = good.clone();
+        raw[56..64].copy_from_slice(&(1u64 << 40).to_le_bytes());
+        cases.push(("GD fuera del fichero", raw));
+        let mut raw = good.clone();
+        raw[56..64].copy_from_slice(&3u64.to_le_bytes());
+        cases.push(("GD sobre el descriptor", raw));
+        let mut raw = good.clone();
+        raw[20..28].copy_from_slice(&12u64.to_le_bytes());
+        cases.push(("tamaño de grano", raw));
+        let mut b = tolerant_sample();
+        b.descriptor = descriptor(600 * GRAIN + 4);
+        cases.push(("capacidad del descriptor", b.build()));
+        for (what, bytes) in cases {
+            for tolerant in [false, true] {
+                let (t, r) = open_mode(&bytes, tolerant);
+                assert!(is_corrupt(r), "{what} (tolerante: {tolerant})");
+                assert!(std::fs::read(t.path()).unwrap() == bytes);
+            }
+        }
     }
 
     #[test]

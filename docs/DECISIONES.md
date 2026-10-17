@@ -253,3 +253,49 @@ verificación con los 5 recuentos), la CLI (código de salida 3) y el visor («N
 Las lecturas estrictas (`mr_source_read`) y los hashes fallan ante cualquier error: nunca se calcula un hash
 sobre bytes sustituidos. Los ceros de regiones dispersas son legítimos (`Sparse`, fiables). Detalle en
 `formatos/mapa-de-validez.md`.
+
+---
+
+## ADR-020 · Tablas de asignación dañadas: estricto por defecto, tolerante por petición explícita (Aceptada, 2026-10-17)
+
+**Contexto.** Issue #4. Un VHD, VHDX o VMDK con alguna entrada de su tabla de asignación dañada (fuera del
+fichero, solapada, duplicada o con un estado inválido) se rechazaba entero con `Corrupt`. Para recuperar
+datos interesa aprovechar todo lo legible sin presentar datos inventados.
+
+**Decisión del propietario.** Modo **estricto por defecto** (comportamiento anterior: la imagen se rechaza
+con `Corrupt`) y modo **tolerante solo por activación explícita**: `mr_image::OpenOptions::tolerant`,
+`MR_OPEN_TOLERANT` (bit 4 de `flags` en `mr_source_open`, ampliación compatible de la ABI 3),
+`Engine.OpenSource(..., tolerant: true)`, `--tolerant` en la CLI y, en la interfaz, una confirmación
+explícita con aviso visible. El origen nunca se modifica.
+
+**Correspondencia inequívoca.** Una entrada solo se usa si su zona del fichero (la parte del bloque o grano
+que cubre el disco virtual) está **entera dentro del fichero**, **no solapa** ninguna estructura del
+contenedor **ni la zona de otra entrada** y su **estado es válido**. Cuando dos o más zonas se solapan se
+invalidan **todas** las implicadas (también las duplicadas idénticas): nunca se elige una interpretación.
+
+| Formato | Entradas | Estructuras que no se pueden solapar | Estados inválidos |
+|---|---|---|---|
+| VHD dinámico | BAT: mapa de bits + parte útil del bloque | copia del pie (byte 0), cabecera dinámica, BAT completa, pie final (fin de la zona de datos) | no hay campo de estado; 0 y cualquier sector cuyo bloque no quepa son inválidos |
+| VHDX | BAT: bloques FULLY_PRESENT (parte útil) | zona de cabeceras (1 MiB inicial), registro, región de metadatos, región BAT, otras regiones | 4, 5 y PARTIALLY_PRESENT (sin padre); desplazamiento desbordado o < 1 MiB |
+| VMDK monolithicSparse | GD: GT de 2 KiB; GT: granos (parte útil) | cabecera, descriptor incrustado, GD, las GT (un grano que solapa una GT invalida ambos) | entrada de GT 1 sin el indicador «zeroed-grain» |
+
+En modo tolerante cada entrada inválida invalida **solo** su bloque o grano (una entrada de GD de VMDK
+inválida invalida los granos de su GT). Esos bloques se entregan como **no fiables**: `read_at` devuelve
+`IoError::Read` con el rango virtual y `allocation` los informa como `Data`, de modo que el lector tolerante
+(`mr_io::resilient`) los marca `Unreadable` con el patrón de relleno (ADR-019) y las lecturas estrictas, los
+hashes y la verificación fallan o los cuentan como no fiables. No se añade un estado «desconocido»: el
+contenido de un bloque descartado no se lee, así que «ilegible» describe con exactitud lo que se entrega.
+Las entradas de mapa de bits de sectores de VHDX con estado inválido no afectan a la lectura de un disco
+sin padre: en modo tolerante se cuentan en la descripción y se ignoran.
+
+**Siguen siendo críticos en ambos modos** (`Corrupt`): pies y cabeceras con firma, suma o versión
+incorrectas, cabecera dinámica, ubicación y tamaño de la BAT/GD, tablas de regiones, metadatos y
+descriptor, y estructuras fijas que se solapan entre sí.
+
+**Consecuencias.** La descripción del origen termina en «modo tolerante: N bloques descartados (no
+fiables)» («granos» en VMDK). El modo estricto ahora detecta también solapes entre bloques y duplicados
+(antes no se comprobaban) y, en VMDK, valida todas las GT y sus granos al abrir (antes los granos se
+validaban al leerlos): una imagen con esos daños se rechaza en la apertura. Las imágenes válidas no
+cambian (pruebas contra qemu-img). Memoria: VMDK guarda las GT presentes (≤ `MAX_TABLE_BYTES`); la
+detección de solapes usa 8 bytes por entrada asignada durante la apertura. Detalle por formato en
+`formatos/vhd.md`, `formatos/vhdx.md` y `formatos/vmdk.md`.

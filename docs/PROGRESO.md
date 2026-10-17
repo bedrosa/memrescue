@@ -208,6 +208,20 @@ asignación dañadas (issue #4): modo estricto por defecto y modo tolerante solo
 repositorio, Rust, .NET e interop, lectores contra qemu-img), verificados en GitHub Actions y exigidos como
 checks obligatorios de `main`; pruebas de interfaz a demanda; `CONTRIBUTING.md` con el flujo de trabajo.
 
+**M1 por issues** (cada uno con su rama, PR y checks obligatorios en verde):
+
+| Issue | PR | Resultado |
+|---|---|---|
+| #3 | #33 | Claves de MSYS2 fijadas a un commit y con SHA-256 comprobado en `tools/fetch_qemu_img.py` |
+| #6 | #34 | `NullDevice` (todo disperso) y `PatternDevice` (patrón constante) |
+| #5 | #35 | Omisión de errores por código y modo «ignorar todo» (IO-09); `mr_source_verify_start_ex` sin cambiar la ABI 3 |
+| #4 | este PR | Tablas de asignación dañadas en VHD/VHDX/VMDK (ADR-020): estricto por defecto (ahora también rechaza bloques solapados o duplicados y valida todas las GT de VMDK al abrir) y modo tolerante solo explícito (`OpenOptions.tolerant`, `MR_OPEN_TOLERANT`, `--tolerant`, confirmación en la interfaz); un bloque solo se usa si su zona del fichero es inequívoca; los descartados se leen como ilegibles, nunca como datos |
+
+Verificación de #4: 213 pruebas Rust, 11 contra qemu-img 11.1.2 (2 nuevas en modo tolerante), 67 de interop
+C#, 11 de interfaz y auditoría de higiene sin problemas.
+
 ## Siguiente tarea (no se avanza a M2)
 
-1. Completar M1 según los issues del milestone M1 (prioridad: #3, #4, #5, #6).
+1. Completar M1 según los issues abiertos del milestone M1: #7 (patrones de relleno y colores por estado),
+   #8 (diferenciales VHD/VHDX), #9 (VMDK streamOptimized), #10 (registro VHDX en memoria) y #11 (VMDK
+   multiextensión y flat).

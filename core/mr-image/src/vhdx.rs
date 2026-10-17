@@ -16,8 +16,16 @@
 //! - Los bloques NOT_PRESENT, UNDEFINED, ZERO y UNMAPPED se leen como ceros y se informan como
 //!   `Allocation::Sparse`; FULLY_PRESENT se lee del fichero; PARTIALLY_PRESENT solo es válido en
 //!   discos diferenciales y aquí se considera corrupción.
+//! - Modo tolerante ([`VhdxImage::open_with`], ADR-020): las entradas de bloque de la BAT con un
+//!   estado no válido (4, 5, PARTIALLY_PRESENT), con el bloque fuera del fichero o en la zona de
+//!   cabeceras, o que solapan el registro, los metadatos, la BAT, otra región u otro bloque
+//!   (incluidas las duplicadas) se descartan: sus bloques se leen con error y se informan como datos
+//!   no fiables. Las entradas de mapa de bits con estado no válido no afectan a la lectura de un
+//!   disco sin padre: se cuentan y se ignoran. Identificador, cabeceras, tablas de regiones,
+//!   metadatos y la ubicación de la BAT siguen siendo críticos (`Corrupt` en ambos modos).
 
 use crate::crc32c::crc32c;
+use crate::tolerant::{self, Damage, Zone};
 use crate::MAX_TABLE_BYTES;
 use mr_io::{Allocation, AllocationRun, BlockDevice, IoError, Result};
 use std::fs::File;
@@ -48,6 +56,9 @@ const ZONA_CABECERAS: u64 = MIB;
 const MAX_TAMANO_VIRTUAL: u64 = 64 * TIB;
 /// Trozo de lectura de la BAT (múltiplo de 8).
 const TROZO_BAT: usize = 1024 * 1024;
+/// Marca interna de un bloque descartado en modo tolerante (ningún desplazamiento válido, múltiplo
+/// de 1 MiB, puede valer `u64::MAX`).
+const DESCARTADO: u64 = u64::MAX;
 
 // Estados de las entradas de bloque de datos de la BAT (bits 0–2).
 const PAYLOAD_NOT_PRESENT: u64 = 0;
@@ -293,8 +304,14 @@ pub struct VhdxImage {
     sector_fisico: u32,
     tam_bloque: u32,
     dejar_asignados: bool,
-    /// Desplazamiento en el fichero de cada bloque de datos (0 = no presente, se lee como ceros).
+    /// Desplazamiento en el fichero de cada bloque de datos (0 = no presente, se lee como ceros;
+    /// [`DESCARTADO`] = descartado en modo tolerante).
     bloques: Vec<u64>,
+    tolerante: bool,
+    /// Bloques descartados en modo tolerante.
+    descartados: u64,
+    /// Entradas de mapa de bits con estado no válido ignoradas en modo tolerante.
+    mapas_ignorados: u64,
 }
 
 impl std::fmt::Debug for VhdxImage {
@@ -309,9 +326,16 @@ impl std::fmt::Debug for VhdxImage {
 }
 
 impl VhdxImage {
-    /// Interpreta `file` (ya admitido y abierto en solo lectura) como VHDX. Valida identificador,
-    /// cabeceras, tablas de regiones, metadatos y BAT contra el tamaño real del fichero.
+    /// Interpreta `file` (ya admitido y abierto en solo lectura) como VHDX en modo estricto.
+    /// Valida identificador, cabeceras, tablas de regiones, metadatos y BAT contra el tamaño real
+    /// del fichero.
     pub fn open(file: File) -> Result<VhdxImage> {
+        Self::open_with(file, false)
+    }
+
+    /// Como [`Self::open`]; con `tolerante`, las entradas de la BAT inválidas o ambiguas no impiden
+    /// abrir la imagen: sus bloques se descartan (ver la documentación del módulo).
+    pub fn open_with(file: File, tolerante: bool) -> Result<VhdxImage> {
         let tam_fichero = file.metadata()?.len();
         if tam_fichero < ZONA_CABECERAS {
             return Err(corrupto(format!(
@@ -595,6 +619,8 @@ impl VhdxImage {
         }
         // Ya sabemos que la BAT cabe en el fichero: la reserva está acotada por su tamaño.
         let mut bloques = Vec::with_capacity(n_bloques as usize);
+        let mut dano = Damage::default();
+        let mut mapas_ignorados = 0u64;
         let mut buf = vec![0u8; TROZO_BAT.min(bytes_bat as usize)];
         let mut indice = 0u64;
         let mut pos = 0u64;
@@ -607,15 +633,22 @@ impl VhdxImage {
                 if (indice + 1).is_multiple_of(ratio + 1) {
                     let estado = entrada & 7;
                     if estado != BITMAP_NOT_PRESENT && estado != BITMAP_PRESENT {
-                        return Err(corrupto(format!(
-                            "estado {estado} no válido en la entrada de mapa de bits {indice} de la BAT"
-                        )));
+                        if !tolerante {
+                            return Err(corrupto(format!(
+                                "estado {estado} no válido en la entrada de mapa de bits {indice} de la BAT"
+                            )));
+                        }
+                        mapas_ignorados += 1;
                     }
                 } else {
                     let b = bloques.len() as u64;
-                    let destino =
-                        validar_bloque(entrada, b, tb, tam_virtual, tam_fichero, &tramos)?;
-                    bloques.push(destino);
+                    match validar_bloque(entrada, b, tb, tam_virtual, tam_fichero) {
+                        Ok(destino) => bloques.push(destino),
+                        Err(motivo) => {
+                            dano.add(b, || motivo);
+                            bloques.push(DESCARTADO);
+                        }
+                    }
                 }
                 indice += 1;
             }
@@ -626,6 +659,35 @@ impl VhdxImage {
                 "número de entradas de bloque incoherente en la BAT",
             ));
         }
+        // Correspondencia inequívoca: ningún bloque presente solapa las zonas del contenedor
+        // (cabeceras, registro, regiones) ni otro bloque.
+        let tramo = |b: u64| -> (u64, u64) {
+            let off = bloques[b as usize];
+            let util = tb.min(tam_virtual - b * tb);
+            (off, off + util)
+        };
+        let candidatos: Vec<u64> = (0..n_bloques)
+            .filter(|&b| !matches!(bloques[b as usize], 0 | DESCARTADO))
+            .collect();
+        let zonas: Vec<Zone> = tramos
+            .iter()
+            .map(|t| Zone::fixed(t.inicio, t.fin - t.inicio))
+            .collect();
+        for b in tolerant::overlaps(candidatos, tramo, &zonas).entries {
+            let off = bloques[b as usize];
+            dano.add(b, || {
+                format!(
+                    "el bloque {b} (desplazamiento {off}) se solapa con las estructuras del contenedor o con otro bloque"
+                )
+            });
+        }
+        if !dano.is_empty() && !tolerante {
+            return Err(corrupto(dano.first().unwrap_or_default()));
+        }
+        let descartados = dano.into_sorted();
+        for &b in &descartados {
+            bloques[b as usize] = DESCARTADO;
+        }
 
         Ok(VhdxImage {
             file,
@@ -635,6 +697,9 @@ impl VhdxImage {
             tam_bloque,
             dejar_asignados: banderas & PARAM_DEJAR_BLOQUES_ASIGNADOS != 0,
             bloques,
+            tolerante,
+            descartados: descartados.len() as u64,
+            mapas_ignorados,
         })
     }
 
@@ -645,12 +710,36 @@ impl VhdxImage {
         } else {
             "dinámico"
         };
-        format!(
+        let mut s = format!(
             "VHDX {tipo}, bloques de {} MiB, sector lógico {} B, sector físico {} B",
             u64::from(self.tam_bloque) / MIB,
             self.sector_logico,
             self.sector_fisico
-        )
+        );
+        if self.tolerante {
+            s.push_str(&tolerant::describe_suffix(
+                self.descartados,
+                "bloque",
+                "bloques",
+            ));
+            if self.mapas_ignorados > 0 {
+                s.push_str(&format!(
+                    ", {} entradas de mapa de bits no válidas ignoradas",
+                    self.mapas_ignorados
+                ));
+            }
+        }
+        s
+    }
+
+    /// `true` si se abrió en modo tolerante.
+    pub fn is_tolerant(&self) -> bool {
+        self.tolerante
+    }
+
+    /// Bloques descartados en modo tolerante (0 en modo estricto).
+    pub fn discarded_blocks(&self) -> u64 {
+        self.descartados
     }
 
     /// Tamaño de bloque de datos en bytes.
@@ -669,49 +758,39 @@ impl VhdxImage {
     }
 }
 
-/// Valida una entrada de bloque de datos y devuelve su desplazamiento en el fichero
-/// (0 si el bloque se lee como ceros).
+/// Valida el estado de una entrada de bloque de datos y que su bloque cabe en el fichero fuera de la
+/// zona de cabeceras; devuelve su desplazamiento en el fichero (0 si el bloque se lee como ceros)
+/// o el motivo por el que no es válida. Los solapes se comprueban después, con todos los bloques.
 fn validar_bloque(
     entrada: u64,
     b: u64,
     tb: u64,
     tam_virtual: u64,
     tam_fichero: u64,
-    tramos: &[Tramo],
-) -> Result<u64> {
+) -> std::result::Result<u64, String> {
     match entrada & 7 {
         PAYLOAD_NOT_PRESENT | PAYLOAD_UNDEFINED | PAYLOAD_ZERO | PAYLOAD_UNMAPPED => Ok(0),
         PAYLOAD_FULLY_PRESENT => {
             let off = (entrada >> 20)
                 .checked_mul(MIB)
-                .ok_or_else(|| corrupto(format!("desplazamiento del bloque {b} desbordado")))?;
+                .ok_or_else(|| format!("desplazamiento del bloque {b} desbordado"))?;
             // Solo se exige en el fichero la parte del bloque que cubre el disco virtual.
             let inicio_virtual = b * tb;
             let util = tb.min(tam_virtual - inicio_virtual);
             let fin = off.checked_add(util);
             if off < ZONA_CABECERAS || fin.is_none_or(|f| f > tam_fichero) {
-                return Err(corrupto(format!(
-                    "el bloque {b} (desplazamiento {off}) queda fuera del fichero ({tam_fichero} bytes)"
-                )));
-            }
-            let fin = off + util;
-            let i = tramos.partition_point(|t| t.fin <= off);
-            if let Some(t) = tramos.get(i) {
-                if t.inicio < fin {
-                    return Err(corrupto(format!(
-                        "el bloque {b} (desplazamiento {off}) se solapa con la zona {}",
-                        t.nombre
-                    )));
-                }
+                return Err(format!(
+                    "el bloque {b} (desplazamiento {off}) queda fuera del fichero ({tam_fichero} bytes) o en la zona de cabeceras"
+                ));
             }
             Ok(off)
         }
-        PAYLOAD_PARTIALLY_PRESENT => Err(corrupto(format!(
+        PAYLOAD_PARTIALLY_PRESENT => Err(format!(
             "bloque {b} PARTIALLY_PRESENT en un disco sin padre"
-        ))),
-        estado => Err(corrupto(format!(
+        )),
+        estado => Err(format!(
             "estado {estado} no válido en la entrada del bloque {b} de la BAT"
-        ))),
+        )),
     }
 }
 
@@ -790,6 +869,8 @@ impl BlockDevice for VhdxImage {
                 .ok_or_else(|| corrupto(format!("bloque {b} fuera de la BAT")))?;
             if base == 0 {
                 parte.fill(0);
+            } else if base == DESCARTADO {
+                return Err(tolerant::discarded_read(FORMATO, "bloque", b, pos, n));
             } else {
                 leer(&self.file, base + dentro, parte)?;
             }
@@ -812,6 +893,7 @@ impl BlockDevice for VhdxImage {
         while s < fin {
             let b = s / por_bloque;
             let limite = ((b + 1) * por_bloque).min(fin);
+            // Un bloque descartado es `Data`: hay que «leerlo» para descubrir que no es fiable.
             let tipo = match self.bloques.get(b as usize) {
                 Some(0) | None => Allocation::Sparse,
                 Some(_) => Allocation::Data,
@@ -1457,6 +1539,180 @@ mod tests {
         }
         sellar_regiones(&mut img);
         assert!(es_corrupto(abrir(&img)));
+    }
+
+    // ---- modo tolerante (ADR-020) ----
+
+    fn abrir_modo(img: &[u8], tolerante: bool) -> (tempfile::NamedTempFile, Result<VhdxImage>) {
+        let t = fichero(img);
+        let r = VhdxImage::open_with(File::open(t.path()).unwrap(), tolerante);
+        (t, r)
+    }
+
+    fn entrada_bat(img: &[u8], b: u64) -> u64 {
+        le64(img, (OFF_BAT + 8 * b) as usize).unwrap()
+    }
+
+    #[test]
+    fn modo_tolerante_descarta_solo_bloques_invalidos_o_ambiguos() {
+        let m = Modelo::basico();
+        let base = construir(&m);
+        let esp = esperado(&m);
+        let presente = |mib: u64| PAYLOAD_FULLY_PRESENT | (mib << 20);
+        let e0 = entrada_bat(&base, 0);
+        let spb = MIB / 512;
+        // (caso, entradas alteradas, tramos de sectores dañados). Bloques de 2048 sectores; el
+        // bloque 3 solo tiene 1024 en el disco virtual.
+        type Caso = (&'static str, Vec<(u64, u64)>, Vec<(u64, u64)>);
+        let casos: Vec<Caso> = vec![
+            (
+                "fuera del fichero",
+                vec![(3, presente(1 << 30))],
+                vec![(3 * spb, spb / 2)],
+            ),
+            (
+                "desplazamiento desbordado",
+                vec![(3, PAYLOAD_FULLY_PRESENT | !0xF_FFFF)],
+                vec![(3 * spb, spb / 2)],
+            ),
+            (
+                "en la zona de cabeceras",
+                vec![(0, presente(0))],
+                vec![(0, spb)],
+            ),
+            ("sobre el registro", vec![(0, presente(1))], vec![(0, spb)]),
+            (
+                "sobre los metadatos",
+                vec![(3, presente(2))],
+                vec![(3 * spb, spb / 2)],
+            ),
+            ("sobre la BAT", vec![(0, presente(3))], vec![(0, spb)]),
+            (
+                "duplicada",
+                vec![(3, e0)],
+                vec![(0, spb), (3 * spb, spb / 2)],
+            ),
+            ("estado 4", vec![(1, 4)], vec![(spb, spb)]),
+            ("estado 5", vec![(2, 5)], vec![(2 * spb, spb)]),
+            (
+                "PARTIALLY_PRESENT",
+                vec![(1, PAYLOAD_PARTIALLY_PRESENT)],
+                vec![(spb, spb)],
+            ),
+            (
+                "varias a la vez",
+                vec![(1, 5), (3, presente(2))],
+                vec![(spb, spb), (3 * spb, spb / 2)],
+            ),
+        ];
+        for (caso, cambios, malos) in casos {
+            let mut img = base.clone();
+            for &(b, e) in &cambios {
+                poner(&mut img, OFF_BAT + 8 * b, &e.to_le_bytes());
+            }
+            assert!(es_corrupto(abrir_modo(&img, false).1), "{caso}");
+            let (t, v) = abrir_modo(&img, true);
+            let antes = crate::tolerant::check::Snapshot::of(t.path());
+            let v = v.unwrap_or_else(|e| panic!("{caso}: {e}"));
+            let n = malos.len() as u64;
+            assert_eq!(v.discarded_blocks(), n, "{caso}");
+            assert!(v.is_tolerant());
+            let d = v.describe();
+            assert!(
+                d.ends_with(&crate::tolerant::describe_suffix(n, "bloque", "bloques")),
+                "{caso}: {d}"
+            );
+            crate::tolerant::check::tolerant_read_matches(&v, &esp, &malos, caso);
+            drop(v);
+            assert_eq!(
+                crate::tolerant::check::Snapshot::of(t.path()),
+                antes,
+                "{caso}"
+            );
+        }
+    }
+
+    #[test]
+    fn modo_tolerante_sin_danos_y_mapas_de_bits_ignorados() {
+        let m = Modelo::basico();
+        let img = construir(&m);
+        let (_t, v) = abrir_modo(&img, true);
+        let v = v.unwrap();
+        assert_eq!(v.discarded_blocks(), 0);
+        assert!(v
+            .describe()
+            .ends_with("; modo tolerante: 0 bloques descartados (no fiables)"));
+        crate::tolerant::check::tolerant_read_matches(&v, &esperado(&m), &[], "sin daños");
+        let (_t, estricto) = abrir_modo(&img, false);
+        let estricto = estricto.unwrap();
+        assert!(!estricto.is_tolerant());
+        assert!(!estricto.describe().contains("tolerante"));
+
+        // Entrada de mapa de bits con estado no válido: no afecta a los datos de un disco sin
+        // padre; en modo tolerante se cuenta y se ignora.
+        let m = Modelo {
+            tam_bloque: MIB as u32,
+            sector_logico: 512,
+            tam_virtual: 4098 * MIB,
+            banderas: 0,
+            estados: vec![(4096, PAYLOAD_FULLY_PRESENT)],
+            padre: None,
+        };
+        let mut img = construir(&m);
+        poner(&mut img, OFF_BAT + 4096 * 8, &3u64.to_le_bytes());
+        assert!(es_corrupto(abrir_modo(&img, false).1));
+        let (_t, v) = abrir_modo(&img, true);
+        let v = v.unwrap();
+        assert_eq!(v.discarded_blocks(), 0);
+        assert!(v
+            .describe()
+            .ends_with(", 1 entradas de mapa de bits no válidas ignoradas"));
+        let mut b = vec![0u8; 4096];
+        v.read_at(4096 * MIB + 77, &mut b).unwrap();
+        assert!(b
+            .iter()
+            .enumerate()
+            .all(|(i, &x)| x == patron(4096 * MIB + 77 + i as u64)));
+    }
+
+    #[test]
+    fn estructuras_criticas_danadas_en_ambos_modos() {
+        let base = construir(&Modelo::basico());
+        let mut casos: Vec<(&str, Vec<u8>)> = Vec::new();
+        let mut img = base.clone();
+        img[0] = b'X';
+        casos.push(("identificador", img));
+        let mut img = base.clone();
+        img[OFF_CABECERAS[0] as usize + 200] ^= 1;
+        img[OFF_CABECERAS[1] as usize + 200] ^= 1;
+        casos.push(("ambas cabeceras", img));
+        let mut img = base.clone();
+        img[OFF_TABLAS_REGIONES[0] as usize + 20] ^= 1;
+        img[OFF_TABLAS_REGIONES[1] as usize + 20] ^= 1;
+        casos.push(("ambas tablas de regiones", img));
+        let mut img = base.clone();
+        img[OFF_META as usize] = b'X';
+        casos.push(("firma de los metadatos", img));
+        let mut img = base.clone();
+        poner(
+            &mut img,
+            item_meta(&base, 0),
+            &(3 * MIB as u32).to_le_bytes(),
+        );
+        casos.push(("tamaño de bloque", img));
+        let mut img = base.clone();
+        for off in OFF_TABLAS_REGIONES {
+            poner(&mut img, off + 32, &(2 * MIB).to_le_bytes());
+        }
+        sellar_regiones(&mut img);
+        casos.push(("BAT sobre los metadatos", img));
+        for (caso, img) in casos {
+            for tolerante in [false, true] {
+                let (t, r) = abrir_modo(&img, tolerante);
+                assert!(es_corrupto(r), "{caso} (tolerante: {tolerante})");
+                assert!(std::fs::read(t.path()).unwrap() == img);
+            }
+        }
     }
 
     #[test]
