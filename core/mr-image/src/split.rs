@@ -14,6 +14,7 @@
 
 use mr_io::path_policy::{admit, check_lexical, open_regular_file};
 use mr_io::{validate_sector_size, BlockDevice, IoError, Result};
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -173,6 +174,8 @@ impl SplitImage {
             )));
         }
         let mut canon_paths: Vec<PathBuf> = Vec::with_capacity(paths.len());
+        // Detección de repetidos en O(1) por segmento (hasta MAX_SEGMENTS rutas).
+        let mut seen: HashSet<PathBuf> = HashSet::with_capacity(paths.len());
         let mut segments = Vec::with_capacity(paths.len());
         let mut anomalies = Vec::new();
         let mut total: u64 = 0;
@@ -180,7 +183,7 @@ impl SplitImage {
         let last = paths.len() - 1;
         for (i, p) in paths.iter().enumerate() {
             let canon = admit(p)?;
-            if canon_paths.contains(&canon) {
+            if !seen.insert(canon.clone()) {
                 return Err(corrupt(format!(
                     "el segmento «{}» aparece más de una vez",
                     canon.display()

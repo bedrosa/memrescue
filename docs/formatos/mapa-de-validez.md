@@ -21,6 +21,11 @@ incluye un mapa de validez con recuentos exactos.
 
 `SectorState::is_trustworthy()` es `false` solo para `Unreadable` y `Skipped`.
 
+`Sparse` incluye todo lo que el contenedor declara sin datos propios en un disco sin padre: bloques
+no asignados de VHD/VMDK y bloques VHDX NOT_PRESENT, ZERO, UNDEFINED y UNMAPPED. Los dos últimos se
+entregan como ceros igual que `qemu-img`, porque la especificación no define su contenido (ver
+`vhdx.md`, «Decisiones»); no son daño ni se leen como datos.
+
 ## Patrones de relleno configurables (IO-08, ADR-021)
 
 Los dos patrones son de 4 bytes y se repiten en todo el sector en el orden escrito. Por defecto
@@ -47,6 +52,8 @@ Los dos patrones son de 4 bytes y se repiten en todo el sector en el orden escri
 - `ReadPolicy { chunk_sectors (2048), retries (1), on_error (Fail), bad_fill (BAD!),
   skip_fill (SKIP), jump_sectors (0), read_back (false), skip_error_codes ([]),
   ignore_all_errors (false) }` y `ReadPolicy::omits(&IoError) -> bool`.
+  `retries` se acota dentro del lector a `MAX_RETRIES` (100), el mismo límite que validan la FFI y la
+  CLI: un valor mayor desde la API de Rust no prolonga la lectura de un sector ilegible.
 - `IoError::os_error_code() -> Option<i32>`: código de error del sistema de un fallo de E/S.
 - `read_range(dev, start, count, policy, sink, progress) -> Result<ReadReport>`:
   `sink(lba, datos, estados)` recibe tramos con **un estado por sector**, siempre en orden

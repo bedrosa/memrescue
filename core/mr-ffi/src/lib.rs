@@ -45,7 +45,7 @@ pub const MR_OPEN_TOLERANT: u32 = 4;
 /// `mr_source_verify_start`: leer hacia atrás tras un salto.
 pub const MR_VERIFY_READ_BACK: u32 = 1;
 /// Máximo de reintentos por sector aceptado en la frontera C.
-pub const MAX_RETRIES: u32 = 100;
+pub const MAX_RETRIES: u32 = mr_io::resilient::MAX_RETRIES;
 /// `mr_source_verify_start_ex`: modo «ignorar todo», ningún error se reintenta.
 pub const MR_VERIFY_IGNORE_ALL_ERRORS: u32 = 2;
 /// Máximo de códigos de error a omitir en `MrVerifyOptions::skip_codes`.
@@ -195,7 +195,31 @@ enum Entry {
     Verify {
         task: Arc<Task<ReadReport>>,
         outcome: Outcome<ReadReport>,
+        /// Índices materializados del informe (se calculan una vez al consultar el resultado),
+        /// para que las consultas por índice sean O(1) bajo el bloqueo del registro.
+        index: Option<VerifyIndex>,
     },
+}
+
+/// Tramos no fiables y códigos de error de un informe de verificación, en orden.
+struct VerifyIndex {
+    untrusted: Vec<(u64, u64, SectorState)>,
+    codes: Vec<(i32, u64)>,
+}
+
+impl VerifyIndex {
+    fn new(r: &ReadReport) -> Self {
+        Self {
+            untrusted: r
+                .map
+                .runs()
+                .iter()
+                .copied()
+                .filter(|t| !t.2.is_trustworthy())
+                .collect(),
+            codes: r.error_codes.iter().map(|(&c, &n)| (c, n)).collect(),
+        }
+    }
 }
 
 fn registry() -> &'static Mutex<HashMap<u64, Entry>> {
@@ -971,6 +995,7 @@ unsafe fn spawn_verify(source_h: u64, opts: VerifyOptions, out_task: *mut u64) -
                 insert(Entry::Verify {
                     task,
                     outcome: None,
+                    index: None,
                 }),
             )
         },
@@ -1091,7 +1116,7 @@ pub unsafe extern "C" fn mr_verify_error_summary(
         if out_omitted.is_null() || out_code_count.is_null() {
             return fail(MR_ERR_INVALID_ARGUMENT, "puntero de salida nulo");
         }
-        match with_verify(task, |r| {
+        match with_verify(task, |r, _| {
             (
                 r.omitted_errors,
                 u32::try_from(r.error_codes.len()).unwrap_or(u32::MAX),
@@ -1126,11 +1151,10 @@ pub unsafe extern "C" fn mr_verify_error_code(
         if out_code.is_null() || out_sectors.is_null() {
             return fail(MR_ERR_INVALID_ARGUMENT, "puntero de salida nulo");
         }
-        match with_verify(task, |r| {
-            r.error_codes
-                .iter()
-                .nth(index as usize)
-                .map(|(&c, &n)| (c, n))
+        match with_verify(task, |_, ix| {
+            usize::try_from(index)
+                .ok()
+                .and_then(|i| ix.codes.get(i).copied())
         }) {
             Ok(Some((code, n))) => {
                 // SAFETY: punteros no nulos y válidos por contrato.
@@ -1151,19 +1175,16 @@ pub unsafe extern "C" fn mr_verify_error_code(
 
 // ---------- Fin de la verificación extendida ----------
 
-/// Tramos no fiables `(lba, nº, estado)` del mapa de validez, en orden.
-fn untrusted_runs(r: &ReadReport) -> impl Iterator<Item = (u64, u64, SectorState)> + '_ {
-    r.map
-        .runs()
-        .iter()
-        .copied()
-        .filter(|t| !t.2.is_trustworthy())
-}
-
-fn with_verify<R>(task: u64, f: impl FnOnce(&ReadReport) -> R) -> Result<R, i32> {
+/// Ejecuta `f` sobre el informe de una verificación terminada y sus índices materializados
+/// (tramos no fiables y códigos de error), que se construyen una sola vez.
+fn with_verify<R>(task: u64, f: impl FnOnce(&ReadReport, &VerifyIndex) -> R) -> Result<R, i32> {
     let r = with_entry(task, |e| match e {
-        Entry::Verify { task, outcome } => settle(task, outcome).map(|()| match outcome {
-            Some(Ok(rep)) => Some(f(rep)),
+        Entry::Verify {
+            task,
+            outcome,
+            index,
+        } => settle(task, outcome).map(|()| match outcome {
+            Some(Ok(rep)) => Some(f(rep, index.get_or_insert_with(|| VerifyIndex::new(rep)))),
             _ => None,
         }),
         _ => Err((
@@ -1184,7 +1205,7 @@ fn with_verify<R>(task: u64, f: impl FnOnce(&ReadReport) -> R) -> Result<R, i32>
 #[no_mangle]
 pub unsafe extern "C" fn mr_verify_result(task: u64, out: *mut MrVerifyReport) -> i32 {
     guard(|| {
-        let rep = with_verify(task, |r| MrVerifyReport {
+        let rep = with_verify(task, |r, ix| MrVerifyReport {
             sectors_requested: r.sectors_requested,
             sectors_read: r.map.count(SectorState::Read),
             sectors_recovered: r.map.count(SectorState::Recovered),
@@ -1192,7 +1213,7 @@ pub unsafe extern "C" fn mr_verify_result(task: u64, out: *mut MrVerifyReport) -
             sectors_skipped: r.map.count(SectorState::Skipped),
             sectors_sparse: r.map.count(SectorState::Sparse),
             retry_reads: r.retry_reads,
-            untrusted_range_count: untrusted_runs(r).count() as u64,
+            untrusted_range_count: ix.untrusted.len() as u64,
             ranges_truncated: u32::from(r.map.truncated()),
             reserved: 0,
         });
@@ -1220,10 +1241,10 @@ pub unsafe extern "C" fn mr_verify_untrusted_range(
         if out_lba.is_null() || out_count.is_null() || out_state.is_null() {
             return fail(MR_ERR_INVALID_ARGUMENT, "puntero de salida nulo");
         }
-        let r = with_verify(task, |rep| {
+        let r = with_verify(task, |_, ix| {
             usize::try_from(index)
                 .ok()
-                .and_then(|i| untrusted_runs(rep).nth(i))
+                .and_then(|i| ix.untrusted.get(i).copied())
         });
         match r {
             Ok(Some((lba, count, state))) => {

@@ -112,7 +112,7 @@ mr_task_free(handle)
 | `mr_verify_error_summary(task, out_omitted, out_code_count)` | Sectores cuyo error se omitió por la política y nº de códigos del sistema distintos registrados |
 | `mr_verify_error_code(task, index, out_code, out_sectors)` | Código nº `index` (orden creciente) y nº de sectores ilegibles cuyo último intento falló con él |
 | `mr_verify_result(task, out)` | Informe con el recuento exacto de cada estado, relecturas, nº de tramos no fiables y truncado |
-| `mr_verify_untrusted_range(task, index, out_lba, out_count, out_state)` | Tramo no fiable nº `index` (2 ilegible, 3 saltado). Sustituye a `mr_verify_bad_range` (ABI 2) |
+| `mr_verify_untrusted_range(task, index, out_lba, out_count, out_state)` | Tramo no fiable nº `index` (2 ilegible, 3 saltado). Sustituye a `mr_verify_bad_range` (ABI 2). Coste O(1) por índice: los tramos no fiables y los códigos de error se materializan una sola vez, en la primera consulta del resultado, y se guardan con él, así que recorrer todos los índices es lineal y el bloqueo global del registro de handles se mantiene un tiempo constante por llamada |
 | `mr_task_status_get(task, out)` | Estado y progreso (bytes en hash, sectores en verificación) |
 | `mr_task_cancel(task)` | Solicita la cancelación |
 | `mr_task_free(task)` | Libera el handle (cancela si sigue en marcha) |

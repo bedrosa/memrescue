@@ -457,3 +457,32 @@ fn width_grows_past_999() {
     assert_eq!(v.len(), 1001);
     assert_eq!(names(&v[999..]), ["k.1000", "k.1001"]);
 }
+
+#[test]
+fn open_with_max_segments_and_late_duplicate_is_fast() {
+    // MAX_SEGMENTS segmentos de un sector: la comprobación de repetidos no debe ser cuadrática.
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let mut paths: Vec<PathBuf> = (1..=MAX_SEGMENTS)
+        .map(|i| {
+            let p = d.join(format!("m.{i:03}"));
+            std::fs::write(&p, [(i % 251) as u8; 512]).unwrap();
+            p
+        })
+        .collect();
+    let started = std::time::Instant::now();
+    let img = SplitImage::open(&paths, 512).unwrap();
+    assert_eq!(img.sector_count(), MAX_SEGMENTS as u64);
+    let mut s = [0u8; 512];
+    img.read_sectors(MAX_SEGMENTS as u64 - 1, 1, &mut s)
+        .unwrap();
+    assert_eq!(s, [(MAX_SEGMENTS % 251) as u8; 512]);
+    drop(img);
+    // El último se sustituye por una repetición del primero: se rechaza.
+    *paths.last_mut().unwrap() = paths[0].clone();
+    assert!(matches!(
+        SplitImage::open(&paths, 512),
+        Err(IoError::Corrupt { .. })
+    ));
+    assert!(started.elapsed() < std::time::Duration::from_secs(60));
+}

@@ -1031,3 +1031,37 @@ fn read_mapped_ex_rejects_invalid_options() {
     assert_eq!(n, 512);
     assert_eq!(mr_source_close(src), MR_OK);
 }
+
+#[test]
+fn untrusted_ranges_are_indexed_in_constant_time() {
+    // 10 000 tramos ilegibles alternos: recorrer todos los índices debe ser lineal en total (antes
+    // cada consulta recorría el mapa desde el principio bajo el bloqueo global).
+    const N: u64 = 10_000;
+    let dev = mr_io::FaultyDevice::new(
+        mr_io::MemDevice::new(vec![0x11u8; 512 * 2 * N as usize], 512).unwrap(),
+    )
+    .with_bad((0..N).map(|i| 2 * i + 1));
+    let src = insert(Entry::Source(mr_api::source_from_device(
+        Arc::new(dev),
+        "fallos alternos",
+    )));
+    let (task, rep) = run_verify_ex(src, &verify_options(0, 0, &[]));
+    assert_eq!(rep.untrusted_range_count, N);
+    let started = std::time::Instant::now();
+    for i in 0..N {
+        let (mut l, mut c, mut st) = (0u64, 0u64, 0u32);
+        assert_eq!(
+            unsafe { mr_verify_untrusted_range(task, i, &mut l, &mut c, &mut st) },
+            MR_OK
+        );
+        assert_eq!((l, c, st), (2 * i + 1, 1, 2));
+    }
+    assert!(started.elapsed() < Duration::from_secs(5));
+    let (mut l, mut c, mut st) = (0u64, 0u64, 0u32);
+    assert_eq!(
+        unsafe { mr_verify_untrusted_range(task, N, &mut l, &mut c, &mut st) },
+        MR_ERR_OUT_OF_RANGE
+    );
+    mr_task_free(task);
+    mr_source_close(src);
+}
