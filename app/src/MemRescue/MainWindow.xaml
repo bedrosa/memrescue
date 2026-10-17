@@ -1,16 +1,22 @@
 <Window x:Class="MemRescue.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="MemRescue" Height="680" Width="1100" MinHeight="420" MinWidth="720"
+        xmlns:local="clr-namespace:MemRescue"
+        Title="MemRescue" Height="760" Width="1180" MinHeight="460" MinWidth="780"
         Icon="Assets/MemRescue.ico"
         WindowStartupLocation="CenterScreen"
         FontSize="12">
     <Window.CommandBindings>
         <CommandBinding Command="Open" Executed="OpenImage_Executed" />
+        <CommandBinding Command="Close" Executed="CloseSource_Executed" CanExecute="HasSource_CanExecute" />
+        <CommandBinding Command="local:Commands.GoToSector" Executed="GoToSector_Executed" CanExecute="HasSource_CanExecute" />
+        <CommandBinding Command="local:Commands.GoToOffset" Executed="GoToOffset_Executed" CanExecute="HasSource_CanExecute" />
+        <CommandBinding Command="local:Commands.PrevSector" Executed="PrevSector_Executed" CanExecute="HasSource_CanExecute" />
+        <CommandBinding Command="local:Commands.NextSector" Executed="NextSector_Executed" CanExecute="HasSource_CanExecute" />
+        <CommandBinding Command="local:Commands.FirstSector" Executed="FirstSector_Executed" CanExecute="HasSource_CanExecute" />
+        <CommandBinding Command="local:Commands.LastSector" Executed="LastSector_Executed" CanExecute="HasSource_CanExecute" />
+        <CommandBinding Command="local:Commands.CopyHex" Executed="CopyHex_Executed" CanExecute="HasSource_CanExecute" />
     </Window.CommandBindings>
-    <Window.InputBindings>
-        <KeyBinding Key="O" Modifiers="Control" Command="Open" />
-    </Window.InputBindings>
 
     <DockPanel>
         <!--
@@ -21,11 +27,13 @@
         <Menu DockPanel.Dock="Top" Padding="2">
             <MenuItem Header="_Disco">
                 <MenuItem Header="_Abrir imagen de disco…" Command="Open" InputGestureText="Ctrl+O" />
+                <MenuItem Header="_Cerrar origen" Command="Close" InputGestureText="Ctrl+F4" />
+                <Separator />
                 <MenuItem Header="_Seleccionar disco físico…" IsEnabled="False" InputGestureText="(M9)" ToolTip="Pendiente: acceso a discos físicos (hito M9)" />
                 <MenuItem Header="Construir _RAID virtual…" IsEnabled="False" InputGestureText="(M5)" ToolTip="Pendiente: RAID virtual (hito M5)" />
                 <MenuItem Header="_Particiones…" IsEnabled="False" InputGestureText="(M2)" ToolTip="Pendiente: lectura de MBR/GPT y búsqueda de particiones (hito M2)" />
                 <MenuItem Header="_Bloquear volúmenes…" IsEnabled="False" InputGestureText="(M9)" ToolTip="Pendiente (hito M9)" />
-                <MenuItem Header="Parámetros de _E/S…" IsEnabled="False" InputGestureText="(M9)" ToolTip="Pendiente: política de errores de lectura en dispositivos (hito M9)" />
+                <MenuItem Header="Parámetros de _E/S…" IsEnabled="False" InputGestureText="(M9)" ToolTip="Pendiente: política de errores en dispositivos reales (hito M9)" />
                 <Separator />
                 <MenuItem Header="Modo global de solo _lectura" IsCheckable="True" IsChecked="True" IsEnabled="False"
                           ToolTip="Siempre activo: en esta versión MemRescue no puede escribir en ningún origen" />
@@ -34,7 +42,8 @@
                 <MenuItem Header="_Salir" Click="Exit_Click" InputGestureText="Alt+F4" />
             </MenuItem>
             <MenuItem Header="_Herramientas">
-                <MenuItem Header="Calcular _hashes de la imagen" Click="ShowHashTab_Click" />
+                <MenuItem Header="Calcular _hashes del origen…" Click="ShowChecksTab_Click" />
+                <MenuItem Header="Comprobar _legibilidad (leer todos los sectores)…" Click="ShowChecksTab_Click" />
                 <Separator />
                 <MenuItem Header="_Escaneo completo…" IsEnabled="False" InputGestureText="(M6)" ToolTip="Pendiente (hito M6)" />
                 <MenuItem Header="Todo lo encontrado / _FS virtual…" IsEnabled="False" InputGestureText="(M6)" ToolTip="Pendiente (hito M6)" />
@@ -43,6 +52,7 @@
                 <MenuItem Header="Búsqueda RAW por _firmas…" IsEnabled="False" InputGestureText="(M7)" ToolTip="Pendiente (hito M7)" />
                 <MenuItem Header="_Mapa de clusters" IsEnabled="False" InputGestureText="(M11)" ToolTip="Pendiente (hito M11)" />
                 <MenuItem Header="_Copiar sectores (imagen/clon)…" IsEnabled="False" InputGestureText="(M9)" ToolTip="Pendiente (hito M9)" />
+                <MenuItem Header="Buscar cadena / sector especial…" IsEnabled="False" InputGestureText="(M11)" ToolTip="Pendiente (hito M11)" />
                 <MenuItem Header="Herramientas _NTFS" IsEnabled="False" InputGestureText="(M12)" ToolTip="Pendiente: requiere escritura segura (hito M12)" />
             </MenuItem>
             <MenuItem Header="_Ventanas">
@@ -52,14 +62,24 @@
                 <MenuItem Header="Panel de _búsqueda" IsEnabled="False" InputGestureText="(M10)" ToolTip="Pendiente (hito M10)" />
             </MenuItem>
             <MenuItem Header="_Editor">
-                <MenuItem Header="_Ir a sector…" IsEnabled="False" InputGestureText="(M11)" ToolTip="Pendiente: editor hexadecimal (hito M11)" />
-                <MenuItem Header="Ir a _desplazamiento…" IsEnabled="False" InputGestureText="(M11)" ToolTip="Pendiente (hito M11)" />
+                <MenuItem Header="Ir a _sector…" Command="local:Commands.GoToSector" InputGestureText="Ctrl+G" />
+                <MenuItem Header="Ir a _desplazamiento…" Command="local:Commands.GoToOffset" InputGestureText="Ctrl+Mayús+G" />
+                <Separator />
+                <MenuItem Header="Sector _anterior" Command="local:Commands.PrevSector" InputGestureText="RePág" />
+                <MenuItem Header="Sector s_iguiente" Command="local:Commands.NextSector" InputGestureText="AvPág" />
+                <MenuItem Header="_Primer sector" Command="local:Commands.FirstSector" InputGestureText="Ctrl+Inicio" />
+                <MenuItem Header="Ú_ltimo sector" Command="local:Commands.LastSector" InputGestureText="Ctrl+Fin" />
+                <Separator />
+                <MenuItem Header="Ir a cluster / registro…" IsEnabled="False" InputGestureText="(M3)" ToolTip="Pendiente: requiere sistemas de archivos (hito M3)" />
             </MenuItem>
             <MenuItem Header="_Modo">
-                <MenuItem Header="_Hexadecimal / texto" IsEnabled="False" InputGestureText="(M11)" ToolTip="Pendiente (hito M11)" />
-                <MenuItem Header="_Plantillas de estructuras…" IsEnabled="False" InputGestureText="(M11)" ToolTip="Pendiente (hito M11)" />
+                <MenuItem Header="_Hexadecimal / texto" IsCheckable="True" IsChecked="True" ToolTip="Vista actual del editor" />
+                <MenuItem Header="Tabla de _particiones (MBR/GPT)" IsEnabled="False" InputGestureText="(M2)" ToolTip="Pendiente (hito M2)" />
+                <MenuItem Header="_Boot sector / superbloque" IsEnabled="False" InputGestureText="(M3)" ToolTip="Pendiente (hito M3)" />
+                <MenuItem Header="Plan_tillas de estructuras…" IsEnabled="False" InputGestureText="(M11)" ToolTip="Pendiente (hito M11)" />
             </MenuItem>
             <MenuItem Header="Edi_ción">
+                <MenuItem Header="_Copiar volcado hexadecimal" Command="local:Commands.CopyHex" InputGestureText="Ctrl+Mayús+C" />
                 <MenuItem Header="Modo _edición" IsEnabled="False" InputGestureText="(M12)" ToolTip="Pendiente: escritura segura (hito M12)" />
             </MenuItem>
             <MenuItem Header="A_yuda">
@@ -70,9 +90,12 @@
         <ToolBarTray DockPanel.Dock="Top" IsLocked="True">
             <ToolBar>
                 <Button Command="Open" Content="Abrir imagen…" ToolTip="Abrir un fichero de imagen de disco en solo lectura (Ctrl+O)" />
-                <TextBlock Text="Sector:" VerticalAlignment="Center" Margin="6,0,4,0" />
-                <ComboBox x:Name="SectorSizeBox" Width="70" SelectedIndex="0" ToolTip="Tamaño de sector lógico con el que se interpreta la imagen">
+                <TextBlock Text="Sector al abrir:" VerticalAlignment="Center" Margin="6,0,4,0" />
+                <ComboBox x:Name="SectorSizeBox" Width="70" SelectedIndex="0"
+                          ToolTip="Tamaño de sector lógico con el que se interpretará la próxima imagen que se abra">
                     <ComboBoxItem Content="512" />
+                    <ComboBoxItem Content="1024" />
+                    <ComboBoxItem Content="2048" />
                     <ComboBoxItem Content="4096" />
                 </ComboBox>
                 <Separator />
@@ -92,6 +115,10 @@
             </StatusBarItem>
             <Separator />
             <StatusBarItem>
+                <TextBlock x:Name="PositionText" Text="" FontFamily="Consolas" />
+            </StatusBarItem>
+            <Separator />
+            <StatusBarItem>
                 <TextBlock x:Name="StatusText" Text="Listo" />
             </StatusBarItem>
         </StatusBar>
@@ -100,10 +127,10 @@
             <Grid.RowDefinitions>
                 <RowDefinition Height="*" MinHeight="200" />
                 <RowDefinition x:Name="LogSplitterRow" Height="Auto" />
-                <RowDefinition x:Name="LogRow" Height="130" MinHeight="0" />
+                <RowDefinition x:Name="LogRow" Height="120" MinHeight="0" />
             </Grid.RowDefinitions>
             <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="270" MinWidth="160" />
+                <ColumnDefinition Width="260" MinWidth="160" />
                 <ColumnDefinition Width="Auto" />
                 <ColumnDefinition Width="*" />
             </Grid.ColumnDefinitions>
@@ -127,6 +154,40 @@
             <GridSplitter Grid.Row="0" Grid.Column="1" Width="4" HorizontalAlignment="Stretch" Background="{StaticResource BorderBrush}" />
 
             <TabControl x:Name="MainTabs" Grid.Row="0" Grid.Column="2" Margin="4">
+                <!-- Visor de sectores -->
+                <TabItem x:Name="SectorsTab" Header="Sectores">
+                    <DockPanel Margin="6">
+                        <WrapPanel DockPanel.Dock="Top" Margin="0,0,0,6">
+                            <Button Content="|◀" Command="local:Commands.FirstSector" ToolTip="Primer sector (Ctrl+Inicio)" />
+                            <Button Content="◀" Command="local:Commands.PrevSector" ToolTip="Sector anterior (RePág)" />
+                            <TextBlock Text="LBA:" VerticalAlignment="Center" Margin="6,0,4,0" />
+                            <TextBox x:Name="LbaBox" Width="140" FontFamily="Consolas" VerticalContentAlignment="Center"
+                                     KeyDown="LbaBox_KeyDown" ToolTip="Número de sector (decimal, 0x… o …h). Intro para ir." />
+                            <Button Content="Ir" Click="GoLba_Click" />
+                            <Button Content="▶" Command="local:Commands.NextSector" ToolTip="Sector siguiente (AvPág)" />
+                            <Button Content="▶|" Command="local:Commands.LastSector" ToolTip="Último sector (Ctrl+Fin)" />
+                            <TextBlock Text="Sectores por página:" VerticalAlignment="Center" Margin="12,0,4,0" />
+                            <ComboBox x:Name="PageSizeBox" Width="50" SelectedIndex="0" SelectionChanged="PageSizeBox_SelectionChanged">
+                                <ComboBoxItem Content="1" />
+                                <ComboBoxItem Content="2" />
+                                <ComboBoxItem Content="4" />
+                                <ComboBoxItem Content="8" />
+                            </ComboBox>
+                        </WrapPanel>
+                        <TextBlock x:Name="SectorInfoText" DockPanel.Dock="Top" Margin="0,0,0,4" FontFamily="Consolas"
+                                   Foreground="{StaticResource BrandBrush}" />
+                        <Grid>
+                            <TextBlock x:Name="NoSourceSectorsText" Text="Abra una imagen de disco (Disco → Abrir imagen…, Ctrl+O) para ver sus sectores."
+                                       Foreground="{StaticResource MutedBrush}" TextWrapping="Wrap" Margin="4" />
+                            <TextBox x:Name="HexView" IsReadOnly="True" FontFamily="Consolas" FontSize="13"
+                                     TextWrapping="NoWrap" AcceptsReturn="True" BorderThickness="1"
+                                     BorderBrush="{StaticResource BorderBrush}"
+                                     HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto"
+                                     PreviewKeyDown="HexView_PreviewKeyDown" Visibility="Collapsed" />
+                        </Grid>
+                    </DockPanel>
+                </TabItem>
+
                 <TabItem Header="Propiedades">
                     <Grid Margin="10">
                         <TextBlock x:Name="NoSourceText" Text="Abra una imagen de disco (Disco → Abrir imagen…, Ctrl+O). Se abre siempre en solo lectura."
@@ -143,27 +204,31 @@
                                 <RowDefinition Height="Auto" />
                                 <RowDefinition Height="Auto" />
                                 <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
                             </Grid.RowDefinitions>
                             <TextBlock Grid.Row="0" Text="Ruta" Style="{StaticResource PropName}" />
                             <TextBox Grid.Row="0" Grid.Column="1" x:Name="PropPath" Style="{StaticResource PropValue}" />
-                            <TextBlock Grid.Row="1" Text="Tamaño" Style="{StaticResource PropName}" />
-                            <TextBox Grid.Row="1" Grid.Column="1" x:Name="PropSize" Style="{StaticResource PropValue}" />
-                            <TextBlock Grid.Row="2" Text="Tamaño de sector" Style="{StaticResource PropName}" />
-                            <TextBox Grid.Row="2" Grid.Column="1" x:Name="PropSector" Style="{StaticResource PropValue}" />
-                            <TextBlock Grid.Row="3" Text="Sectores" Style="{StaticResource PropName}" />
-                            <TextBox Grid.Row="3" Grid.Column="1" x:Name="PropSectors" Style="{StaticResource PropValue}" />
-                            <TextBlock Grid.Row="4" Text="Bytes sobrantes" Style="{StaticResource PropName}" />
-                            <TextBox Grid.Row="4" Grid.Column="1" x:Name="PropTrailing" Style="{StaticResource PropValue}" />
-                            <TextBlock Grid.Row="5" Text="Acceso" Style="{StaticResource PropName}" />
-                            <TextBox Grid.Row="5" Grid.Column="1" Text="Solo lectura (fichero de imagen)" Style="{StaticResource PropValue}" />
+                            <TextBlock Grid.Row="1" Text="Formato" Style="{StaticResource PropName}" />
+                            <TextBox Grid.Row="1" Grid.Column="1" x:Name="PropFormat" Style="{StaticResource PropValue}" />
+                            <TextBlock Grid.Row="2" Text="Tamaño" Style="{StaticResource PropName}" />
+                            <TextBox Grid.Row="2" Grid.Column="1" x:Name="PropSize" Style="{StaticResource PropValue}" />
+                            <TextBlock Grid.Row="3" Text="Tamaño de sector" Style="{StaticResource PropName}" />
+                            <TextBox Grid.Row="3" Grid.Column="1" x:Name="PropSector" Style="{StaticResource PropValue}" />
+                            <TextBlock Grid.Row="4" Text="Sectores" Style="{StaticResource PropName}" />
+                            <TextBox Grid.Row="4" Grid.Column="1" x:Name="PropSectors" Style="{StaticResource PropValue}" />
+                            <TextBlock Grid.Row="5" Text="Bytes sobrantes" Style="{StaticResource PropName}" />
+                            <TextBox Grid.Row="5" Grid.Column="1" x:Name="PropTrailing" Style="{StaticResource PropValue}" />
+                            <TextBlock Grid.Row="6" Text="Acceso" Style="{StaticResource PropName}" />
+                            <TextBox Grid.Row="6" Grid.Column="1" Text="Solo lectura (fichero de imagen)" Style="{StaticResource PropValue}" />
                         </Grid>
                     </Grid>
                 </TabItem>
 
-                <TabItem x:Name="HashTab" Header="Hashes">
-                    <DockPanel Margin="10">
-                        <StackPanel DockPanel.Dock="Top">
-                            <TextBlock Text="Calcula hashes del origen seleccionado leyendo la imagen completa en solo lectura."
+                <TabItem x:Name="ChecksTab" Header="Comprobaciones">
+                    <ScrollViewer VerticalScrollBarVisibility="Auto">
+                        <StackPanel Margin="10">
+                            <TextBlock Text="Hashes del origen" Style="{StaticResource SectionHeader}" />
+                            <TextBlock Text="Lee el fichero completo en solo lectura. Cualquier error de lectura aborta el cálculo (un hash con datos de relleno no representaría el origen)."
                                        Foreground="{StaticResource MutedBrush}" Margin="0,0,0,8" TextWrapping="Wrap" />
                             <WrapPanel Margin="0,0,0,8">
                                 <CheckBox x:Name="AlgCrc32" Content="CRC-32" Margin="0,0,14,0" />
@@ -178,11 +243,30 @@
                                 <Button x:Name="HashCancelButton" Content="Cancelar" Click="HashCancel_Click" IsEnabled="False" />
                             </StackPanel>
                             <ProgressBar x:Name="HashProgress" Height="16" Minimum="0" Maximum="1" />
-                            <TextBlock x:Name="HashProgressText" Margin="0,4,0,8" Foreground="{StaticResource MutedBrush}" />
+                            <TextBlock x:Name="HashProgressText" Margin="0,4,0,6" Foreground="{StaticResource MutedBrush}" />
+                            <TextBox x:Name="HashResults" IsReadOnly="True" FontFamily="Consolas" MinHeight="70" TextWrapping="NoWrap"
+                                     HorizontalScrollBarVisibility="Auto" />
+
+                            <TextBlock Text="Comprobación de legibilidad" Style="{StaticResource SectionHeader}" Margin="0,18,0,6" />
+                            <TextBlock Text="Lee todos los sectores completos. Si un bloque falla, relee sector a sector con los reintentos indicados e informa de los sectores ilegibles."
+                                       Foreground="{StaticResource MutedBrush}" Margin="0,0,0,8" TextWrapping="Wrap" />
+                            <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                                <TextBlock Text="Reintentos por sector:" VerticalAlignment="Center" Margin="0,0,6,0" />
+                                <ComboBox x:Name="RetriesBox" Width="50" SelectedIndex="1">
+                                    <ComboBoxItem Content="0" />
+                                    <ComboBoxItem Content="1" />
+                                    <ComboBoxItem Content="3" />
+                                    <ComboBoxItem Content="10" />
+                                </ComboBox>
+                                <Button x:Name="VerifyStartButton" Content="Comprobar" Click="VerifyStart_Click" Margin="12,0,4,0" />
+                                <Button x:Name="VerifyCancelButton" Content="Cancelar" Click="VerifyCancel_Click" IsEnabled="False" />
+                            </StackPanel>
+                            <ProgressBar x:Name="VerifyProgress" Height="16" Minimum="0" Maximum="1" />
+                            <TextBlock x:Name="VerifyProgressText" Margin="0,4,0,6" Foreground="{StaticResource MutedBrush}" />
+                            <TextBox x:Name="VerifyResults" IsReadOnly="True" FontFamily="Consolas" MinHeight="70" TextWrapping="NoWrap"
+                                     HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto" MaxHeight="220" />
                         </StackPanel>
-                        <TextBox x:Name="HashResults" IsReadOnly="True" FontFamily="Consolas" TextWrapping="NoWrap"
-                                 HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto" />
-                    </DockPanel>
+                    </ScrollViewer>
                 </TabItem>
             </TabControl>
 

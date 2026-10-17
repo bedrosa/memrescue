@@ -181,3 +181,34 @@ Detalles en [API_FFI.md](API_FFI.md). Puntos clave:
 **Alternativas descartadas.** COM/WinRT (complejidad), proceso separado con IPC (latencia y complejidad
 innecesarias en M0; se reconsiderará con ADR-007 para el acceso elevado a dispositivos), `csbindgen`
 (herramienta extra).
+
+**Revisión M1.** ABI 2: orígenes como handles, lectura de sectores, verificación, detección de formato,
+códigos 10–11, cadenas ≤ 64 KiB. En C#, `EngineHandle` con finalizador de seguridad.
+
+---
+
+## ADR-014 · Política de admisión de rutas por lista blanca (Aceptada, 2026-10-17)
+
+**Contexto.** La revisión técnica encontró que `\\?\C:` abría el volumen como dispositivo pese a la lista
+negra de prefijos (REVISION_TECNICA_M1, R1).
+
+**Decisión.** Mientras el acceso a dispositivos esté deshabilitado, solo se admiten **ficheros normales**:
+lista blanca léxica de formas de ruta, resolución de enlaces sin abrir el destino, ruta canónica con letra
+de unidad o UNC y apertura con `FILE_FLAG_OPEN_REPARSE_POINT` verificando los atributos del objeto abierto.
+El acceso a discos (M9) tendrá su propia vía explícita, nunca a través de `ImageFile`.
+
+---
+
+## ADR-015 · Contenedores: detectar antes que interpretar (Aceptada, 2026-10-17)
+
+**Decisión.** Un fichero cuyo formato se reconoce como contenedor (VHD, VHDX, VMDK, EWF, QCOW, VDI, DMG) no
+se abre como RAW salvo petición explícita del usuario. Cada formato se implementará solo cuando exista un
+corpus de referencia generado por una herramienta independiente.
+
+---
+
+## ADR-016 · Propietario único de la base de trabajo (Aceptada, 2026-10-17)
+
+**Decisión.** Una base de trabajo SQLite pertenece a un solo `Store` a la vez (bloqueo exclusivo de
+`<base>.lock`). Con `synchronous=FULL` y `quick_check` al abrir. Así es seguro marcar como interrumpidos los
+trabajos huérfanos al abrir (REVISION_TECNICA_M1, S1–S5).

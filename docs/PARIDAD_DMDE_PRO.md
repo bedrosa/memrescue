@@ -28,9 +28,9 @@ Referencias abreviadas a documentos de investigación: `F1-05` = `investigacion/
 | IO-03 | Abrir disco en solo lectura | `\\.\PhysicalDriveN` | Base | F1-06 | B D | `BlockDevice` Win | No iniciado | Prueba en VM con disco virtual | - |
 | IO-04 | Geometría y tamaño | Sector lógico/físico, tamaño total | Base | F1-06 (GET_LENGTH_INFO, GEOMETRY) | D | `mr-io-win` | No iniciado | VHD de 512 y 4Kn | Detección de capacidad "no accesible" (HPA/DCO) ? |
 | IO-05 | Interfaz IO FILE / SCSI / ATA | Selección de vía de lectura | Parámetros E/S | MAN, F1-06 (SCSI/ATA pass-through) | M D | Estrategias intercambiables | No iniciado | Simulador + VM | CDBs/comandos exactos no verificados (INV-06) |
-| IO-06 | Reintentos CRC y seek | Reintentos configurables, sector a sector tras error | Parámetros E/S | MAN, F1-06 | M B | `ResilientReader` | No iniciado | Dispositivo simulado con errores | - |
+| IO-06 | Reintentos CRC y seek | Reintentos configurables, sector a sector tras error | Parámetros E/S | MAN, F1-06 | M B | `mr-io::resilient` | **Implementado parcial** (M1: relectura sector a sector tras fallo de bloque + N reintentos por sector) | Hecho: `FaultyDevice` (sectores permanentes e intermitentes). Falta: hardware real (M9) | Sin distinción CRC/seek; sin salto ni lectura hacia atrás (IO-07) |
 | IO-07 | Salto sobre sectores malos + lectura hacia atrás | Reduce carga en zonas dañadas | Parámetros E/S | MAN, F1-06 | M B | `ResilientReader` | No iniciado | Simulador: mapa de errores esperado | Algoritmo exacto de retroceso ? (INV-06) |
-| IO-08 | Rellenos de sectores malos/saltados | Patrón de 4 bytes LE | Parámetros E/S | MAN | M B | `ResilientReader` | No iniciado | Comparar bytes de salida | - |
+| IO-08 | Rellenos de sectores malos/saltados | Patrón de 4 bytes LE | Parámetros E/S | MAN | M B | `mr-io::resilient` | **Implementado parcial** (M1: patrón de 4 bytes para sectores ilegibles, con informe exacto de rangos) | Hecho: `fill_policy_fills_only_bad_sectors_and_reports_them` | Falta relleno distinto para sectores saltados (depende de IO-07) y configuración en UI |
 | IO-09 | Omitir errores por código / "ignorar todo" | Lista de códigos | Parámetros E/S | MAN | M B | Política de errores | No iniciado | Simulador | - |
 | IO-10 | Timeouts, reset de handle, reanudar al reconectar | Robustez ante desconexiones | Parámetros E/S | MAN, F1-06 | M B | `mr-io-win` + política | No iniciado | Simulador de desconexión | - |
 | IO-11 | Script de manejo de E/S **(Pro)** | Lenguaje para decidir ante errores | Parámetros E/S | MAN, F1-09 | M B Pro | Lenguaje propio o Rhai/Lua embebido | No iniciado | Pruebas del intérprete | Semántica completa ? (INV-07) |
@@ -42,12 +42,12 @@ Referencias abreviadas a documentos de investigación: `F1-05` = `investigacion/
 
 | ID | Funcionalidad | Descripción | Ref. DMDE | Evidencias | Verif. | Diseño MemRescue | Estado | Pruebas necesarias | Diferencias pendientes |
 |---|---|---|---|---|---|---|---|---|---|
-| IM-01 | Imagen sector a sector | IMG/BIN/RAW | Open Image | MAN, F1-02 | M B | `mr-io::ImageFile` (M0) → `mr-image` | **Implementado parcial** (M0: apertura solo lectura, tamaño, sectores, lectura posicional) | Hecho: unitarias + corpus (3 imágenes). Falta: lectura de estructuras (M2) | Sin interpretación de contenido aún |
+| IM-01 | Imagen sector a sector | IMG/BIN/RAW | Open Image | MAN, F1-02 | M B | `mr-io::ImageFile` | **Probado** (M1: apertura solo lectura con política de rutas, sectores de 512/1024/2048/4096, lectura de rangos estricta, verificación completa, visor) | Hecho: unitarias, CLI, C#, corpus (marcadores en LBA exactas, 512 y 4096 B), autodiagnóstico GUI, inmutabilidad del origen | Falta abrir junto con logs/escaneos y la búsqueda de particiones al abrir (M2) para cubrir todo el diálogo de referencia |
 | IM-02 | Imagen dividida | Partes + descriptor | Copy Sectors (split) | MAN | M B | `mr-image` | No iniciado | Generador de partes | Descriptor propio (no `raidinfo.ini`) |
-| IM-03 | VHD (fijo/dinámico/diferencial) | Lectura | Imágenes | MAN, F1-06 | M B | `mr-image` | No iniciado | VHD creados con herramientas Windows | Diferencial vía RAID "DVHD" ? |
-| IM-04 | VHDX | Lectura | Imágenes | MAN, F1-06 | M B | `mr-image` | No iniciado | VHDX de Hyper-V/diskpart | - |
-| IM-05 | VMDK | Lectura | Imágenes | MAN | M B | `mr-image` | No iniciado | VMDK de qemu-img | Variantes (sparse/stream) a acotar |
-| IM-06 | E01/EWF **(Pro)** | Lectura con compresión | Imágenes | MAN | M Pro | `mr-image` (spec libewf) | No iniciado | E01 generados con herramienta libre | - |
+| IM-03 | VHD (fijo/dinámico/diferencial) | Lectura | Imágenes | MAN, F1-06 | M B | `mr-image` | No iniciado (M1: **detección** por firma `conectix`; se rechaza abrirlo como RAW) | VHD creados con herramientas de terceros (sin herramienta disponible sin administrador: pendiente) | Diferencial vía RAID "DVHD" ? |
+| IM-04 | VHDX | Lectura | Imágenes | MAN, F1-06 | M B | `mr-image` | No iniciado (M1: **detección** `vhdxfile`) | VHDX de Hyper-V/diskpart (requiere administrador: pendiente de autorización) | - |
+| IM-05 | VMDK | Lectura | Imágenes | MAN | M B | `mr-image` | No iniciado (M1: **detección** `KDMV`/`COWD`/descriptor) | VMDK de qemu-img (no instalado) | Variantes (sparse/stream) a acotar |
+| IM-06 | E01/EWF **(Pro)** | Lectura con compresión | Imágenes | MAN | M Pro | `mr-image` (spec libewf) | No iniciado (M1: **detección** EVF/LVF/EVF2) | E01 generados con herramienta libre | - |
 | IM-07 | Capa de cambios diferidos | Deshacer/rehacer/aplicar/rollback | Disk menu | MAN, F1-04 | M B | `mr-changes` | No iniciado | Pruebas de propiedades | - |
 | IM-08 | Modo global de solo lectura | Bloqueo de escritura | Disk menu | MAN | M B | ADR-006 | No iniciado | Prueba de que nada escribe | - |
 
@@ -55,11 +55,11 @@ Referencias abreviadas a documentos de investigación: `F1-05` = `investigacion/
 
 | ID | Funcionalidad | Descripción | Ref. DMDE | Evidencias | Verif. | Diseño MemRescue | Estado | Pruebas necesarias | Diferencias pendientes |
 |---|---|---|---|---|---|---|---|---|---|
-| PT-01 | Leer MBR/EBR | Primarias y lógicas | Partitions | MAN, F1-07 | M B | `mr-part` | No iniciado | Imágenes con sfdisk/diskpart | Validador DMDE no decompilado (INV-05) |
+| PT-01 | Leer MBR/EBR | Primarias y lógicas | Partitions | MAN, F1-07 | M B D | `mr-part` | No iniciado (**INV-05 hecha**: reglas de aceptación de tabla y nombres de tipo verificadas) | Corpus `mbr_basic` + casos de INV-05 §6 | - |
 | PT-02 | Leer GPT + copia | Cabecera, entradas, CRC | Partitions | F1-05 §5.2 | M D | `mr-part` | No iniciado | GPT sano, dañado, desplazado | - |
 | PT-03 | Tolerancia GPT | Rebasar LBA si la imagen está desplazada | - | F1-05 §5.2 | D | `mr-part` | No iniciado | Imagen recortada al inicio | - |
 | PT-04 | Apple Partition Map | Lectura | - | F1-07 | B | `mr-part` | No iniciado | Imagen APM | Prioridad baja |
-| PT-05 | Búsqueda exprés de particiones perdidas | Al abrir dispositivo | Partitions "found" | MAN | M B | `mr-part::search` | No iniciado | Tabla borrada con FS intactos | Algoritmo ? (INV-05) |
+| PT-05 | Búsqueda exprés de particiones perdidas | Al abrir dispositivo | Partitions "found" | MAN | M B D | `mr-part::search` | No iniciado (**INV-05**: sondeo por candidato verificado; generación de candidatos sin verificar) | Tabla borrada con FS intactos y copias de respaldo | Bucle externo de candidatos no verificado |
 | PT-06 | Indicadores T/E/B/C/F/f/x y activa | Estado de estructuras | Partitions | MAN | M | UI + `mr-part` | No iniciado | Instantáneas de UI | - |
 | PT-07 | Insertar (undelete), quitar, crear RAW | Edición de tabla | Partitions (avanzado) | MAN | M B | `mr-part` + `mr-changes` | No iniciado | Sobre imágenes únicamente | Escritura física bloqueada (ADR-006) |
 | PT-08 | Restaurar boot sector desde copia | NTFS/FAT/exFAT | Partitions | MAN | M B | `mr-part` | No iniciado | Boot dañado + copia sana | - |
@@ -173,13 +173,13 @@ Referencias abreviadas a documentos de investigación: `F1-05` = `investigacion/
 
 | ID | Funcionalidad | Descripción | Ref. DMDE | Evidencias | Verif. | Diseño MemRescue | Estado | Pruebas necesarias | Diferencias pendientes |
 |---|---|---|---|---|---|---|---|---|---|
-| HX-01 | Vista hex/texto con codificaciones | - | Editor/Mode | MAN, F1-04 | M B | `mr-hex` + control UI | No iniciado | Instantáneas | - |
+| HX-01 | Vista hex/texto con codificaciones | - | Editor/Mode | MAN, F1-04 | M B | `HexDump` (C#) + visor WPF | **Implementado parcial** (M1: hex + ASCII con desplazamientos absolutos, 1–8 sectores por página) | Hecho: `HexDumpTests`, autodiagnóstico (primera línea del visor) | Sin codificaciones alternativas, sin vista continua con desplazamiento, sin colores de estado |
 | HX-02 | Vistas de estructura integradas (MBR, GPT, boot, FAT dir, MFT, INDX…) | - | Mode | MAN, F1-04 | M B | Plantillas propias | No iniciado | Cada estructura | Lista completa de vistas (INV-09) |
 | HX-03 | Plantillas personalizadas | Lenguaje de plantillas | Mode | MAN, F1-09 | M B | Lenguaje propio documentado | No iniciado | Intérprete | No compatible con `template.txt` de DMDE |
-| HX-04 | Navegación (ir a sector/cluster/registro/offset, objetos FS) | - | Editor | MAN, F1-04 | M B | `mr-hex` | No iniciado | - | - |
+| HX-04 | Navegación (ir a sector/cluster/registro/offset, objetos FS) | - | Editor | MAN, F1-04 | M B | Comandos WPF + `mr_source_read` | **Implementado parcial** (M1: ir a sector, ir a desplazamiento, anterior/siguiente, primero/último, con validación de rango) | Hecho: análisis de números (`HexDumpTests`), lectura en LBA exactas (corpus). Falta: prueba automática de UI | Cluster, registro y objetos FS (M3+) |
 | HX-05 | Modo edición + colores (modificado, no usado, error E/S, error lógico) | - | Edit | MAN | M | `mr-hex` + `mr-changes` | No iniciado | - | - |
 | HX-06 | Buscar cadena / sector especial | - | Tools → Search | MAN, F1-04 | M B | `mr-hex` | No iniciado | - | - |
-| HX-07 | Copiar/pegar bloques, exportar a texto | - | Edit | F1-04 | B | `mr-hex` | No iniciado | - | - |
+| HX-07 | Copiar/pegar bloques, exportar a texto | - | Edit | F1-04 | B | `mr-hex` | **Implementado parcial** (M1: copiar el volcado visible; selección de texto) | - | Pegar (requiere escritura, M12), exportar a fichero |
 | NT-01 | Herramientas NTFS sin driver: copiar dentro, crear dir, borrar, reparar INDX | Escritura FS | Tools → NTFS Tools | MAN, F1-04 | M B | `mr-fs-ntfs::write` | No iniciado | Solo imágenes + chkdsk en VM | Alto riesgo: último hito |
 | NT-02 | Crear lista de atributos NTFS | Avanzado | Undocumented | F1-04 | B | - | No iniciado | - | Baja prioridad |
 
@@ -188,10 +188,10 @@ Referencias abreviadas a documentos de investigación: `F1-05` = `investigacion/
 | ID | Funcionalidad | Descripción | Ref. DMDE | Evidencias | Verif. | Diseño MemRescue | Estado | Pruebas necesarias | Diferencias pendientes |
 |---|---|---|---|---|---|---|---|---|---|
 | UX-01 | Flujo selector → particiones → volumen → árbol → recuperar | Flujo principal | Manual "Work with Program" | MAN | M | ARQUITECTURA §5 | No iniciado | Pruebas de UI guiadas | Disposición exacta de DMDE no documentada (INV-12) |
-| UX-02 | Menús Disco/Herramientas/Ventanas/Editor/Modo/Edición | Organización | Menu | MAN, F1-04 | M B | Misma organización lógica, textos propios | No iniciado | Revisión de cobertura | Submenús Windows/Editor/Mode/Edit ? (INV-12) |
+| UX-02 | Menús Disco/Herramientas/Ventanas/Editor/Modo/Edición | Organización | Menu | MAN, F1-04 | M B | Misma organización lógica, textos propios | **Implementado parcial** (M1: los 6 menús; cada entrada funciona o está deshabilitada con su hito) | Revisión de cobertura; captura `--screenshot` | Submenús Windows/Editor/Mode/Edit de la referencia sin documentar (INV-12) |
 | UX-03 | Panel de ficheros con marcadores de estado | Borrado/encontrado/RAW/fragmento | File panel | MAN | M | UI con iconos propios | No iniciado | - | - |
 | UX-04 | Disposiciones de ventana (árbol, panel, editor) | - | Windows | F1-04 | B | UI | No iniciado | - | - |
-| UX-05 | Atajos de teclado familiares | Ctrl+E, Ctrl+W, F2, Insert/Espacio… | Varios | MAN, F1-02 (lista de atajos) | M B | Mapa de atajos configurable | No iniciado | - | Lista completa ? |
+| UX-05 | Atajos de teclado familiares | Ctrl+E, Ctrl+W, F2, Insert/Espacio… | Varios | MAN, F1-02 (lista de atajos) | M B | Mapa de atajos configurable | **Implementado parcial** (M1: Ctrl+O, Ctrl+F4, Ctrl+G, Ctrl+Mayús+G, RePág/AvPág, Ctrl+Inicio/Fin, Ctrl+Mayús+C) | - | Lista completa de la referencia ?; atajos no configurables aún |
 | UX-06 | Idiomas | Localización | Language | MAN, F1-09 | M B | Recursos `.resx` propios (WPF) | No iniciado | - | ES/EN primero |
 | UX-07 | Tema oscuro, alto DPI | - | "Dark Mode (Unofficial)" | F1-04 | B | WPF: PerMonitorV2 (hecho en M0) + temas claro/oscuro propios | No iniciado (DPI: configurado) | Captura con `--screenshot` | Tema oscuro pendiente |
 | UX-08 | Pistas para usuarios noveles | Ayudas contextuales | - | F1-04 | B | UI | No iniciado | - | - |
@@ -202,17 +202,18 @@ Referencias abreviadas a documentos de investigación: `F1-05` = `investigacion/
 
 | Bloque | Funcionalidades | Con lógica verificada en DMDE (D) | Implementadas | En paridad |
 |---|---|---|---|---|
-| E/S | 14 | 7 | 0 | 0 |
-| Imágenes | 8 | 0 | 1 (parcial: IM-01) | 0 |
-| Particiones | 11 | 2 | 0 | 0 |
+| E/S | 14 | 7 | 2 parciales (IO-06, IO-08) | 0 |
+| Imágenes | 8 | 0 | 1 probada (IM-01); IM-03…06 solo detección | 0 |
+| Particiones | 11 | 4 | 0 (INV-05 hecha) | 0 |
 | FS | 15 | 6 | 0 | 0 |
 | Escaneo | 13 | 2 | 0 | 0 |
 | RAW | 8 | 0 | 0 | 0 |
 | Recuperación | 14 | 1 | 0 | 0 |
 | RAID | 11 | 0 | 0 | 0 |
 | Clonado | 11 | 0 | 0 | 0 |
-| Editor/herramientas | 9 | 0 | 0 | 0 |
-| Aplicación | 10 | 0 | 1 (UX-09) | 0 |
-| **Total** | **124** | **18** | **2 (1 parcial)** | **0** |
+| Editor/herramientas | 9 | 0 | 3 parciales (HX-01, HX-04, HX-07) | 0 |
+| Aplicación | 10 | 0 | 1 (UX-09) + 2 parciales (UX-02, UX-05) | 0 |
+| **Total** | **124** | **20** | **9 (1 probada, 1 implementada, 7 parciales)** | **0** |
 
-Última actualización: 2026-10-17, tras M0. Ninguna funcionalidad alcanza todavía "Paridad".
+Última actualización: 2026-10-17, tras M1 (iteración 1). Ninguna funcionalidad alcanza todavía "Paridad":
+IM-01 está probada, pero el diálogo de referencia abre también logs y busca particiones al abrir (M2).

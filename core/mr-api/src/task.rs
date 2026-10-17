@@ -1,6 +1,7 @@
 //! Tareas en segundo plano con progreso y cancelación cooperativa.
 
 use crate::{ApiError, Result};
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -64,8 +65,9 @@ pub struct Task<T> {
 }
 
 impl<T: Send + 'static> Task<T> {
-    /// Ejecuta `f` en un hilo nuevo.
-    pub fn spawn<F>(f: F) -> Arc<Self>
+    /// Ejecuta `f` en un hilo nuevo. Un pánico dentro de `f` no deja la tarea colgada: se
+    /// convierte en un fallo de la tarea.
+    pub fn spawn<F>(f: F) -> Result<Arc<Self>>
     where
         F: FnOnce(&TaskContext) -> Result<T> + Send + 'static,
     {
@@ -79,7 +81,12 @@ impl<T: Send + 'static> Task<T> {
         thread::Builder::new()
             .name("mr-task".into())
             .spawn(move || {
-                let r = f(&t.ctx);
+                let r = match panic::catch_unwind(AssertUnwindSafe(|| f(&t.ctx))) {
+                    Ok(r) => r,
+                    Err(_) => Err(ApiError::InvalidArgument(
+                        "error interno del motor durante la tarea (pánico capturado)".into(),
+                    )),
+                };
                 let st = match &r {
                     Ok(_) => TaskState::Completed,
                     Err(ApiError::Cancelled) => TaskState::Cancelled,
@@ -90,8 +97,8 @@ impl<T: Send + 'static> Task<T> {
                 t.state.store(st as u8, Ordering::Release);
                 t.finished.notify_all();
             })
-            .expect("no se pudo crear el hilo de la tarea");
-        task
+            .map_err(ApiError::Spawn)?;
+        Ok(task)
     }
 }
 
@@ -145,7 +152,8 @@ mod tests {
                 thread::sleep(Duration::from_micros(10));
             }
             Ok(())
-        });
+        })
+        .unwrap();
         thread::sleep(Duration::from_millis(20));
         t.cancel();
         assert!(matches!(t.wait(), Err(ApiError::Cancelled)));
@@ -155,7 +163,15 @@ mod tests {
 
     #[test]
     fn errors_mark_failed() {
-        let t: Arc<Task<()>> = Task::spawn(|_| Err(ApiError::InvalidArgument("x".into())));
+        let t: Arc<Task<()>> = Task::spawn(|_| Err(ApiError::InvalidArgument("x".into()))).unwrap();
+        assert!(t.wait().is_err());
+        assert_eq!(t.state(), TaskState::Failed);
+    }
+
+    /// Regresión: un pánico dentro de la operación no deja la tarea colgada en "en curso".
+    #[test]
+    fn panic_inside_task_marks_failed_instead_of_hanging() {
+        let t: Arc<Task<()>> = Task::spawn(|_| panic!("fallo simulado")).unwrap();
         assert!(t.wait().is_err());
         assert_eq!(t.state(), TaskState::Failed);
     }

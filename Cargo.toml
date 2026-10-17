@@ -10,11 +10,12 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "LicenseRef-MemRescue-Proprietary"
 authors = ["MemRescue"]
-rust-version = "1.80"
+# 1.89: File::try_lock (bloqueo de propietario de la base de trabajo).
+rust-version = "1.89"
 
 [workspace.dependencies]
 mr-common = { path = "core/mr-common" }

@@ -1,10 +1,11 @@
 //! memrescue-cli: acceso al motor de MemRescue sin interfaz gráfica.
 //!
-//! Todas las operaciones de M0 son de solo lectura y solo aceptan ficheros de imagen.
+//! Todas las operaciones son de solo lectura y solo aceptan ficheros de imagen.
 
 use mr_api::task::TaskState;
-use mr_api::{HashOptions, ImageInfo};
+use mr_api::{HashOptions, ImageInfo, VerifyOptions};
 use mr_common::HashAlgorithm;
+use mr_io::resilient::{OnError, ReadPolicy};
 use mr_store::Store;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -16,12 +17,16 @@ memrescue-cli: motor de MemRescue
 
 USO:
   memrescue-cli version
+  memrescue-cli probe <fichero>
   memrescue-cli image-info <imagen> [--sector-size N] [--json]
+  memrescue-cli sectors <imagen> --lba N [--count M] [--sector-size N]
+  memrescue-cli verify <imagen> [--sector-size N] [--retries N] [--json]
   memrescue-cli hash <imagen> [--algo crc32,md5,sha1,sha256] [--sector-size N] [--db trabajo.mrdb] [--json]
   memrescue-cli db-init <trabajo.mrdb>
   memrescue-cli jobs <trabajo.mrdb>
 
-Códigos de salida: 0 correcto, 1 error de operación, 2 uso incorrecto.
+Tamaños de sector habituales: 512, 1024, 2048, 4096 (potencia de 2 entre 512 y 65536).
+Códigos de salida: 0 correcto, 1 error de operación, 2 uso incorrecto, 3 verificación con sectores ilegibles.
 ";
 
 struct Args {
@@ -30,6 +35,18 @@ struct Args {
     algos: Vec<HashAlgorithm>,
     db: Option<PathBuf>,
     json: bool,
+    lba: Option<u64>,
+    count: u64,
+    retries: u32,
+}
+
+fn num<T: std::str::FromStr>(
+    it: &mut impl Iterator<Item = String>,
+    name: &str,
+) -> Result<T, String> {
+    let v = it.next().ok_or(format!("falta el valor de {name}"))?;
+    v.parse()
+        .map_err(|_| format!("valor no válido para {name}: {v}"))
 }
 
 fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -39,15 +56,16 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
         algos: vec![HashAlgorithm::Sha256],
         db: None,
         json: false,
+        lba: None,
+        count: 1,
+        retries: 1,
     };
     while let Some(s) = it.next() {
         match s.as_str() {
-            "--sector-size" => {
-                let v = it.next().ok_or("falta el valor de --sector-size")?;
-                a.sector_size = v
-                    .parse()
-                    .map_err(|_| format!("tamaño de sector no válido: {v}"))?;
-            }
+            "--sector-size" => a.sector_size = num(&mut it, "--sector-size")?,
+            "--lba" => a.lba = Some(num(&mut it, "--lba")?),
+            "--count" => a.count = num(&mut it, "--count")?,
+            "--retries" => a.retries = num(&mut it, "--retries")?,
             "--algo" => {
                 let v = it.next().ok_or("falta el valor de --algo")?;
                 a.algos = v
@@ -103,6 +121,30 @@ fn print_info(i: &ImageInfo, json: bool) {
     }
 }
 
+/// Volcado hexadecimal: desplazamiento absoluto (hex), 16 bytes por línea y texto ASCII.
+fn hexdump(base_offset: u64, data: &[u8]) {
+    for (i, line) in data.chunks(16).enumerate() {
+        let off = base_offset + (i * 16) as u64;
+        let hex: Vec<String> = line.iter().map(|b| format!("{b:02X}")).collect();
+        let (l, r) = hex.split_at(hex.len().min(8));
+        let ascii: String = line
+            .iter()
+            .map(|&b| {
+                if (0x20..0x7f).contains(&b) {
+                    b as char
+                } else {
+                    '.'
+                }
+            })
+            .collect();
+        println!(
+            "{off:012X}  {:<23}  {:<23}  {ascii}",
+            l.join(" "),
+            r.join(" ")
+        );
+    }
+}
+
 fn run(args: Vec<String>) -> Result<(), (u8, String)> {
     let usage = |m: &str| (2u8, format!("{m}\n\n{USAGE}"));
     let mut it = args.into_iter();
@@ -118,9 +160,88 @@ fn run(args: Vec<String>) -> Result<(), (u8, String)> {
 
     match cmd.as_str() {
         "version" | "--version" => {
-            println!("MemRescue engine {} (ABI 1)", mr_api::ENGINE_VERSION);
+            println!("MemRescue engine {}", mr_api::ENGINE_VERSION);
         }
         "help" | "--help" | "-h" => print!("{USAGE}"),
+        "probe" => {
+            let p = one(&a)?;
+            let f = mr_api::probe_format(&p).map_err(|e| op(&e))?;
+            let soporte = if f.is_supported() {
+                "soportado"
+            } else {
+                "todavía no soportado"
+            };
+            println!("{} ({soporte})", f.name());
+        }
+        "sectors" => {
+            let p = one(&a)?;
+            let lba = a.lba.ok_or_else(|| usage("falta --lba"))?;
+            if a.count == 0 || a.count > 256 {
+                return Err(usage("--count debe estar entre 1 y 256"));
+            }
+            let src = mr_api::open_source(&p, a.sector_size).map_err(|e| op(&e))?;
+            let data = mr_api::read_sectors(src.as_ref(), lba, a.count).map_err(|e| op(&e))?;
+            let ss = usize::try_from(a.sector_size).unwrap_or(512);
+            for (i, sector) in data.chunks(ss).enumerate() {
+                let l = lba + i as u64;
+                println!(
+                    "== LBA {l} (desplazamiento {} = 0x{:X})",
+                    l * u64::from(a.sector_size),
+                    l * u64::from(a.sector_size)
+                );
+                hexdump(l * u64::from(a.sector_size), sector);
+            }
+        }
+        "verify" => {
+            let p = one(&a)?;
+            let src = mr_api::open_source(&p, a.sector_size).map_err(|e| op(&e))?;
+            let opts = VerifyOptions {
+                policy: ReadPolicy {
+                    retries: a.retries,
+                    on_error: OnError::FillAndContinue,
+                    ..ReadPolicy::default()
+                },
+                ..VerifyOptions::default()
+            };
+            let task = mr_api::start_verify_task(src, opts).map_err(|e| op(&e))?;
+            while task.state() == TaskState::Running {
+                let (d, t) = task.progress();
+                if !a.json && t > 0 {
+                    eprint!("\r{:5.1}%  {d}/{t} sectores", d as f64 * 100.0 / t as f64);
+                }
+                thread::sleep(Duration::from_millis(200));
+            }
+            if !a.json {
+                eprintln!();
+            }
+            let r = task.wait().map_err(|e| op(&e))?;
+            if a.json {
+                let ranges: Vec<String> = r
+                    .bad_ranges
+                    .iter()
+                    .map(|(l, c)| format!("[{l},{c}]"))
+                    .collect();
+                println!(
+                    "{{\"sectors\":{},\"ok\":{},\"bad\":{},\"bad_ranges\":[{}]}}",
+                    r.sectors_requested,
+                    r.sectors_read_ok,
+                    r.sectors_bad,
+                    ranges.join(",")
+                );
+            } else {
+                println!(
+                    "Sectores leídos correctamente: {} de {}",
+                    r.sectors_read_ok, r.sectors_requested
+                );
+                println!("Sectores ilegibles: {}", r.sectors_bad);
+                for (l, c) in &r.bad_ranges {
+                    println!("  LBA {l} – {} ({c} sectores)", l + c - 1);
+                }
+            }
+            if r.sectors_bad > 0 {
+                return Err((3, format!("{} sectores ilegibles", r.sectors_bad)));
+            }
+        }
         "image-info" => {
             let p = one(&a)?;
             let i = mr_api::image_info(&p, a.sector_size).map_err(|e| op(&e))?;

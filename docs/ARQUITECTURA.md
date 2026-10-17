@@ -126,22 +126,22 @@ ni se simulan).
 - Fuzzing de cada parser; pruebas con imágenes corrompidas de forma determinista.
 - Escritura física deshabilitada en compilación hasta el hito correspondiente (ADR-006).
 
-## 7. Estado implementado (M0, 2026-10-17)
+## 7. Estado implementado (M1 iteración 1, 2026-10-17)
 
 | Componente | Ubicación | Qué hace hoy | Pruebas |
 |---|---|---|---|
-| `mr-common` | `core/mr-common` | `Lba`, `ByteRange` con aritmética comprobada; `Confidence`; hashes CRC-32/MD5/SHA-1/SHA-256 incrementales | 6 unitarias (vectores conocidos) |
-| `mr-io` | `core/mr-io` | Trait `BlockDevice`; `ImageFile` (solo lectura, lectura posicional, rechaza rutas de dispositivo); `MemDevice` | 5 unitarias |
-| `mr-store` | `core/mr-store` | SQLite v1: fuentes, trabajos (máquina de estados), checkpoints, eventos; WAL; recuperación tras cierre abrupto | 6 unitarias |
-| `mr-api` | `core/mr-api` | `Task<T>` (hilo, progreso atómico, cancelación cooperativa); `image_info`; tarea de hash con registro opcional en SQLite | 6 unitarias |
-| `mr-ffi` | `core/mr-ffi` | `memrescue_core.dll`, ABI 1 ([API_FFI.md](API_FFI.md)) | 7 unitarias |
-| `memrescue-cli` | `cli/` | `version`, `image-info`, `hash`, `db-init`, `jobs` | 4 extremo a extremo + 2 contra corpus |
-| `MemRescue.Core.Interop` | `app/src/MemRescue.Core.Interop` | Cliente .NET seguro de la DLL (`Engine`, `HashTask`) | 17 xUnit (14 + 3 corpus) |
-| `MemRescue` (WPF) | `app/src/MemRescue` | Ventana principal con menús del flujo de referencia; abrir imagen, propiedades, hashes con progreso/cancelación, registro; modo `--selftest` y `--screenshot` | Autodiagnóstico en `scripts/test.ps1` |
+| `mr-common` | `core/mr-common` | `Lba`, `ByteRange` con aritmética comprobada; `Confidence`; hashes CRC-32/MD5/SHA-1/SHA-256 incrementales | 6 unitarias |
+| `mr-io` | `core/mr-io` | `BlockDevice` (+ `read_sectors`, `sector_span`); `path_policy` (lista blanca de rutas, ADR-014); `ImageFile`; `format` (detección de contenedores, ADR-015); `resilient` (lectura tolerante); `FaultyDevice`; `MemDevice` | 26 unitarias |
+| `mr-store` | `core/mr-store` | SQLite v1 con propietario exclusivo, `synchronous=FULL`, `quick_check`, transiciones atómicas (ADR-016) | 11 unitarias |
+| `mr-api` | `core/mr-api` | Tareas (pánicos capturados), `open_source`, `read_sectors`, hashes, verificación | 11 unitarias |
+| `mr-ffi` | `core/mr-ffi` | `memrescue_core.dll`, ABI 2 ([API_FFI.md](API_FFI.md)) | 13 unitarias |
+| `memrescue-cli` | `cli/` | `version`, `probe`, `image-info`, `sectors`, `verify`, `hash`, `db-init`, `jobs` | 7 extremo a extremo + 3 contra corpus |
+| `MemRescue.Core.Interop` | `app/src/MemRescue.Core.Interop` | `Engine`, `Source`, `HashTask`, `VerifyTask` (`EngineHandle` con finalizador), `HexDump` | 47 xUnit |
+| `MemRescue` (WPF) | `app/src/MemRescue` | Menús del flujo de referencia; orígenes; visor de sectores con navegación; propiedades; hashes; comprobación de legibilidad; registro; `--selftest`/`--screenshot` | Autodiagnóstico 512 y 4096 B en `scripts/test.ps1` |
 | Generador y validador | `tests/generators` | Imágenes MBR/GPT deterministas + validador independiente + pruebas negativas | 128 comprobaciones + 9 corrupciones |
 
-Fuera de M0 (no existe todavía): lectura de particiones, sistemas de archivos, escaneo, recuperación,
-RAID, clonado, editor hex, acceso a dispositivos.
+No existe todavía: interpretación de particiones, sistemas de archivos, escaneo, recuperación, RAID,
+clonado, lectura de contenedores, acceso a dispositivos.
 
 ## 8. Estructura del repositorio
 

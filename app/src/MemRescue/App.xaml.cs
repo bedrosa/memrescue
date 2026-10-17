@@ -1,37 +1,59 @@
+using System.Globalization;
 using System.Windows;
 using MemRescue.Core.Interop;
 
 namespace MemRescue;
 
+/// <summary>Parámetros del modo de autodiagnóstico.</summary>
+internal sealed record SelfTestOptions(string Output, string? Image, uint SectorSize, ulong ReadLba, string? Screenshot);
+
 public partial class App : Application
 {
     /// <summary>
-    /// Modo de autodiagnóstico: <c>MemRescue.exe --selftest &lt;salida.txt&gt; [imagen]</c>.
-    /// Abre la ventana real, consulta el motor a través de la DLL, opcionalmente calcula el SHA-256
-    /// de una imagen, escribe el resultado y se cierra. Lo usa la verificación automática de M0.
+    /// Autodiagnóstico: <c>MemRescue.exe --selftest &lt;salida.txt&gt; [imagen] [--sector-size N] [--read-lba N] [--screenshot png]</c>.
+    /// Abre la ventana real, carga el motor por la DLL y, si se indica una imagen, la abre, muestra y lee la
+    /// LBA pedida, calcula hashes y comprueba su legibilidad; escribe el resultado y se cierra.
     /// </summary>
-    internal static string? SelfTestOutput { get; private set; }
+    internal static SelfTestOptions? SelfTest { get; private set; }
 
-    internal static string? SelfTestImage { get; private set; }
-
-    /// <summary>Con <c>--screenshot &lt;png&gt;</c> el autodiagnóstico guarda una captura de la ventana.</summary>
-    internal static string? ScreenshotPath { get; private set; }
+    private static SelfTestOptions? ParseSelfTest(IReadOnlyList<string> args)
+    {
+        var i = args.ToList().IndexOf("--selftest");
+        if (i < 0 || i + 1 >= args.Count)
+        {
+            return null;
+        }
+        string? image = null, shot = null;
+        uint ss = 512;
+        ulong lba = 0;
+        for (var k = 0; k < args.Count; k++)
+        {
+            switch (args[k])
+            {
+                case "--selftest":
+                    k++;
+                    break;
+                case "--sector-size" when k + 1 < args.Count:
+                    ss = uint.Parse(args[++k], CultureInfo.InvariantCulture);
+                    break;
+                case "--read-lba" when k + 1 < args.Count:
+                    lba = ulong.Parse(args[++k], CultureInfo.InvariantCulture);
+                    break;
+                case "--screenshot" when k + 1 < args.Count:
+                    shot = args[++k];
+                    break;
+                default:
+                    image ??= args[k];
+                    break;
+            }
+        }
+        return new SelfTestOptions(args[i + 1], image, ss, lba, shot);
+    }
 
     protected override void OnStartup(StartupEventArgs e)
     {
         base.OnStartup(e);
-        var args = e.Args.ToList();
-        var shot = args.IndexOf("--screenshot");
-        if (shot >= 0 && shot + 1 < args.Count)
-        {
-            ScreenshotPath = args[shot + 1];
-            args.RemoveRange(shot, 2);
-        }
-        if (args.Count >= 2 && args[0] == "--selftest")
-        {
-            SelfTestOutput = args[1];
-            SelfTestImage = args.Count >= 3 ? args[2] : null;
-        }
+        SelfTest = ParseSelfTest(e.Args);
 
         try
         {
@@ -40,9 +62,9 @@ public partial class App : Application
         catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException or EngineException)
         {
             var msg = $"No se pudo cargar el motor de MemRescue (memrescue_core.dll):\n\n{ex.Message}";
-            if (SelfTestOutput is not null)
+            if (SelfTest is not null)
             {
-                System.IO.File.WriteAllText(SelfTestOutput, $"ERROR\n{msg}\n");
+                System.IO.File.WriteAllText(SelfTest.Output, $"ERROR\n{msg}\n");
             }
             else
             {

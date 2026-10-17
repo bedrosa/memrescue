@@ -83,6 +83,62 @@ fn engine_size_and_sha256_match_independent_generator() {
     }
 }
 
+/// (start_lba, marcador) de cada `[[partitions]]` del manifiesto.
+fn partition_markers(manifest: &Path) -> Vec<(u64, String)> {
+    let text = std::fs::read_to_string(manifest).unwrap();
+    let mut out = Vec::new();
+    let mut lba = None;
+    for l in text.lines() {
+        if let Some(v) = l.strip_prefix("start_lba = ") {
+            lba = Some(v.parse().unwrap());
+        }
+        if let Some(v) = l.strip_prefix("marker = ") {
+            out.push((lba.take().unwrap(), v.trim_matches('"').to_string()));
+        }
+    }
+    out
+}
+
+#[test]
+#[ignore = "requiere el corpus generado; lo ejecuta scripts/test.ps1"]
+fn sector_reads_land_on_the_exact_lba_for_every_sector_size() {
+    let mut checked = 0;
+    for mf in manifests() {
+        let m = top_level(&mf);
+        let img = image_path(&m);
+        let p = img.to_str().unwrap();
+        let ss = &m["sector_size"];
+        for (lba, marker) in partition_markers(&mf) {
+            let out = cli(&["sectors", p, "--lba", &lba.to_string(), "--sector-size", ss]);
+            // El volcado parte el texto en líneas de 16 bytes: se comprueban los 16 primeros.
+            assert!(
+                out.contains(&marker[..16]),
+                "{}: LBA {lba} sin marcador\n{out}",
+                m["name"]
+            );
+            checked += 1;
+        }
+        if m["scheme"] == "gpt" {
+            let out = cli(&["sectors", p, "--lba", "1", "--sector-size", ss]);
+            let off: u64 = ss.parse().unwrap();
+            assert!(
+                out.contains(&format!("{off:012X}  45 46 49 20 50 41 52 54")),
+                "{}: la LBA 1 debe empezar por 'EFI PART'\n{out}",
+                m["name"]
+            );
+        }
+        let v = cli(&["verify", p, "--sector-size", ss, "--json"]);
+        assert!(
+            v.contains(&format!(
+                "\"sectors\":{},\"ok\":{},\"bad\":0",
+                m["total_sectors"], m["total_sectors"]
+            )),
+            "{v}"
+        );
+    }
+    assert_eq!(checked, 8, "4 particiones MBR + 3 GPT + 1 GPT 4Kn");
+}
+
 #[test]
 #[ignore = "requiere el corpus generado; lo ejecuta scripts/test.ps1"]
 fn engine_crc32_validates_gpt_headers_written_by_python() {

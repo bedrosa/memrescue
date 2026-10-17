@@ -1,4 +1,4 @@
-# Interfaz entre el motor (Rust) y la interfaz (C#): ABI 1
+# Interfaz entre el motor (Rust) y la interfaz (C#): ABI 2
 
 Fuente de verdad: [core/mr-ffi/include/memrescue_core.h](../core/mr-ffi/include/memrescue_core.h).
 Implementación: [core/mr-ffi/src/lib.rs](../core/mr-ffi/src/lib.rs).
@@ -15,7 +15,7 @@ memrescue-cli.exe (Rust) ──────────────── llamad
 
 - La DLL es la **única** dependencia binaria de la GUI con el motor. La GUI no conoce tipos Rust.
 - La CLI usa `mr-api` directamente (sin FFI); las pruebas comprueban que ambas vías dan los mismos resultados.
-- Versionado: `mr_abi_version()` devuelve 1. La GUI lo comprueba al arrancar (`Engine.EnsureCompatible`) y se
+- Versionado: `mr_abi_version()` devuelve 2 (ABI 1 en M0). La GUI lo comprueba al arrancar (`Engine.EnsureCompatible`) y se
   niega a funcionar con una DLL incompatible. Cualquier cambio incompatible en firmas, estructuras o
   significados incrementa la versión de ABI; añadir funciones nuevas no.
 
@@ -82,23 +82,42 @@ mr_task_free(handle)
 - Persistencia opcional: si se pasa una ruta de base de datos de trabajo, el motor registra el trabajo
   (fuente, estado, progreso, resultado) en SQLite. Ver [ARQUITECTURA.md](ARQUITECTURA.md) §4.
 
-## Funciones (ABI 1)
+## Funciones (ABI 2)
 
 | Función | Descripción |
 |---|---|
-| `mr_abi_version()` | Versión de la ABI |
+| `mr_abi_version()` | Versión de la ABI (2) |
 | `mr_engine_version(buf, cap, out_len)` | Versión del motor |
 | `mr_last_error(buf, cap, out_len)` | Mensaje del último error del hilo |
-| `mr_image_info_get(path, len, sector_size, out)` | Tamaño, sectores y bytes sobrantes de una imagen (solo lectura) |
-| `mr_hash_start(path, len, sector_size, mask, store, store_len, out_task)` | Inicia el cálculo de hashes (CRC-32=1, MD5=2, SHA-1=4, SHA-256=8) |
+| `mr_image_probe(path, len, out_format)` | Formato detectado por firmas: 1 RAW, 2 VHD, 3 VHDX, 4 VMDK, 5 VMDK descriptor, 6 EWF, 7 QCOW, 8 VDI, 9 DMG |
+| `mr_image_info_get(path, len, sector_size, out)` | Tamaño, sectores y bytes sobrantes (rechaza contenedores no soportados) |
+| `mr_source_open(path, len, sector_size, flags, out_source)` | Abre un origen en solo lectura (`flags`: 1 = forzar RAW) |
+| `mr_source_info(source, out)` | Datos del origen |
+| `mr_source_read(source, lba, count, buf, cap, out_len)` | Lee `count` sectores completos (máx. 64 MiB por llamada); `*out_len` = bytes necesarios/escritos |
+| `mr_source_close(source)` | Cierra el origen (las tareas en curso conservan su referencia) |
+| `mr_hash_start(path, …)` / `mr_source_hash_start(source, mask, store, store_len, out_task)` | Hashes (CRC-32=1, MD5=2, SHA-1=4, SHA-256=8); estricto ante errores |
 | `mr_hash_result(task, alg, buf, cap, out_len)` | Resumen hexadecimal de un algoritmo |
-| `mr_task_status_get(task, out)` | Estado y progreso |
+| `mr_source_verify_start(source, start_lba, count, retries, out_task)` | Lectura completa tolerante a errores (`count` 0 = hasta el final; reintentos 0–100) |
+| `mr_verify_result(task, out)` | Informe: solicitados, correctos, ilegibles, relecturas, nº de rangos, truncado |
+| `mr_verify_bad_range(task, index, out_lba, out_count)` | Rango ilegible nº `index` |
+| `mr_task_status_get(task, out)` | Estado y progreso (bytes en hash, sectores en verificación) |
 | `mr_task_cancel(task)` | Solicita la cancelación |
 | `mr_task_free(task)` | Libera el handle (cancela si sigue en marcha) |
 
+Códigos añadidos en ABI 2: `MR_ERR_UNSUPPORTED_FORMAT` (10) y `MR_ERR_OUT_OF_RANGE` (11). Límites:
+cadenas de entrada ≤ 64 KiB (`MR_MAX_STRING_BYTES`), lecturas ≤ 64 MiB (`MR_MAX_READ_BYTES`).
+
+## Propiedad en C#
+
+`Source`, `HashTask` y `VerifyTask` derivan de `EngineHandle`: `IDisposable` idempotente + finalizador de
+seguridad (si el código olvida liberarlos, el recolector lo hace) y `ObjectDisposedException` si se usan
+después de liberarlos.
+
 ## Pruebas que garantizan el contrato
 
-- Rust (`core/mr-ffi/src/tests.rs`): tamaños de estructuras, protocolo de búfer pequeño, rutas de
-  dispositivo, UTF-8 inválido y punteros nulos, handles inválidos, flujo completo de hash, máscaras inválidas.
-- C# (`app/tests/MemRescue.Core.Interop.Tests`): los mismos contratos vistos desde .NET contra la DLL real,
-  rutas con caracteres no ASCII, cancelación, base de datos de trabajo, y el corpus sintético.
+- Rust (`core/mr-ffi/src/tests.rs`, 13 pruebas): tamaños de estructuras, protocolo de búfer pequeño, rutas
+  de dispositivo, UTF-8 inválido, punteros nulos y cadenas desmesuradas, handles inválidos o de otro
+  tipo, orígenes en los 4 tamaños de sector, cierre con tarea en curso, verificación, formatos.
+- C# (`app/tests/MemRescue.Core.Interop.Tests`, 47 pruebas): los mismos contratos desde .NET contra la DLL
+  real, finalizadores, rutas no ASCII, cancelación, base de datos de trabajo, inmutabilidad del origen y el
+  corpus sintético (lectura de marcadores en LBA exactas y cabeceras GPT).

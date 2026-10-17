@@ -4,8 +4,9 @@ Herramienta de recuperación de datos, reconstrucción de sistemas de archivos y
 para Windows 11. Objetivo: la máxima paridad funcional con DMDE Professional mediante una
 implementación **original** basada en especificaciones públicas y pruebas propias.
 
-Ejecutable final: `MemRescue.exe`. Estado: **M0 (fundaciones) terminado**. Aún no recupera datos:
-abre imágenes en solo lectura y calcula hashes; el resto de funciones aparece deshabilitado con su hito.
+Ejecutable final: `MemRescue.exe`. Estado: **M1 en curso** (iteración 1 entregada). Aún no recupera
+datos: abre imágenes RAW en solo lectura (sectores de 512 a 4096 B), muestra y navega sectores en
+hexadecimal, calcula hashes y comprueba la legibilidad; el resto aparece deshabilitado con su hito.
 
 ## Compilar y probar
 
@@ -42,6 +43,7 @@ CLI: `target\debug\memrescue-cli.exe help`.
 | [docs/PARIDAD_DMDE_PRO.md](docs/PARIDAD_DMDE_PRO.md) | Matriz de 124 funcionalidades con evidencia y estado |
 | [docs/ARQUITECTURA.md](docs/ARQUITECTURA.md) | Capas, módulos, estado implementado |
 | [docs/API_FFI.md](docs/API_FFI.md) | Contrato Rust ↔ C# (memoria, errores, asincronía) |
+| [docs/REVISION_TECNICA_M1.md](docs/REVISION_TECNICA_M1.md) | Hallazgos de seguridad/robustez corregidos y sus pruebas |
 | [docs/DECISIONES.md](docs/DECISIONES.md) | ADR (tecnología, seguridad, sala limpia) |
 | [docs/PRUEBAS.md](docs/PRUEBAS.md) | Corpus, simulador, criterios de paridad, cómo ejecutar |
 | [docs/PLAN_CORPUS_NTFS.md](docs/PLAN_CORPUS_NTFS.md) | Plan de imágenes NTFS con ficheros borrados |

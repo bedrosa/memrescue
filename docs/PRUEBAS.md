@@ -74,8 +74,11 @@ Pasos de `test.ps1`:
 | 6 | Pruebas negativas | El validador detecta 9 tipos de corrupción (no es un validador que siempre aprueba) |
 | 7 | Pruebas cruzadas Rust ↔ corpus | SHA-256 y CRC-32 del motor coinciden con `hashlib`/`zlib` de Python |
 | 8 | `dotnet build` | Compilación .NET con advertencias como errores |
-| 9 | `dotnet test` | 17 pruebas de la frontera C# ↔ Rust contra la DLL real |
-| 10 | Autodiagnóstico GUI | `MemRescue.exe` abre su ventana, carga el motor, abre una imagen y su SHA-256 coincide con el manifiesto |
+| 9 | `dotnet test` | 47 pruebas de la frontera C# ↔ Rust contra la DLL real (incluye corpus) |
+| 10–11 | Autodiagnóstico GUI (512 y 4096 B/sector) | `MemRescue.exe` abre la imagen, lee la LBA 1 (`EFI PART`), sectores y SHA-256 = manifiesto, verificación sin sectores ilegibles |
+| 12 | Orígenes intactos | SHA-256, tamaño y fecha de las imágenes iguales antes y después de todas las operaciones |
+
+(Desde M1 el paso 3 ejecuta 77 pruebas Rust y el 7 incluye la lectura de marcadores en LBA exactas.)
 
 Corpus actual (`tests/corpus/manifests`, imágenes en `tests/corpus/generated`, no versionadas):
 

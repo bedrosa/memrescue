@@ -33,6 +33,7 @@ son **evidencias técnicas** y se mantienen sin cambios.
 | [10](dmde-fase1/10-funcionalidades-verificables.md) | Niveles de verificación |
 | [11](dmde-fase1/11-pendientes-y-fase-2.md) | Pendientes de la fase 1 |
 | [dmde-manual-oficial.md](dmde-manual-oficial.md) | Resumen de la documentación oficial consultada (fase 2) |
+| [dmde-fase2/INV-05](dmde-fase2/INV-05-mbr-y-busqueda-de-particiones.md) | MBR/EBR y búsqueda exprés de particiones perdidas |
 
 ### Datos brutos (`dmde-fase1/datos/`)
 

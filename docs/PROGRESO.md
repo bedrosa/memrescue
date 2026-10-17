@@ -83,10 +83,56 @@ oficial firmado por Microsoft (autorizado por el propietario). WSL, sqlite3 y qe
 WPF ↔ Rust funciona ✔ · la CLI invoca el motor ✔ · pruebas automatizadas ✔ · imágenes validadas ✔ ·
 documentación actualizada ✔ · sin funciones ficticias ✔ (todo lo no implementado está deshabilitado con su hito).
 
-## Siguiente tarea
+## Etapa 4 · Commit inicial, revisión técnica, INV-05 y M1 (iteración 1): 2026-10-17, Entregada para revisión
 
-1. **INV-05** (MBR/EBR y búsqueda exprés de particiones perdidas): investigación acotada reutilizando la
-   evidencia de la fase 1 (rango 0x608b00–0x613300 y validador GPT ya verificado), sin repetir análisis completos.
-2. Después, **M1** (capa de bloques completa, `ResilientReader` con dispositivo simulado, VHD/VHDX/VMDK).
-3. Decisión pendiente del propietario: autorizar WSL2 para el oráculo de terceros y el corpus NTFS
-   (`PLAN_CORPUS_NTFS.md` §4).
+**Git**: commit inicial `7fdc385` (79 ficheros; sin binarios, SDK, temporales, bases ni imágenes; material
+propietario de DMDE excluido por `.gitignore`; sin remotos). Los cambios de esta etapa **no** están
+confirmados todavía.
+
+**Revisión técnica** (`REVISION_TECNICA_M1.md`): 25 hallazgos corregidos con prueba de regresión. Los más
+graves: alias `\\?\C:` que abría el volumen (R1), enlaces a dispositivos (R2), comportamiento indefinido por
+longitudes FFI desmesuradas (R13) y el marcado de trabajos ajenos como interrumpidos en SQLite (S1).
+
+**INV-05** (`investigacion/dmde-fase2/INV-05-mbr-y-busqueda-de-particiones.md`): 13 consultas REA acotadas.
+Verificado: tabla de nombres de tipo, esquemas (MBR/GPT/híbrido/Apple), reglas de aceptación de una tabla
+MBR/EBR y sondeo de una posición candidata con copias de respaldo (sector 6, sector 12, último sector,
+64–384 MiB, −1024 B). Sin verificar: el bucle que genera candidatos.
+
+**M1 – iteración 1** (motor 0.2.0, ABI 2):
+- Lectura RAW endurecida, sectores 512/1024/2048/4096, rangos estrictos, límite de memoria por petición.
+- Lector tolerante a errores con progreso/cancelación y simulador de fallos.
+- Detección de formatos de contenedor (sin interpretarlos aún).
+- CLI: `probe`, `sectors`, `verify`.
+- WPF: visor hexadecimal por sectores (1–8 por página), ir a sector/desplazamiento, anterior/siguiente,
+  primero/último, copiar volcado, cerrar origen, comprobación de legibilidad, confirmación explícita para
+  abrir contenedores como RAW; autodiagnóstico con `--sector-size`/`--read-lba`.
+
+**Verificado (ejecución real)**
+
+| Comprobación | Resultado |
+|---|---|
+| `scripts\build.ps1` (Debug) y `-Configuration Release -Publish` | Correctos, 0 advertencias, 0 errores |
+| Pruebas Rust | **77/77** (mr-io 26, mr-store 11, mr-api 11, mr-ffi 13, mr-common 6, CLI 7, corpus 3) |
+| Pruebas .NET (DLL real) | **47/47** |
+| Corpus | determinista, 128 comprobaciones, 9/9 corrupciones detectadas |
+| GUI `--selftest` 512 B (`gpt_basic`) y 4096 B (`gpt_4kn`) | LBA 1 = `EFI PART`, sectores y SHA-256 = manifiesto, 0 ilegibles |
+| Exe publicado autocontenido sin .NET | Arranca; LBA 2048 de `mbr_basic` = marcador de P1 |
+| Orígenes tras todas las pruebas | 3/3 imágenes con SHA-256, tamaño y fecha intactos |
+| `scripts\test.ps1` | **12/12 pasos OK** |
+
+**Funcionalidades completadas** (ver `PARIDAD_DMDE_PRO.md`): IM-01 probada; IO-06, IO-08, HX-01, HX-04, HX-07,
+UX-02, UX-05 parciales; UX-09 implementada. **Pendientes en M1**: ver `ROADMAP.md` (PartitionView, IO-07/09,
+IM-02, VHD/VHDX/VMDK, prueba de UI).
+
+**Limitaciones**
+- VHD/VHDX/VMDK solo se **detectan**: no hay forma de generar imágenes de referencia independientes sin
+  instalar herramientas o usar administrador (WSL pospuesto por el propietario).
+- La prueba de enlace simbólico → dispositivo no se ejecuta en este equipo (crear enlaces requiere privilegios);
+  se cubre con pruebas léxicas y de uniones.
+- La navegación de la interfaz se verifica por autodiagnóstico y captura, no por automatización de UI.
+
+## Siguiente tarea (pendiente de revisión del propietario; no se avanza a M2)
+
+1. Revisión de M1-iteración 1 por el propietario y decisión sobre el commit de esta etapa.
+2. Decidir cómo validar VHD/VHDX/VMDK: herramienta de terceros (qemu-img portable / WSL / VM) o generador propio documentado.
+3. Completar M1: `PartitionView`, IO-07/IO-09, IM-02 y prueba de UI.

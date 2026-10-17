@@ -15,6 +15,8 @@ public enum EngineStatus
     InvalidHandle = 7,
     BufferTooSmall = 8,
     TaskFailed = 9,
+    UnsupportedFormat = 10,
+    OutOfRange = 11,
     Panic = 99,
 }
 
@@ -37,6 +39,21 @@ public enum EngineTaskState
     Cancelled = 4,
 }
 
+/// <summary>Formato de fichero detectado por sus firmas.</summary>
+public enum ImageFormat : uint
+{
+    Unknown = 0,
+    Raw = 1,
+    Vhd = 2,
+    Vhdx = 3,
+    Vmdk = 4,
+    VmdkDescriptor = 5,
+    Ewf = 6,
+    Qcow = 7,
+    Vdi = 8,
+    Dmg = 9,
+}
+
 /// <summary>Error devuelto por el motor, con su código y el mensaje de mr_last_error.</summary>
 public sealed class EngineException(EngineStatus status, string message) : Exception(message)
 {
@@ -50,9 +67,18 @@ public readonly record struct TaskProgress(ulong Done, ulong Total)
     public double Fraction => Total == 0 ? 0 : (double)Done / Total;
 }
 
+public readonly record struct BadRange(ulong Lba, ulong Count);
+
+public sealed record VerifyReport(
+    ulong SectorsRequested, ulong SectorsOk, ulong SectorsBad, ulong RetryReads,
+    IReadOnlyList<BadRange> BadRanges, bool BadRangesTruncated);
+
 /// <summary>Punto de entrada seguro al motor de MemRescue.</summary>
 public static class Engine
 {
+    /// <summary>Tamaños de sector lógico ofrecidos en la interfaz.</summary>
+    public static IReadOnlyList<uint> CommonSectorSizes { get; } = [512, 1024, 2048, 4096];
+
     /// <summary>Versión de la ABI que expone la DLL cargada.</summary>
     public static uint AbiVersion => NativeMethods.mr_abi_version();
 
@@ -71,11 +97,30 @@ public static class Engine
 
     public static string EngineVersion => ReadString((b, c) => (NativeMethods.mr_engine_version(b, c, out var n), n));
 
+    /// <summary>Detecta el formato de un fichero (RAW o contenedor) sin abrirlo como origen.</summary>
+    public static ImageFormat Probe(string path)
+    {
+        var p = Utf8(path);
+        Check(NativeMethods.mr_image_probe(p, (nuint)p.Length, out var f));
+        return Enum.IsDefined(typeof(ImageFormat), f) ? (ImageFormat)f : ImageFormat.Unknown;
+    }
+
     public static ImageInfo GetImageInfo(string path, uint sectorSize = 512)
     {
         var p = Utf8(path);
         Check(NativeMethods.mr_image_info_get(p, (nuint)p.Length, sectorSize, out var i));
         return new ImageInfo(path, i.SizeBytes, i.SectorSize, i.SectorCount, i.TrailingBytes);
+    }
+
+    /// <summary>Abre una imagen RAW en solo lectura.</summary>
+    /// <param name="path">Fichero de imagen; las rutas de dispositivo se rechazan.</param>
+    /// <param name="sectorSize">Tamaño de sector lógico (potencia de 2, 512–65536).</param>
+    /// <param name="forceRaw">Interpretar como RAW aunque parezca un contenedor (VHD, VMDK…).</param>
+    public static Source OpenSource(string path, uint sectorSize = 512, bool forceRaw = false)
+    {
+        var p = Utf8(path);
+        Check(NativeMethods.mr_source_open(p, (nuint)p.Length, sectorSize, forceRaw ? 1u : 0u, out var h));
+        return new Source(h, path);
     }
 
     /// <summary>Inicia el cálculo de hashes de una imagen en segundo plano (solo lectura).</summary>
@@ -142,22 +187,94 @@ public static class Engine
 }
 
 /// <summary>
-/// Tarea de hash del motor. Propiedad: el handle pertenece a esta instancia y se libera con Dispose
-/// (si la tarea sigue en marcha, el motor la cancela).
+/// Handle del motor con liberación garantizada: <see cref="IDisposable"/> y, como red de seguridad,
+/// finalizador (si el código olvida liberarlo, el GC lo hace y el registro del motor no crece).
 /// </summary>
-public sealed class HashTask : IDisposable
+public abstract class EngineHandle : IDisposable
 {
     private ulong _handle;
 
-    internal HashTask(ulong handle, HashAlgorithms algorithms)
+    private protected EngineHandle(ulong handle) => _handle = handle;
+
+    ~EngineHandle() => Release(Interlocked.Exchange(ref _handle, 0));
+
+    private protected ulong Handle =>
+        Volatile.Read(ref _handle) is var h && h != 0 ? h : throw new ObjectDisposedException(GetType().Name);
+
+    public bool IsDisposed => Volatile.Read(ref _handle) == 0;
+
+    private protected abstract void Release(ulong handle);
+
+    public void Dispose()
     {
-        _handle = handle;
-        Algorithms = algorithms;
+        Release(Interlocked.Exchange(ref _handle, 0));
+        GC.SuppressFinalize(this);
+    }
+}
+
+/// <summary>Origen abierto en el motor (imagen RAW, solo lectura).</summary>
+public sealed class Source : EngineHandle
+{
+    internal Source(ulong handle, string path) : base(handle)
+    {
+        Path = path;
+        Engine.Check(NativeMethods.mr_source_info(Handle, out var i));
+        Info = new ImageInfo(path, i.SizeBytes, i.SectorSize, i.SectorCount, i.TrailingBytes);
     }
 
-    public HashAlgorithms Algorithms { get; }
+    public string Path { get; }
 
-    private ulong Handle => _handle != 0 ? _handle : throw new ObjectDisposedException(nameof(HashTask));
+    public ImageInfo Info { get; }
+
+    /// <summary>Lee <paramref name="count"/> sectores completos desde <paramref name="lba"/>.</summary>
+    public byte[] ReadSectors(ulong lba, uint count)
+    {
+        if (count == 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(count));
+        }
+        var len = checked((int)(count * Info.SectorSize));
+        var buf = new byte[len];
+        Engine.Check(NativeMethods.mr_source_read(Handle, lba, count, buf, (nuint)buf.Length, out var n));
+        if ((int)n != len)
+        {
+            throw new EngineException(EngineStatus.Io, $"Lectura incompleta: {n} de {len} bytes.");
+        }
+        return buf;
+    }
+
+    public HashTask StartHash(HashAlgorithms algorithms, string? storePath = null)
+    {
+        var s = storePath is null ? null : Engine.Utf8(storePath);
+        Engine.Check(NativeMethods.mr_source_hash_start(Handle, (uint)algorithms, s, (nuint)(s?.Length ?? 0), out var h));
+        return new HashTask(h, algorithms);
+    }
+
+    /// <summary>Lee todos los sectores (o un rango) tolerando errores e informa de los ilegibles.</summary>
+    /// <param name="startLba">Primer sector.</param>
+    /// <param name="count">Nº de sectores; 0 = hasta el final.</param>
+    /// <param name="retries">Reintentos por sector ilegible (0–100).</param>
+    public VerifyTask StartVerify(ulong startLba = 0, ulong count = 0, uint retries = 1)
+    {
+        Engine.Check(NativeMethods.mr_source_verify_start(Handle, startLba, count, retries, out var h));
+        return new VerifyTask(h);
+    }
+
+    private protected override void Release(ulong handle)
+    {
+        if (handle != 0)
+        {
+            NativeMethods.mr_source_close(handle);
+        }
+    }
+}
+
+/// <summary>Tarea del motor (sondeo de estado y cancelación cooperativa).</summary>
+public abstract class EngineTask : EngineHandle
+{
+    private protected EngineTask(ulong handle) : base(handle)
+    {
+    }
 
     public (EngineTaskState State, TaskProgress Progress) Status()
     {
@@ -166,10 +283,6 @@ public sealed class HashTask : IDisposable
     }
 
     public void Cancel() => Engine.Check(NativeMethods.mr_task_cancel(Handle));
-
-    /// <summary>Resumen hexadecimal de un algoritmo (la tarea debe haber terminado).</summary>
-    public string GetResult(HashAlgorithms algorithm) =>
-        Engine.ReadString((b, c) => (NativeMethods.mr_hash_result(Handle, (uint)algorithm, b, c, out var n), n));
 
     /// <summary>
     /// Espera a que termine consultando el estado periódicamente. Si se cancela el token, pide la
@@ -197,12 +310,43 @@ public sealed class HashTask : IDisposable
         }
     }
 
-    public void Dispose()
+    private protected override void Release(ulong handle)
     {
-        var h = Interlocked.Exchange(ref _handle, 0);
-        if (h != 0)
+        if (handle != 0)
         {
-            NativeMethods.mr_task_free(h);
+            NativeMethods.mr_task_free(handle);
         }
+    }
+}
+
+/// <summary>Tarea de hash. El progreso se expresa en bytes.</summary>
+public sealed class HashTask : EngineTask
+{
+    internal HashTask(ulong handle, HashAlgorithms algorithms) : base(handle) => Algorithms = algorithms;
+
+    public HashAlgorithms Algorithms { get; }
+
+    /// <summary>Resumen hexadecimal de un algoritmo (la tarea debe haber terminado).</summary>
+    public string GetResult(HashAlgorithms algorithm) =>
+        Engine.ReadString((b, c) => (NativeMethods.mr_hash_result(Handle, (uint)algorithm, b, c, out var n), n));
+}
+
+/// <summary>Tarea de verificación de legibilidad. El progreso se expresa en sectores.</summary>
+public sealed class VerifyTask : EngineTask
+{
+    internal VerifyTask(ulong handle) : base(handle)
+    {
+    }
+
+    public VerifyReport GetReport()
+    {
+        Engine.Check(NativeMethods.mr_verify_result(Handle, out var r));
+        var ranges = new List<BadRange>(checked((int)Math.Min(r.BadRangeCount, 100_000)));
+        for (ulong i = 0; i < r.BadRangeCount; i++)
+        {
+            Engine.Check(NativeMethods.mr_verify_bad_range(Handle, i, out var lba, out var count));
+            ranges.Add(new BadRange(lba, count));
+        }
+        return new VerifyReport(r.SectorsRequested, r.SectorsOk, r.SectorsBad, r.RetryReads, ranges, r.BadRangesTruncated != 0);
     }
 }

@@ -33,11 +33,25 @@ Resultado en `PROGRESO.md` (etapa 3). Pendiente heredado: oráculo de terceros p
 - Esqueleto de `mr-api` (tareas, progreso, cancelación) y `memrescue-cli`.
 - **Salida**: build reproducible; primeras imágenes del corpus con hashes.
 
-## M1 · Capa de bloques e imágenes (solo lectura)
+## M1 · Capa de bloques e imágenes (solo lectura): **EN CURSO** (iteración 1 entregada 2026-10-17)
 
-- `BlockDevice`, `PartitionView`, `ImageFile`, imágenes divididas, `NullDevice`, `SimulatedDevice` con mapa de errores.
-- `ResilientReader` completo contra el simulador (IO-06…IO-10).
-- VHD/VHDX/VMDK (IM-03…IM-05).
+Hecho en la iteración 1 (detalle en `PROGRESO.md`, etapa 4):
+- ✔ Revisión técnica previa con 25 correcciones y pruebas de regresión (`REVISION_TECNICA_M1.md`).
+- ✔ `ImageFile` endurecido (política de rutas), tamaños de sector 512/1024/2048/4096, `read_sectors` estricto,
+  límite de 64 MiB por petición.
+- ✔ Lector tolerante (`resilient`): bloques → sector a sector, reintentos, relleno, informe de rangos,
+  progreso y cancelación; `FaultyDevice` (simulador de sectores permanentes e intermitentes).
+- ✔ Detección de contenedores (VHD, VHDX, VMDK, EWF, QCOW, VDI, DMG) como punto de extensión.
+- ✔ ABI 2, CLI (`probe`, `sectors`, `verify`), interfaz WPF: visor de sectores, navegación, comprobación de legibilidad.
+
+Pendiente en M1 (no se avanza a M2 sin revisión del propietario):
+- `PartitionView` (vista de un rango como dispositivo), `NullDevice`, imágenes divididas (IM-02).
+- Salto sobre sectores malos y lectura hacia atrás (IO-07), relleno de saltados, omitir por código (IO-09).
+- **VHD/VHDX/VMDK (IM-03…05)**: bloqueados por falta de un generador/oráculo independiente sin
+  administrador (qemu-img no instalado; `New-VHD`/`diskpart` requieren administrador). Opciones: autorizar
+  qemu-img portable, WSL o una VM; o aceptar VHD fijo generado por el generador propio (limitación documentada).
+- Prueba automática de la interfaz (UI Automation) para la navegación.
+
 - **Paridad objetivo**: IM-01, IM-02, IM-03, IM-04, IM-05, IO-06…IO-09 (simulados).
 
 ## M2 · Particiones
@@ -135,7 +149,7 @@ Cada INV: alcance cerrado, fuentes en este orden: (1) especificación pública, 
 | INV-03 | Puntuación de volúmenes candidatos | Pendiente NTFS | M6 | Métrica de % / Check / votos | `FUN_006a6d80`, `FUN_006a89b0`, `FUN_006a8c50` |
 | INV-03b | RAID: mapeo, delay, cálculo automático | Área "RAID/RAW" | M5 | Fórmulas de rotación y métrica de detección | Cadenas 0x6c1d64, 0x677594; manual RAID |
 | INV-04 | FS no NTFS (uno por sesión) | Área "otros FS" | M8 | Validadores y escáneres de FAT, exFAT, HFS+, ReFS, Btrfs | Rangos del doc F1-03 |
-| INV-05 | MBR/EBR y búsqueda exprés de particiones | Área "otros FS" | M2 | Validación de tablas y heurística de búsqueda | 0x608b00–0x613300 |
+| INV-05 | MBR/EBR y búsqueda exprés de particiones | Área "otros FS" | M2 | **Hecha** (2026-10-17): `investigacion/dmde-fase2/INV-05-…md`. Queda el bucle externo de candidatos (INV-05b) | 0x608b00–0x613300 |
 | INV-06 | Bucle de lectura con errores, CDB SCSI/ATA | Área "E/S" | M9 | Secuencia de reintentos/saltos/retroceso; opcodes | 0x4d6b00, 0x4d7730, 0x4d7f20, 0x4d9870 |
 | INV-07 | Script de manejo de E/S | Área "arranque/scripts" | M11 | Gramática y semántica | `deviohsc.txt`, 0x4c3e80 |
 | INV-08 | Escritura NTFS sin driver | Nueva | M12 | Qué estructuras actualiza al crear/borrar | Mensajes 1780–1823 |

@@ -191,17 +191,18 @@ dependencies = [
 
 [[package]]
 name = "memrescue-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "mr-api",
  "mr-common",
+ "mr-io",
  "mr-store",
  "tempfile",
 ]
 
 [[package]]
 name = "mr-api"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "mr-common",
  "mr-io",
@@ -212,7 +213,7 @@ dependencies = [
 
 [[package]]
 name = "mr-common"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crc32fast",
  "hex",
@@ -224,7 +225,7 @@ dependencies = [
 
 [[package]]
 name = "mr-ffi"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "mr-api",
  "mr-common",
@@ -234,7 +235,7 @@ dependencies = [
 
 [[package]]
 name = "mr-io"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "mr-common",
  "tempfile",
@@ -243,7 +244,7 @@ dependencies = [
 
 [[package]]
 name = "mr-store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rusqlite",
  "tempfile",

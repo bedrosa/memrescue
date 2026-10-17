@@ -26,26 +26,51 @@ Step 'Rust: formato (cargo fmt --check)' { cargo fmt --all -- --check }
 Step 'Rust: análisis (clippy -D warnings)' { cargo clippy --workspace --all-targets -- -D warnings }
 Step 'Rust: pruebas unitarias e integración' { cargo test --workspace }
 Step 'Corpus: generación determinista' { & $Python -I -X utf8 tests\generators\gen_partition_images.py $gen }
+# Huella de los orígenes tras generarlos: al final se comprueba que nada los ha modificado.
+$fingerprint = Get-ChildItem "$gen\*.img" | ForEach-Object {
+    [pscustomobject]@{ Path = $_.FullName; Hash = (Get-FileHash $_.FullName).Hash; Mtime = $_.LastWriteTimeUtc; Len = $_.Length }
+}
 Step 'Corpus: validación independiente vs manifiestos versionados' { & $Python -I -X utf8 tests\generators\validate_partition_images.py $gen $refs }
 Step 'Corpus: pruebas negativas del validador' { & $Python -I -X utf8 tests\generators\test_validator.py $gen $refs }
 Step 'Rust: pruebas cruzadas con el corpus' { cargo test -p memrescue-cli --test corpus -- --ignored }
 Step '.NET: compilación (warnings = errores)' { & $Dotnet build app\MemRescue.slnx -c Debug }
 Step '.NET: pruebas de interop (xUnit)' { & $Dotnet test app\MemRescue.slnx -c Debug --no-build }
 
+function Invoke-GuiSelfTest([string] $name) {
+    $manifest = "$refs\$name.manifest.toml"
+    $get = { param($k) (Select-String $manifest -Pattern "^$k = `"?([^`"]+)`"?$").Matches[0].Groups[1].Value }
+    $ss = & $get 'sector_size'; $sectors = & $get 'total_sectors'; $sha = & $get 'sha256'
+    $exe = Join-Path $Root 'app\src\MemRescue\bin\Debug\net10.0-windows\win-x64\MemRescue.exe'
+    $out = Join-Path $env:TEMP "memrescue-selftest-$name-$PID.txt"
+    Remove-Item $out -ErrorAction SilentlyContinue
+    $img = Join-Path $Root "$gen\$name.img"
+    $p = Start-Process $exe -ArgumentList '--selftest', "`"$out`"", "`"$img`"", '--sector-size', $ss, '--read-lba', '1' -PassThru
+    if (-not $p.WaitForExit(120000)) { $p.Kill(); Write-Host 'TIMEOUT'; $global:LASTEXITCODE = 1; return }
+    $lines = Get-Content $out
+    $lines | ForEach-Object { Write-Host "  $_" }
+    $checks = @(
+        ($p.ExitCode -eq 0), ($lines[0] -eq 'OK'),
+        ($lines -contains "sha256=$sha"), ($lines -contains "image_sectors=$sectors"),
+        ($lines -contains "sector_size=$ss"), ($lines -contains "verify_ok=$sectors"), ($lines -contains 'verify_bad=0'),
+        # LBA 1 de un disco GPT empieza por "EFI PART"
+        ($lines -contains 'lba1_hex16=4546492050415254000001005C000000')
+    )
+    $global:LASTEXITCODE = $(if ($checks -notcontains $false) { 0 } else { 1 })
+}
+
 if (-not $SkipGui) {
-    Step 'GUI: autodiagnóstico de MemRescue.exe' {
-        $exe = Join-Path $Root 'app\src\MemRescue\bin\Debug\net10.0-windows\win-x64\MemRescue.exe'
-        $out = Join-Path $env:TEMP "memrescue-selftest-$PID.txt"
-        $img = Join-Path $Root "$gen\gpt_basic.img"
-        Remove-Item $out -ErrorAction SilentlyContinue
-        $p = Start-Process $exe -ArgumentList '--selftest', "`"$out`"", "`"$img`"" -PassThru
-        if (-not $p.WaitForExit(120000)) { $p.Kill(); Write-Host 'TIMEOUT'; $global:LASTEXITCODE = 1; return }
-        $lines = Get-Content $out
-        $lines | ForEach-Object { Write-Host "  $_" }
-        $expected = (Select-String "$refs\gpt_basic.manifest.toml" -Pattern '^sha256 = "(.+)"').Matches[0].Groups[1].Value
-        $ok = $p.ExitCode -eq 0 -and $lines[0] -eq 'OK' -and ($lines -contains "sha256=$expected")
-        $global:LASTEXITCODE = $(if ($ok) { 0 } else { 1 })
-    }
+    Step 'GUI: autodiagnóstico (GPT, 512 B/sector)' { Invoke-GuiSelfTest 'gpt_basic' }
+    Step 'GUI: autodiagnóstico (GPT 4Kn, 4096 B/sector)' { Invoke-GuiSelfTest 'gpt_4kn' }
+}
+
+Step 'Orígenes intactos tras todas las operaciones' {
+    $changed = @($fingerprint | Where-Object {
+        $f = Get-Item $_.Path
+        (Get-FileHash $_.Path).Hash -ne $_.Hash -or $f.LastWriteTimeUtc -ne $_.Mtime -or $f.Length -ne $_.Len
+    })
+    $changed | ForEach-Object { Write-Host "  MODIFICADO: $($_.Path)" -ForegroundColor Red }
+    Write-Host "  $($fingerprint.Count) imágenes comprobadas, $($changed.Count) modificadas"
+    $global:LASTEXITCODE = $(if ($changed.Count -eq 0 -and $fingerprint.Count -gt 0) { 0 } else { 1 })
 }
 
 Write-Host "`n== Resumen" -ForegroundColor Cyan

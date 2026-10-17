@@ -1,6 +1,7 @@
 using System.Collections.ObjectModel;
 using System.Globalization;
 using System.IO;
+using System.Text;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
@@ -9,18 +10,33 @@ using Microsoft.Win32;
 
 namespace MemRescue;
 
-/// <summary>Origen abierto en la sesión (en M0: ficheros de imagen).</summary>
-public sealed record SourceEntry(ImageInfo Info)
+/// <summary>Origen abierto en la sesión: imagen RAW en solo lectura, con su handle del motor.</summary>
+public sealed class SourceEntry(Source source, ImageFormat detected, bool forcedRaw) : IDisposable
 {
+    public Source Source { get; } = source;
+
+    public ImageInfo Info => Source.Info;
+
+    public ImageFormat Detected { get; } = detected;
+
+    public bool ForcedRaw { get; } = forcedRaw;
+
+    /// <summary>Primer sector mostrado en el visor.</summary>
+    public ulong CurrentLba { get; set; }
+
     public string FileName => Path.GetFileName(Info.Path);
 
-    public string Summary => $"{MainWindow.FormatSize(Info.SizeBytes)} · {Info.SectorCount:N0} sectores de {Info.SectorSize} B";
+    public string Summary => $"{MainWindow.FormatSize(Info.SizeBytes)} · {Info.SectorCount:N0} × {Info.SectorSize} B";
+
+    public void Dispose() => Source.Dispose();
 }
 
 public partial class MainWindow : Window
 {
     private readonly ObservableCollection<SourceEntry> _sources = [];
     private CancellationTokenSource? _hashCts;
+    private CancellationTokenSource? _verifyCts;
+    private int _pageRequest;
 
     public MainWindow()
     {
@@ -28,7 +44,16 @@ public partial class MainWindow : Window
         SourcesList.ItemsSource = _sources;
         EngineStatusText.Text = $"Motor {Engine.EngineVersion} · ABI {Engine.AbiVersion}";
         Log($"Motor cargado: versión {Engine.EngineVersion}, ABI {Engine.AbiVersion}.");
+        InputBindings.Add(new KeyBinding(ApplicationCommands.Close, Key.F4, ModifierKeys.Control));
+        PreviewKeyDown += Window_PreviewKeyDown;
         ContentRendered += OnContentRendered;
+        Closed += (_, _) =>
+        {
+            foreach (var s in _sources)
+            {
+                s.Dispose();
+            }
+        };
     }
 
     private SourceEntry? Selected => SourcesList.SelectedItem as SourceEntry;
@@ -36,9 +61,12 @@ public partial class MainWindow : Window
     private uint SelectedSectorSize =>
         uint.Parse(((ComboBoxItem)SectorSizeBox.SelectedItem).Content.ToString()!, CultureInfo.InvariantCulture);
 
+    private uint PageSectors =>
+        uint.Parse(((ComboBoxItem)PageSizeBox.SelectedItem).Content.ToString()!, CultureInfo.InvariantCulture);
+
     internal static string FormatSize(ulong bytes)
     {
-        string[] units = ["B", "KiB", "MiB", "GiB", "TiB"];
+        string[] units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
         double v = bytes;
         var i = 0;
         while (v >= 1024 && i < units.Length - 1)
@@ -55,42 +83,75 @@ public partial class MainWindow : Window
         LogList.ScrollIntoView(LogList.Items[^1]);
     }
 
-    // ---------- Abrir imagen ----------
+    private void ShowError(string title, EngineException ex)
+    {
+        Log($"{title}: [{ex.Status}] {ex.Message}");
+        MessageBox.Show(this, ex.Message, title, MessageBoxButton.OK, MessageBoxImage.Warning);
+    }
+
+    // ---------- Abrir / cerrar ----------
 
     private async void OpenImage_Executed(object sender, ExecutedRoutedEventArgs e)
     {
         var dlg = new OpenFileDialog
         {
             Title = "Abrir imagen de disco (solo lectura)",
-            Filter = "Imágenes de disco (*.img;*.ima;*.bin;*.raw;*.dd)|*.img;*.ima;*.bin;*.raw;*.dd|Todos los ficheros (*.*)|*.*",
+            Filter = "Imágenes de disco (*.img;*.ima;*.bin;*.raw;*.dd;*.iso)|*.img;*.ima;*.bin;*.raw;*.dd;*.iso|Todos los ficheros (*.*)|*.*",
             CheckFileExists = true,
         };
         if (dlg.ShowDialog(this) == true)
         {
-            await OpenImageAsync(dlg.FileName, SelectedSectorSize);
+            await OpenImageAsync(dlg.FileName, SelectedSectorSize, interactive: true);
         }
     }
 
-    private async Task<SourceEntry?> OpenImageAsync(string path, uint sectorSize)
+    /// <summary>Abre un origen. Si el fichero parece un contenedor no soportado, pregunta antes de tratarlo como RAW.</summary>
+    internal async Task<SourceEntry?> OpenImageAsync(string path, uint sectorSize, bool interactive)
     {
         try
         {
             StatusText.Text = "Abriendo imagen…";
-            var info = await Task.Run(() => Engine.GetImageInfo(path, sectorSize));
-            var entry = new SourceEntry(info);
+            var format = await Task.Run(() => Engine.Probe(path));
+            var forceRaw = false;
+            if (format != ImageFormat.Raw)
+            {
+                Log($"Formato detectado en {Path.GetFileName(path)}: {format} (todavía no soportado).");
+                if (!interactive)
+                {
+                    return null;
+                }
+                var answer = MessageBox.Show(this,
+                    $"El fichero parece un contenedor {format}. MemRescue todavía no interpreta este formato (está en el plan de M1–M9).\n\n" +
+                    "¿Abrirlo de todas formas como volcado RAW sector a sector? Solo es correcto si sabe que el fichero es un volcado sin cabeceras.",
+                    "Formato no soportado", MessageBoxButton.YesNo, MessageBoxImage.Question, MessageBoxResult.No);
+                if (answer != MessageBoxResult.Yes)
+                {
+                    return null;
+                }
+                forceRaw = true;
+            }
+            var source = await Task.Run(() => Engine.OpenSource(path, sectorSize, forceRaw));
+            var entry = new SourceEntry(source, format, forceRaw);
             _sources.Add(entry);
             SourcesList.SelectedItem = entry;
-            Log($"Imagen abierta en solo lectura: {path} ({info.SizeBytes:N0} bytes, {info.SectorCount:N0} sectores de {sectorSize} B).");
-            if (info.TrailingBytes > 0)
+            Log($"Imagen abierta en solo lectura: {path} ({entry.Info.SizeBytes:N0} bytes, {entry.Info.SectorCount:N0} sectores de {sectorSize} B){(forceRaw ? ", forzada como RAW" : "")}.");
+            if (entry.Info.TrailingBytes > 0)
             {
-                Log($"Aviso: {info.TrailingBytes} bytes finales no completan un sector.");
+                Log($"Aviso: {entry.Info.TrailingBytes} bytes finales no completan un sector de {sectorSize} B.");
             }
+            MainTabs.SelectedItem = SectorsTab;
             return entry;
         }
         catch (EngineException ex)
         {
-            Log($"Error al abrir {path}: [{ex.Status}] {ex.Message}");
-            MessageBox.Show(this, ex.Message, "No se pudo abrir la imagen", MessageBoxButton.OK, MessageBoxImage.Warning);
+            if (interactive)
+            {
+                ShowError("No se pudo abrir la imagen", ex);
+            }
+            else
+            {
+                Log($"No se pudo abrir {path}: [{ex.Status}] {ex.Message}");
+            }
             return null;
         }
         finally
@@ -99,25 +160,219 @@ public partial class MainWindow : Window
         }
     }
 
-    private void SourcesList_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    private void HasSource_CanExecute(object sender, CanExecuteRoutedEventArgs e) => e.CanExecute = Selected is not null;
+
+    private void CloseSource_Executed(object sender, ExecutedRoutedEventArgs e)
     {
-        var s = Selected;
-        NoSourceText.Visibility = s is null ? Visibility.Visible : Visibility.Collapsed;
-        PropsGrid.Visibility = s is null ? Visibility.Collapsed : Visibility.Visible;
-        if (s is null)
+        if (Selected is not { } s)
         {
             return;
         }
-        PropPath.Text = s.Info.Path;
-        PropSize.Text = $"{s.Info.SizeBytes:N0} bytes ({FormatSize(s.Info.SizeBytes)})";
-        PropSector.Text = $"{s.Info.SectorSize} bytes";
-        PropSectors.Text = $"{s.Info.SectorCount:N0}";
-        PropTrailing.Text = $"{s.Info.TrailingBytes}";
+        _hashCts?.Cancel();
+        _verifyCts?.Cancel();
+        _sources.Remove(s);
+        s.Dispose();
+        Log($"Origen cerrado: {s.FileName}.");
+        SourcesList.SelectedItem = _sources.LastOrDefault();
     }
 
-    // ---------- Hashes ----------
+    private void SourcesList_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        var s = Selected;
+        var has = s is not null;
+        NoSourceText.Visibility = has ? Visibility.Collapsed : Visibility.Visible;
+        PropsGrid.Visibility = has ? Visibility.Visible : Visibility.Collapsed;
+        NoSourceSectorsText.Visibility = NoSourceText.Visibility;
+        HexView.Visibility = PropsGrid.Visibility;
+        CommandManager.InvalidateRequerySuggested();
+        if (s is null)
+        {
+            HexView.Clear();
+            SectorInfoText.Text = "";
+            PositionText.Text = "";
+            return;
+        }
+        PropPath.Text = s.Info.Path;
+        PropFormat.Text = s.ForcedRaw ? $"RAW (forzado; firmas de {s.Detected})" : "RAW (sector a sector)";
+        PropSize.Text = $"{s.Info.SizeBytes:N0} bytes ({FormatSize(s.Info.SizeBytes)})";
+        PropSector.Text = $"{s.Info.SectorSize} bytes";
+        PropSectors.Text = $"{s.Info.SectorCount:N0} (LBA 0 – {(s.Info.SectorCount == 0 ? 0 : s.Info.SectorCount - 1):N0})";
+        PropTrailing.Text = $"{s.Info.TrailingBytes}";
+        _ = ShowSectorAsync(s.CurrentLba);
+    }
 
-    private void ShowHashTab_Click(object sender, RoutedEventArgs e) => MainTabs.SelectedItem = HashTab;
+    // ---------- Visor de sectores ----------
+
+    /// <summary>Lee y muestra la página que empieza en <paramref name="lba"/>; ajusta al rango válido.</summary>
+    internal async Task<bool> ShowSectorAsync(ulong lba)
+    {
+        if (Selected is not { } s)
+        {
+            return false;
+        }
+        var total = s.Info.SectorCount;
+        if (total == 0)
+        {
+            HexView.Text = "(la imagen tiene menos de un sector completo)";
+            SectorInfoText.Text = "";
+            return false;
+        }
+        lba = Math.Min(lba, total - 1);
+        var count = (uint)Math.Min(PageSectors, total - lba);
+        var request = Interlocked.Increment(ref _pageRequest);
+        try
+        {
+            var data = await Task.Run(() => s.Source.ReadSectors(lba, count));
+            if (request != _pageRequest || Selected != s)
+            {
+                return false; // llegó una petición más reciente
+            }
+            var ss = s.Info.SectorSize;
+            var sb = new StringBuilder();
+            for (uint i = 0; i < count; i++)
+            {
+                var sectorLba = lba + i;
+                var offset = sectorLba * ss;
+                sb.Append(CultureInfo.CurrentCulture, $"── LBA {sectorLba:N0} · desplazamiento {offset:N0} (0x{offset:X}) ──\n");
+                sb.Append(HexDump.Format(data.AsSpan((int)(i * ss), (int)ss), offset));
+            }
+            HexView.Text = sb.ToString();
+            HexView.ScrollToHome();
+            s.CurrentLba = lba;
+            LbaBox.Text = lba.ToString(CultureInfo.InvariantCulture);
+            var endLba = lba + count - 1;
+            SectorInfoText.Text = count == 1
+                ? $"LBA {lba:N0} de {total - 1:N0} · desplazamiento {lba * ss:N0} (0x{lba * ss:X}) · sector de {ss} B"
+                : $"LBA {lba:N0} – {endLba:N0} de {total - 1:N0} · desplazamiento {lba * ss:N0} (0x{lba * ss:X}) · {count} sectores de {ss} B";
+            PositionText.Text = $"LBA {lba:N0} / {total - 1:N0}";
+            return true;
+        }
+        catch (EngineException ex)
+        {
+            Log($"Error leyendo LBA {lba}: [{ex.Status}] {ex.Message}");
+            HexView.Text = $"No se pudo leer la LBA {lba:N0}:\n{ex.Message}";
+            return false;
+        }
+    }
+
+    private void Navigate(Func<SourceEntry, ulong> target)
+    {
+        if (Selected is { } s)
+        {
+            _ = ShowSectorAsync(target(s));
+        }
+    }
+
+    private void PrevSector_Executed(object sender, ExecutedRoutedEventArgs e) =>
+        Navigate(s => s.CurrentLba >= PageSectors ? s.CurrentLba - PageSectors : 0);
+
+    private void NextSector_Executed(object sender, ExecutedRoutedEventArgs e) =>
+        Navigate(s => s.CurrentLba + PageSectors < s.Info.SectorCount ? s.CurrentLba + PageSectors : s.CurrentLba);
+
+    private void FirstSector_Executed(object sender, ExecutedRoutedEventArgs e) => Navigate(_ => 0);
+
+    private void LastSector_Executed(object sender, ExecutedRoutedEventArgs e) =>
+        Navigate(s => s.Info.SectorCount == 0 ? 0 : s.Info.SectorCount - 1);
+
+    private void GoToSector_Executed(object sender, ExecutedRoutedEventArgs e)
+    {
+        if (Selected is not { } s || s.Info.SectorCount == 0)
+        {
+            return;
+        }
+        var dlg = new InputNumberDialog("Ir a sector", "Número de sector (LBA):", 0, s.Info.SectorCount - 1, s.CurrentLba) { Owner = this };
+        if (dlg.ShowDialog() == true)
+        {
+            MainTabs.SelectedItem = SectorsTab;
+            _ = ShowSectorAsync(dlg.Value);
+        }
+    }
+
+    private void GoToOffset_Executed(object sender, ExecutedRoutedEventArgs e)
+    {
+        if (Selected is not { } s || s.Info.SectorCount == 0)
+        {
+            return;
+        }
+        var max = s.Info.SectorCount * s.Info.SectorSize - 1;
+        var dlg = new InputNumberDialog("Ir a desplazamiento", "Desplazamiento en bytes desde el inicio del origen:", 0, max,
+            s.CurrentLba * s.Info.SectorSize) { Owner = this };
+        if (dlg.ShowDialog() == true)
+        {
+            var lba = dlg.Value / s.Info.SectorSize;
+            Log($"Desplazamiento {dlg.Value:N0} (0x{dlg.Value:X}) → LBA {lba:N0}, byte {dlg.Value % s.Info.SectorSize} del sector.");
+            MainTabs.SelectedItem = SectorsTab;
+            _ = ShowSectorAsync(lba);
+        }
+    }
+
+    private void GoLba_Click(object sender, RoutedEventArgs e) => GoToTypedLba();
+
+    private void LbaBox_KeyDown(object sender, KeyEventArgs e)
+    {
+        if (e.Key == Key.Enter)
+        {
+            GoToTypedLba();
+            e.Handled = true;
+        }
+    }
+
+    private void GoToTypedLba()
+    {
+        if (Selected is not { } s)
+        {
+            return;
+        }
+        if (!HexDump.TryParseNumber(LbaBox.Text, out var lba) || lba >= s.Info.SectorCount)
+        {
+            StatusText.Text = $"LBA no válida (0 – {(s.Info.SectorCount == 0 ? 0 : s.Info.SectorCount - 1):N0})";
+            System.Media.SystemSounds.Beep.Play();
+            return;
+        }
+        StatusText.Text = "Listo";
+        _ = ShowSectorAsync(lba);
+    }
+
+    private void PageSizeBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (IsLoaded && Selected is { } s)
+        {
+            _ = ShowSectorAsync(s.CurrentLba);
+        }
+    }
+
+    private void Window_PreviewKeyDown(object sender, KeyEventArgs e)
+    {
+        if (Selected is null || MainTabs.SelectedItem != SectorsTab || Keyboard.FocusedElement is TextBox { Name: nameof(LbaBox) })
+        {
+            return;
+        }
+        if (e.Key == Key.PageUp && Keyboard.Modifiers == ModifierKeys.None)
+        {
+            Commands.PrevSector.Execute(null, this);
+            e.Handled = true;
+        }
+        else if (e.Key == Key.PageDown && Keyboard.Modifiers == ModifierKeys.None)
+        {
+            Commands.NextSector.Execute(null, this);
+            e.Handled = true;
+        }
+    }
+
+    private void HexView_PreviewKeyDown(object sender, KeyEventArgs e) => Window_PreviewKeyDown(sender, e);
+
+    private void CopyHex_Executed(object sender, ExecutedRoutedEventArgs e)
+    {
+        if (!string.IsNullOrEmpty(HexView.Text))
+        {
+            Clipboard.SetText(HexView.Text);
+            Log("Volcado hexadecimal copiado al portapapeles.");
+        }
+    }
+
+    // ---------- Comprobaciones: hashes ----------
+
+    private void ShowChecksTab_Click(object sender, RoutedEventArgs e) => MainTabs.SelectedItem = ChecksTab;
 
     private HashAlgorithms SelectedAlgorithms()
     {
@@ -156,7 +411,7 @@ public partial class MainWindow : Window
     private void HashCancel_Click(object sender, RoutedEventArgs e)
     {
         _hashCts?.Cancel();
-        Log("Cancelación solicitada.");
+        Log("Cancelación del cálculo de hashes solicitada.");
     }
 
     internal async Task<IReadOnlyList<(HashAlgorithms Alg, string Hex)>?> RunHashAsync(SourceEntry s, HashAlgorithms algs, string? db)
@@ -170,7 +425,7 @@ public partial class MainWindow : Window
         Log($"Calculando {algs} de {s.FileName}{(db is null ? "" : $" (registrado en {db})")}…");
         try
         {
-            using var task = Engine.StartHash(s.Info.Path, algs, s.Info.SectorSize, db);
+            using var task = s.Source.StartHash(algs, db);
             var progress = new Progress<TaskProgress>(p =>
             {
                 HashProgress.Value = p.Fraction;
@@ -179,7 +434,7 @@ public partial class MainWindow : Window
             var state = await task.WaitAsync(progress, _hashCts.Token);
             if (state == EngineTaskState.Cancelled)
             {
-                Log("Cálculo cancelado.");
+                Log("Cálculo de hashes cancelado.");
                 HashProgressText.Text = "Cancelado";
                 return null;
             }
@@ -201,8 +456,8 @@ public partial class MainWindow : Window
         }
         catch (EngineException ex)
         {
-            Log($"Error: [{ex.Status}] {ex.Message}");
-            HashProgressText.Text = "Error";
+            Log($"Error en el cálculo de hashes: [{ex.Status}] {ex.Message}");
+            HashProgressText.Text = "Error: " + ex.Message;
             return null;
         }
         finally
@@ -212,12 +467,85 @@ public partial class MainWindow : Window
         }
     }
 
+    // ---------- Comprobaciones: legibilidad ----------
+
+    private async void VerifyStart_Click(object sender, RoutedEventArgs e)
+    {
+        if (Selected is not { } s)
+        {
+            MessageBox.Show(this, "Primero abra y seleccione una imagen.", "MemRescue", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+        var retries = uint.Parse(((ComboBoxItem)RetriesBox.SelectedItem).Content.ToString()!, CultureInfo.InvariantCulture);
+        await RunVerifyAsync(s, retries);
+    }
+
+    private void VerifyCancel_Click(object sender, RoutedEventArgs e)
+    {
+        _verifyCts?.Cancel();
+        Log("Cancelación de la comprobación de legibilidad solicitada.");
+    }
+
+    internal async Task<VerifyReport?> RunVerifyAsync(SourceEntry s, uint retries)
+    {
+        VerifyStartButton.IsEnabled = false;
+        VerifyCancelButton.IsEnabled = true;
+        VerifyResults.Clear();
+        VerifyProgress.Value = 0;
+        _verifyCts = new CancellationTokenSource();
+        var started = DateTime.Now;
+        Log($"Comprobando la legibilidad de {s.FileName} ({s.Info.SectorCount:N0} sectores, {retries} reintentos)…");
+        try
+        {
+            using var task = s.Source.StartVerify(retries: retries);
+            var progress = new Progress<TaskProgress>(p =>
+            {
+                VerifyProgress.Value = p.Fraction;
+                VerifyProgressText.Text = $"{p.Fraction:P1}, {p.Done:N0} de {p.Total:N0} sectores";
+            });
+            var state = await task.WaitAsync(progress, _verifyCts.Token);
+            if (state == EngineTaskState.Cancelled)
+            {
+                Log("Comprobación cancelada.");
+                VerifyProgressText.Text = "Cancelada";
+                return null;
+            }
+            var r = task.GetReport();
+            var sb = new StringBuilder();
+            sb.AppendLine(CultureInfo.CurrentCulture, $"Sectores leídos correctamente: {r.SectorsOk:N0} de {r.SectorsRequested:N0}");
+            sb.AppendLine(CultureInfo.CurrentCulture, $"Sectores ilegibles:            {r.SectorsBad:N0}");
+            sb.AppendLine(CultureInfo.CurrentCulture, $"Lecturas repetidas:            {r.RetryReads:N0}");
+            foreach (var b in r.BadRanges)
+            {
+                sb.AppendLine(CultureInfo.CurrentCulture, $"  LBA {b.Lba:N0} – {b.Lba + b.Count - 1:N0} ({b.Count:N0} sectores)");
+            }
+            if (r.BadRangesTruncated)
+            {
+                sb.AppendLine("  (lista de rangos truncada; el recuento total es exacto)");
+            }
+            VerifyResults.Text = sb.ToString();
+            Log($"Comprobación terminada en {(DateTime.Now - started).TotalSeconds:0.00} s: {r.SectorsBad:N0} sectores ilegibles.");
+            return r;
+        }
+        catch (EngineException ex)
+        {
+            Log($"Error en la comprobación: [{ex.Status}] {ex.Message}");
+            VerifyProgressText.Text = "Error: " + ex.Message;
+            return null;
+        }
+        finally
+        {
+            VerifyStartButton.IsEnabled = true;
+            VerifyCancelButton.IsEnabled = false;
+        }
+    }
+
     // ---------- Otros ----------
 
     private void ToggleLog_Click(object sender, RoutedEventArgs e)
     {
         var show = LogMenuItem.IsChecked;
-        LogRow.Height = show ? new GridLength(130) : new GridLength(0);
+        LogRow.Height = show ? new GridLength(120) : new GridLength(0);
         LogSplitter.Visibility = show ? Visibility.Visible : Visibility.Collapsed;
         LogList.Visibility = show ? Visibility.Visible : Visibility.Collapsed;
     }
@@ -227,7 +555,7 @@ public partial class MainWindow : Window
             $"MemRescue {typeof(MainWindow).Assembly.GetName().Version}\n" +
             $"Motor {Engine.EngineVersion} (ABI {Engine.AbiVersion})\n\n" +
             "Herramienta de recuperación de datos y edición de disco.\n" +
-            "Versión de desarrollo (hito M0): solo apertura de imágenes y cálculo de hashes, en solo lectura.",
+            "Versión de desarrollo (hito M1): imágenes RAW en solo lectura, visor de sectores, hashes y comprobación de legibilidad.",
             "Acerca de MemRescue", MessageBoxButton.OK, MessageBoxImage.Information);
 
     private void Exit_Click(object sender, RoutedEventArgs e) => Close();
@@ -236,7 +564,7 @@ public partial class MainWindow : Window
 
     private async void OnContentRendered(object? sender, EventArgs e)
     {
-        if (App.SelfTestOutput is null)
+        if (App.SelfTest is not { } st)
         {
             return;
         }
@@ -249,9 +577,9 @@ public partial class MainWindow : Window
         };
         try
         {
-            if (App.SelfTestImage is not null)
+            if (st.Image is not null)
             {
-                var entry = await OpenImageAsync(App.SelfTestImage, 512);
+                var entry = await OpenImageAsync(st.Image, st.SectorSize, interactive: false);
                 if (entry is null)
                 {
                     lines[0] = "ERROR";
@@ -260,7 +588,19 @@ public partial class MainWindow : Window
                 else
                 {
                     lines.Add($"image_size={entry.Info.SizeBytes}");
+                    lines.Add($"sector_size={entry.Info.SectorSize}");
                     lines.Add($"image_sectors={entry.Info.SectorCount}");
+                    if (await ShowSectorAsync(st.ReadLba))
+                    {
+                        var sector = entry.Source.ReadSectors(st.ReadLba, 1);
+                        lines.Add($"lba{st.ReadLba}_hex16={Convert.ToHexString(sector, 0, 16)}");
+                        lines.Add($"viewer_first_line={HexView.Text.Split('\n')[1]}");
+                    }
+                    else
+                    {
+                        lines[0] = "ERROR";
+                        lines.Add("read_lba=failed");
+                    }
                     var r = await RunHashAsync(entry, HashAlgorithms.Sha256 | HashAlgorithms.Crc32, null);
                     if (r is null)
                     {
@@ -271,6 +611,19 @@ public partial class MainWindow : Window
                     {
                         lines.AddRange(r.Select(x => $"{x.Alg.ToString().ToLowerInvariant()}={x.Hex}"));
                     }
+                    var v = await RunVerifyAsync(entry, 1);
+                    if (v is null)
+                    {
+                        lines[0] = "ERROR";
+                        lines.Add("verify=failed");
+                    }
+                    else
+                    {
+                        lines.Add($"verify_ok={v.SectorsOk}");
+                        lines.Add($"verify_bad={v.SectorsBad}");
+                    }
+                    MainTabs.SelectedItem = SectorsTab;
+                    await Dispatcher.InvokeAsync(() => { }, System.Windows.Threading.DispatcherPriority.Background);
                 }
             }
         }
@@ -279,12 +632,12 @@ public partial class MainWindow : Window
             lines[0] = "ERROR";
             lines.Add($"exception={ex.GetType().Name}: {ex.Message}");
         }
-        if (App.ScreenshotPath is not null)
+        if (st.Screenshot is not null)
         {
-            SaveScreenshot(App.ScreenshotPath);
-            lines.Add($"screenshot={App.ScreenshotPath}");
+            SaveScreenshot(st.Screenshot);
+            lines.Add($"screenshot={st.Screenshot}");
         }
-        await File.WriteAllLinesAsync(App.SelfTestOutput, lines);
+        await File.WriteAllLinesAsync(st.Output, lines);
         Close();
     }
 
