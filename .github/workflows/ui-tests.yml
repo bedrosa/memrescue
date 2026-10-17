@@ -1,0 +1,36 @@
+name: UI tests
+
+# Pruebas de interfaz con UI Automation: lanzan MemRescue.exe y necesitan un escritorio. Se ejecutan a
+# demanda (Actions > UI tests > Run workflow, disponible cuando el workflow está en main) y no forman
+# parte de los checks obligatorios (ver docs/PRUEBAS_UI.md).
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+  DOTNET_NOLOGO: "1"
+
+jobs:
+  ui:
+    name: UI Automation tests
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          global-json-file: global.json
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install && rustup show active-toolchain
+      - name: Build solution
+        run: dotnet build app/MemRescue.slnx -c Debug
+      - name: UI Automation tests
+        run: dotnet test app/tests/MemRescue.UiTests/MemRescue.UiTests.csproj -c Debug --no-build

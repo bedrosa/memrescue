@@ -1,0 +1,6 @@
+# Versión fija del compilador para que las advertencias de clippy y el formato sean idénticos en local y
+# en CI. Debe ser >= rust-version del workspace (Cargo.toml).
+[toolchain]
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

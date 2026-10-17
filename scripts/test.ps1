@@ -24,6 +24,7 @@ function Step([string] $name, [scriptblock] $body) {
 $gen = 'tests\corpus\generated'
 $refs = 'tests\corpus\manifests'
 
+Step 'Repositorio: higiene (rutas, credenciales, material excluido, U+2014)' { & $Python -I -X utf8 tools\check_repo_hygiene.py }
 Step 'Rust: formato (cargo fmt --check)' { cargo fmt --all -- --check }
 Step 'Rust: análisis (clippy -D warnings)' { cargo clippy --workspace --all-targets -- -D warnings }
 Step 'Rust: pruebas unitarias e integración' { cargo test --workspace }

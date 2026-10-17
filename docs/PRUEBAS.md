@@ -58,7 +58,7 @@ Una fila de `PARIDAD_DMDE_PRO.md` pasa a **Paridad** solo si:
 ```powershell
 # Desde la raíz del repositorio (no requiere administrador)
 powershell -ExecutionPolicy Bypass -File scripts\build.ps1                 # compila todo (Debug)
-powershell -ExecutionPolicy Bypass -File scripts\test.ps1                  # 13 pasos (-SkipGui, -SkipQemu)
+powershell -ExecutionPolicy Bypass -File scripts\test.ps1                  # 14 pasos (-SkipGui, -SkipQemu)
 powershell -ExecutionPolicy Bypass -File scripts\build.ps1 -Configuration Release -Publish   # exe autocontenido
 ```
 
@@ -86,6 +86,12 @@ qemu-img comparados byte a byte y en su mapa de dispersos, rechazo de streamOpti
 el corpus GPT/MBR convertido a 5 variantes de contenedor y leído con la detección automática. El paso de
 `dotnet test` ejecuta 52 pruebas de interop y **9 de interfaz** con UI Automation (`PRUEBAS_UI.md`).
 Documentación de cada formato y de sus pruebas en `formatos/`.
+
+**Integración continua** (`.github/workflows/ci.yml`, detalle en `CONTRIBUTING.md`): las mismas
+comprobaciones se ejecutan en GitHub Actions en cada rama `feat/` o `fix/` y en cada PR, más la auditoría
+de higiene del repositorio (`tools/check_repo_hygiene.py`: rutas personales, correos, credenciales,
+material excluido, carácter U+2014 y binarios reproducibles), que también es un paso de `test.ps1`. Las
+pruebas de interfaz se lanzan a demanda con el workflow `UI tests`.
 
 Corpus actual (`tests/corpus/manifests`, imágenes en `tests/corpus/generated`, no versionadas):
 

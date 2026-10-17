@@ -4,6 +4,10 @@ Organizado en **hitos** (orden de construcción) y **módulos**. Cada hito termi
 mueven filas de `PARIDAD_DMDE_PRO.md` a "Probado". Las tareas de investigación (INV) se ejecutan
 **una a una**, justo antes del hito que las necesita, con consultas acotadas.
 
+Seguimiento operativo: GitHub Issues, con un milestone por hito (M1 a M12). Este documento describe los
+hitos; `PROGRESO.md` recoge los resultados verificados y `PARIDAD_DMDE_PRO.md` la paridad (ver
+`CONTRIBUTING.md`).
+
 ## Prioridades del propietario y cómo se reflejan
 
 | Prioridad indicada | Dónde se aborda | Nota de dependencia |
