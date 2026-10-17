@@ -1,17 +1,22 @@
 //! API de alto nivel del motor. La consumen la CLI (directamente) y la GUI (a través de `mr-ffi`).
 //!
 //! Operaciones disponibles (todas de solo lectura):
-//! - [`probe_format`]: identifica el formato de un fichero (RAW o contenedor aún no soportado).
-//! - [`open_source`] / [`image_info`]: abre una imagen RAW y devuelve sus datos básicos.
-//! - [`read_sectors`]: lectura estricta de un rango de sectores (visor hexadecimal).
+//! - [`probe_format`]: identifica el formato de un fichero.
+//! - [`open_source`] / [`open_with`] / [`image_info`]: abre una imagen RAW o un contenedor
+//!   soportado (VHD, VHDX, VMDK monolithicSparse) y devuelve sus datos.
+//! - [`discover_split`] / [`open_split_source`]: imágenes divididas (apertura explícita).
+//! - [`open_range`]: un rango de sectores de otro origen como origen propio.
+//! - [`read_sectors`]: lectura estricta de un rango de sectores; [`read_sectors_mapped`]: lectura
+//!   tolerante con el estado de cada sector (visor hexadecimal).
 //! - [`start_hash_task`]: hashes del fichero completo en segundo plano.
-//! - [`start_verify_task`]: lectura completa tolerante a errores con informe de sectores ilegibles.
+//! - [`start_verify_task`]: lectura completa tolerante a errores con mapa de validez por sector.
 
 pub mod task;
 
 use mr_common::{HashAlgorithm, MultiHasher};
+use mr_image::OpenedImage;
 use mr_io::resilient::{read_range, OnError, ReadPolicy, ReadReport};
-use mr_io::{BlockDevice, ImageFile, ImageFormat};
+use mr_io::{BlockDevice, ImageFormat, RangeView, SectorState};
 use mr_store::{JobState, Store};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -19,6 +24,7 @@ use task::{Task, TaskContext};
 use thiserror::Error;
 
 pub use mr_common::ENGINE_VERSION;
+pub use mr_image::OpenOptions;
 
 #[derive(Debug, Error)]
 pub enum ApiError {
@@ -36,28 +42,101 @@ pub enum ApiError {
 
 pub type Result<T> = std::result::Result<T, ApiError>;
 
-/// Origen abierto (en esta fase: imagen RAW en solo lectura). Se comparte entre lecturas y tareas.
-pub type Source = Arc<ImageFile>;
+/// Origen abierto (imagen RAW, contenedor, imagen dividida o rango de otro origen), siempre de
+/// solo lectura. Se comparte entre lecturas y tareas.
+pub type Source = Arc<OpenSource>;
+
+/// Dispositivo abierto junto con sus metadatos.
+pub struct OpenSource {
+    dev: Arc<dyn BlockDevice>,
+    info: ImageInfo,
+}
+
+impl OpenSource {
+    fn new(dev: Arc<dyn BlockDevice>, meta: Meta) -> Self {
+        let info = ImageInfo {
+            path: meta.path,
+            size_bytes: dev.size(),
+            sector_size: dev.sector_size(),
+            sector_count: dev.sector_count(),
+            trailing_bytes: dev.trailing_bytes(),
+            format: meta.format,
+            detected: meta.detected,
+            description: meta.description,
+            segments: meta.segments,
+            range: meta.range,
+        };
+        Self { dev, info }
+    }
+
+    pub fn info(&self) -> &ImageInfo {
+        &self.info
+    }
+
+    pub fn device(&self) -> &Arc<dyn BlockDevice> {
+        &self.dev
+    }
+}
+
+impl BlockDevice for OpenSource {
+    fn size(&self) -> u64 {
+        self.dev.size()
+    }
+    fn sector_size(&self) -> u32 {
+        self.dev.sector_size()
+    }
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> mr_io::Result<()> {
+        self.dev.read_at(offset, buf)
+    }
+    fn allocation(&self, lba: u64, count: u64) -> mr_io::Result<Vec<mr_io::AllocationRun>> {
+        self.dev.allocation(lba, count)
+    }
+}
+
+struct Meta {
+    path: PathBuf,
+    format: ImageFormat,
+    detected: ImageFormat,
+    description: String,
+    segments: Vec<PathBuf>,
+    range: Option<(u64, u64)>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageInfo {
+    /// Ruta canónica del fichero (o del primer segmento).
     pub path: PathBuf,
     pub size_bytes: u64,
     pub sector_size: u32,
     pub sector_count: u64,
     /// Bytes sobrantes al final que no completan un sector.
     pub trailing_bytes: u64,
+    /// Formato con el que se interpreta (RAW si se forzó).
+    pub format: ImageFormat,
+    /// Formato detectado en el fichero.
+    pub detected: ImageFormat,
+    /// Descripción legible (variante del contenedor, segmentos, rango…).
+    pub description: String,
+    /// Segmentos de una imagen dividida (vacío en los demás casos).
+    pub segments: Vec<PathBuf>,
+    /// Si el origen es un rango de otro: `(LBA inicial, nº de sectores)` relativos al origen padre
+    /// (en sectores del padre).
+    pub range: Option<(u64, u64)>,
 }
 
-impl ImageInfo {
-    pub fn of(src: &ImageFile) -> Self {
-        Self {
-            path: src.path().to_path_buf(),
-            size_bytes: src.size(),
-            sector_size: src.sector_size(),
-            sector_count: src.sector_count(),
-            trailing_bytes: src.trailing_bytes(),
-        }
+impl From<OpenedImage> for OpenSource {
+    fn from(o: OpenedImage) -> Self {
+        OpenSource::new(
+            o.device,
+            Meta {
+                path: o.path,
+                format: o.format,
+                detected: o.detected,
+                description: o.description,
+                segments: o.segments,
+                range: None,
+            },
+        )
     }
 }
 
@@ -66,15 +145,57 @@ pub fn probe_format(path: impl AsRef<Path>) -> Result<ImageFormat> {
     Ok(mr_io::probe_format(path)?)
 }
 
-/// Abre una imagen RAW en solo lectura (rechaza dispositivos y contenedores no soportados).
+/// Abre una imagen (RAW o contenedor soportado) en solo lectura. `sector_size` 0 = nativo.
 pub fn open_source(path: impl AsRef<Path>, sector_size: u32) -> Result<Source> {
-    Ok(Arc::new(ImageFile::open(path, sector_size)?))
+    open_with(
+        path,
+        OpenOptions {
+            sector_size,
+            force_raw: false,
+        },
+    )
+}
+
+/// Abre una imagen con opciones explícitas (p. ej. forzar RAW).
+pub fn open_with(path: impl AsRef<Path>, opts: OpenOptions) -> Result<Source> {
+    Ok(Arc::new(mr_image::open_image(path.as_ref(), opts)?.into()))
+}
+
+/// Lista los segmentos de una imagen dividida a partir del primero, sin abrirlos.
+pub fn discover_split(first: impl AsRef<Path>) -> Result<Vec<PathBuf>> {
+    Ok(mr_image::split::discover(first.as_ref())?)
+}
+
+/// Abre una imagen dividida (petición explícita del usuario tras ver la lista de segmentos).
+pub fn open_split_source(first: impl AsRef<Path>, opts: OpenOptions) -> Result<Source> {
+    Ok(Arc::new(mr_image::open_split(first.as_ref(), opts)?.into()))
+}
+
+/// Presenta `count` sectores de `parent` desde `start_lba` como un origen independiente
+/// (partición o rango elegido por el usuario).
+pub fn open_range(parent: &Source, start_lba: u64, count: u64) -> Result<Source> {
+    let dev: Arc<dyn BlockDevice> = Arc::clone(parent) as Arc<dyn BlockDevice>;
+    let view = RangeView::new(dev, start_lba, count)?;
+    let p = parent.info();
+    let end = start_lba + count - 1; // RangeView::new ya validó el rango (count > 0, sin desbordes)
+    let description = format!("Rango LBA {start_lba}–{end} de: {}", p.description);
+    Ok(Arc::new(OpenSource::new(
+        Arc::new(view),
+        Meta {
+            path: p.path.clone(),
+            format: p.format,
+            detected: p.detected,
+            description,
+            segments: p.segments.clone(),
+            range: Some((start_lba, count)),
+        },
+    )))
 }
 
 /// Abre la imagen en solo lectura y devuelve sus datos básicos.
 pub fn image_info(path: impl AsRef<Path>, sector_size: u32) -> Result<ImageInfo> {
     let src = open_source(path, sector_size)?;
-    Ok(ImageInfo::of(&src))
+    Ok(src.info().clone())
 }
 
 /// Lee `count` sectores desde `lba` con validación estricta (rango, tamaño máximo por petición).
@@ -83,6 +204,25 @@ pub fn read_sectors(src: &dyn BlockDevice, lba: u64, count: u64) -> Result<Vec<u
     let mut buf = vec![0u8; len];
     src.read_sectors(lba, count, &mut buf)?;
     Ok(buf)
+}
+
+/// Lectura acotada para el visor con el **estado de cada sector**: los ilegibles se entregan con
+/// el patrón de relleno y estado `Unreadable` (nunca como datos); los dispersos, como ceros
+/// `Sparse`. `retries` = reintentos por sector tras un fallo.
+pub fn read_sectors_mapped(
+    src: &dyn BlockDevice,
+    lba: u64,
+    count: u64,
+    retries: u32,
+) -> Result<(Vec<u8>, Vec<SectorState>)> {
+    let policy = ReadPolicy {
+        retries,
+        on_error: OnError::FillAndContinue,
+        ..ReadPolicy::default()
+    };
+    Ok(mr_io::resilient::read_sectors_mapped(
+        src, lba, count, &policy,
+    )?)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -166,13 +306,13 @@ pub fn start_hash_task_on(src: Source, opts: HashOptions) -> Result<Arc<Task<Has
     Task::spawn(move |ctx| run_hash_job(&src, &opts, ctx))
 }
 
-fn run_hash_job(img: &ImageFile, opts: &HashOptions, ctx: &TaskContext) -> Result<HashResult> {
+fn run_hash_job(img: &OpenSource, opts: &HashOptions, ctx: &TaskContext) -> Result<HashResult> {
     let Some(db) = &opts.store_path else {
         return hash_image(img, opts, ctx);
     };
     let mut store = Store::open(db)?;
     let src = store.add_image_source(
-        &img.path().display().to_string(),
+        &img.info().path.display().to_string(),
         img.size(),
         img.sector_size(),
         None,
@@ -229,7 +369,8 @@ impl Default for VerifyOptions {
     }
 }
 
-/// Lee el rango completo de sectores; el progreso se expresa en sectores.
+/// Lee el rango completo de sectores; el progreso se expresa en sectores. El informe incluye el
+/// mapa de validez (estado de cada sector: leído, recuperado, ilegible, saltado o disperso).
 pub fn verify(
     dev: &dyn BlockDevice,
     opts: &VerifyOptions,
@@ -248,7 +389,7 @@ pub fn verify(
         opts.start_lba,
         count,
         &opts.policy,
-        |_, _| Ok(()),
+        |_, _, _| Ok(()),
         |done, _| {
             ctx.set_done(done);
             !ctx.is_cancelled()
@@ -268,7 +409,7 @@ pub fn start_verify_task(src: Source, opts: VerifyOptions) -> Result<Arc<Task<Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mr_io::{FaultyDevice, MemDevice};
+    use mr_io::{FaultyDevice, MemDevice, SectorState};
     use std::io::Write;
     use task::TaskState;
 
@@ -379,8 +520,21 @@ mod tests {
             .with_bad([10, 11, 50]);
         let ctx = TaskContext::detached();
         let r = verify(&dev, &VerifyOptions::default(), &ctx).unwrap();
-        assert_eq!((r.sectors_read_ok, r.sectors_bad), (97, 3));
-        assert_eq!(r.bad_ranges, vec![(10, 2), (50, 1)]);
+        assert_eq!(
+            (
+                r.map.count(SectorState::Read),
+                r.map.count(SectorState::Unreadable)
+            ),
+            (97, 3)
+        );
+        assert_eq!(
+            r.map.untrusted_runs().collect::<Vec<_>>(),
+            vec![
+                (10, 2, SectorState::Unreadable),
+                (50, 1, SectorState::Unreadable)
+            ]
+        );
+        assert!(!r.map.all_trustworthy());
         assert_eq!((ctx.done(), ctx.total()), (100, 100));
     }
 
@@ -402,5 +556,63 @@ mod tests {
         t.cancel();
         assert!(matches!(t.wait(), Err(ApiError::Cancelled)));
         assert_eq!(t.state(), TaskState::Cancelled);
+    }
+
+    #[test]
+    fn open_range_is_bounded_nests_and_describes_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("r.img");
+        let data: Vec<u8> = (0..100 * 512).map(|i| (i / 512) as u8).collect();
+        std::fs::write(&img, &data).unwrap();
+        let parent = open_source(&img, 0).unwrap();
+        assert_eq!(parent.info().format, ImageFormat::Raw);
+        let r = open_range(&parent, 10, 20).unwrap();
+        assert_eq!(r.info().sector_count, 20);
+        assert_eq!(r.info().range, Some((10, 20)));
+        assert!(r.info().description.starts_with("Rango LBA 10–29"));
+        assert!(read_sectors(r.as_ref(), 0, 1)
+            .unwrap()
+            .iter()
+            .all(|&b| b == 10));
+        assert!(read_sectors(r.as_ref(), 20, 1).is_err());
+        let r2 = open_range(&r, 5, 10).unwrap();
+        assert!(read_sectors(r2.as_ref(), 9, 1)
+            .unwrap()
+            .iter()
+            .all(|&b| b == 24));
+        assert!(open_range(&parent, 95, 6).is_err());
+        assert!(open_range(&parent, 0, 0).is_err());
+        assert!(open_range(&parent, u64::MAX, 2).is_err());
+        drop(parent);
+        assert!(read_sectors(r2.as_ref(), 0, 1).is_ok());
+        assert_eq!(std::fs::read(&img).unwrap(), data);
+    }
+
+    #[test]
+    fn mapped_read_never_presents_fill_as_data() {
+        let dev = FaultyDevice::new(MemDevice::new(vec![0x41u8; 512 * 8], 512).unwrap())
+            .with_bad([2])
+            .with_sparse(5, 2);
+        let (data, states) = read_sectors_mapped(&dev, 0, 8, 1).unwrap();
+        assert_eq!(
+            states,
+            vec![
+                SectorState::Read,
+                SectorState::Read,
+                SectorState::Unreadable,
+                SectorState::Read,
+                SectorState::Read,
+                SectorState::Sparse,
+                SectorState::Sparse,
+                SectorState::Read,
+            ]
+        );
+        // El ilegible lleva el relleno (no los datos), los dispersos ceros y el resto los datos.
+        assert!(data[1024..1536].chunks(4).all(|c| c == b"BAD!"));
+        assert!(data[5 * 512..7 * 512].iter().all(|&b| b == 0));
+        assert!(data[..1024].iter().all(|&b| b == 0x41));
+        // El hash estricto se niega a calcularse sobre esa misma zona.
+        let ctx = TaskContext::detached();
+        assert!(hash_image(&dev, &HashOptions::default(), &ctx).is_err());
     }
 }

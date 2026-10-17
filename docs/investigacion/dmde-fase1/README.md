@@ -19,7 +19,7 @@ modificado el ejecutable ni se ha escrito código**.
 | 09 | [Configuración, scripts y plantillas](09-configuracion-scripts-plantillas.md) | INI, `.lng`, script de E/S, lenguaje de plantillas |
 | 10 | [Funcionalidades verificables](10-funcionalidades-verificables.md) | Nivel de verificación por funcionalidad + conclusiones |
 | 11 | [Pendientes y fase 2](11-pendientes-y-fase-2.md) | Huecos abiertos, plan siguiente, pautas de reimplementación |
-| - | [datos/imports_por_dll.txt](datos/imports_por_dll.txt) | Imports agrupados por DLL |
+| - | `datos/imports_por_dll.txt` (solo en local, no versionado) | Imports agrupados por DLL |
 
 ## Resumen en una página
 

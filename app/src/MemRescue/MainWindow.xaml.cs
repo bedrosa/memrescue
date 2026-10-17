@@ -10,8 +10,8 @@ using Microsoft.Win32;
 
 namespace MemRescue;
 
-/// <summary>Origen abierto en la sesión: imagen RAW en solo lectura, con su handle del motor.</summary>
-public sealed class SourceEntry(Source source, ImageFormat detected, bool forcedRaw) : IDisposable
+/// <summary>Origen abierto en la sesión (imagen, contenedor, imagen dividida o rango), en solo lectura.</summary>
+public sealed class SourceEntry(Source source, ImageFormat detected, bool forcedRaw, string? label = null) : IDisposable
 {
     public Source Source { get; } = source;
 
@@ -24,7 +24,7 @@ public sealed class SourceEntry(Source source, ImageFormat detected, bool forced
     /// <summary>Primer sector mostrado en el visor.</summary>
     public ulong CurrentLba { get; set; }
 
-    public string FileName => Path.GetFileName(Info.Path);
+    public string FileName => label ?? Path.GetFileName(Info.Path);
 
     public string Summary => $"{MainWindow.FormatSize(Info.SizeBytes)} · {Info.SectorCount:N0} × {Info.SectorSize} B";
 
@@ -37,6 +37,7 @@ public partial class MainWindow : Window
     private CancellationTokenSource? _hashCts;
     private CancellationTokenSource? _verifyCts;
     private int _pageRequest;
+    private bool _syncingScroll;
 
     public MainWindow()
     {
@@ -58,8 +59,11 @@ public partial class MainWindow : Window
 
     private SourceEntry? Selected => SourcesList.SelectedItem as SourceEntry;
 
+    /// <summary>Tamaño de sector elegido para abrir; 0 = automático (nativo del formato, 512 en RAW).</summary>
     private uint SelectedSectorSize =>
-        uint.Parse(((ComboBoxItem)SectorSizeBox.SelectedItem).Content.ToString()!, CultureInfo.InvariantCulture);
+        uint.TryParse(((ComboBoxItem)SectorSizeBox.SelectedItem).Content.ToString(), NumberStyles.None, CultureInfo.InvariantCulture, out var v)
+            ? v
+            : 0;
 
     private uint PageSectors =>
         uint.Parse(((ComboBoxItem)PageSizeBox.SelectedItem).Content.ToString()!, CultureInfo.InvariantCulture);
@@ -86,7 +90,14 @@ public partial class MainWindow : Window
     private void ShowError(string title, EngineException ex)
     {
         Log($"{title}: [{ex.Status}] {ex.Message}");
-        MessageBox.Show(this, ex.Message, title, MessageBoxButton.OK, MessageBoxImage.Warning);
+        var hint = ex.Status switch
+        {
+            EngineStatus.Corrupt => "\n\nLa estructura del contenedor está dañada o es incoherente; no se interpreta para no mostrar datos erróneos.",
+            EngineStatus.ExternalReference => "\n\nEl contenedor depende de otro fichero (disco padre o extensión). Por seguridad MemRescue no abre ficheros referenciados automáticamente.",
+            EngineStatus.UnsupportedFeature => "\n\nEsta variante del formato todavía no está soportada.",
+            _ => "",
+        };
+        MessageBox.Show(this, ex.Message + hint, title, MessageBoxButton.OK, MessageBoxImage.Warning);
     }
 
     // ---------- Abrir / cerrar ----------
@@ -96,7 +107,7 @@ public partial class MainWindow : Window
         var dlg = new OpenFileDialog
         {
             Title = "Abrir imagen de disco (solo lectura)",
-            Filter = "Imágenes de disco (*.img;*.ima;*.bin;*.raw;*.dd;*.iso)|*.img;*.ima;*.bin;*.raw;*.dd;*.iso|Todos los ficheros (*.*)|*.*",
+            Filter = "Imágenes de disco (*.img;*.ima;*.bin;*.raw;*.dd;*.iso;*.vhd;*.vhdx;*.vmdk;*.001;*.000)|*.img;*.ima;*.bin;*.raw;*.dd;*.iso;*.vhd;*.vhdx;*.vmdk;*.001;*.000|Todos los ficheros (*.*)|*.*",
             CheckFileExists = true,
         };
         if (dlg.ShowDialog(this) == true)
@@ -105,7 +116,11 @@ public partial class MainWindow : Window
         }
     }
 
-    /// <summary>Abre un origen. Si el fichero parece un contenedor no soportado, pregunta antes de tratarlo como RAW.</summary>
+    /// <summary>
+    /// Abre un origen. Los contenedores soportados (VHD, VHDX, VMDK monolithicSparse) se interpretan;
+    /// si el fichero es el primer segmento de una imagen dividida se ofrece abrir el conjunto; si
+    /// parece un contenedor sin lector, se pregunta antes de tratarlo como RAW.
+    /// </summary>
     internal async Task<SourceEntry?> OpenImageAsync(string path, uint sectorSize, bool interactive)
     {
         try
@@ -113,15 +128,45 @@ public partial class MainWindow : Window
             StatusText.Text = "Abriendo imagen…";
             var format = await Task.Run(() => Engine.Probe(path));
             var forceRaw = false;
-            if (format != ImageFormat.Raw)
+            var split = false;
+            if (format == ImageFormat.Raw && interactive && LooksLikeFirstSegment(path))
             {
-                Log($"Formato detectado en {Path.GetFileName(path)}: {format} (todavía no soportado).");
+                IReadOnlyList<string> segments = [];
+                try
+                {
+                    segments = await Task.Run(() => Engine.DiscoverSplit(path));
+                }
+                catch (EngineException ex)
+                {
+                    Log($"No se pudo enumerar la imagen dividida: [{ex.Status}] {ex.Message}");
+                }
+                if (segments.Count > 1)
+                {
+                    var list = string.Join("\n", segments.Take(12).Select(Path.GetFileName));
+                    if (segments.Count > 12)
+                    {
+                        list += $"\n… y {segments.Count - 12} más";
+                    }
+                    var answer = MessageBox.Show(this,
+                        $"«{Path.GetFileName(path)}» parece el primer segmento de una imagen dividida en {segments.Count} ficheros:\n\n{list}\n\n" +
+                        "¿Abrir el conjunto como un único disco (solo lectura)? Si responde No, se abrirá solo este fichero.",
+                        "Imagen dividida", MessageBoxButton.YesNoCancel, MessageBoxImage.Question, MessageBoxResult.Yes);
+                    if (answer == MessageBoxResult.Cancel)
+                    {
+                        return null;
+                    }
+                    split = answer == MessageBoxResult.Yes;
+                }
+            }
+            else if (!IsReadable(format))
+            {
+                Log($"Formato detectado en {Path.GetFileName(path)}: {format} (sin lector todavía).");
                 if (!interactive)
                 {
                     return null;
                 }
                 var answer = MessageBox.Show(this,
-                    $"El fichero parece un contenedor {format}. MemRescue todavía no interpreta este formato (está en el plan de M1–M9).\n\n" +
+                    $"El fichero parece un contenedor {format}. MemRescue todavía no interpreta este formato.\n\n" +
                     "¿Abrirlo de todas formas como volcado RAW sector a sector? Solo es correcto si sabe que el fichero es un volcado sin cabeceras.",
                     "Formato no soportado", MessageBoxButton.YesNo, MessageBoxImage.Question, MessageBoxResult.No);
                 if (answer != MessageBoxResult.Yes)
@@ -130,16 +175,14 @@ public partial class MainWindow : Window
                 }
                 forceRaw = true;
             }
-            var source = await Task.Run(() => Engine.OpenSource(path, sectorSize, forceRaw));
+            var source = await Task.Run(() => Engine.OpenSource(path, sectorSize, forceRaw, split));
             var entry = new SourceEntry(source, format, forceRaw);
-            _sources.Add(entry);
-            SourcesList.SelectedItem = entry;
-            Log($"Imagen abierta en solo lectura: {path} ({entry.Info.SizeBytes:N0} bytes, {entry.Info.SectorCount:N0} sectores de {sectorSize} B){(forceRaw ? ", forzada como RAW" : "")}.");
+            AddSource(entry);
+            Log($"Origen abierto en solo lectura: {path}, {source.Description} ({entry.Info.SizeBytes:N0} bytes, {entry.Info.SectorCount:N0} sectores de {entry.Info.SectorSize} B).");
             if (entry.Info.TrailingBytes > 0)
             {
-                Log($"Aviso: {entry.Info.TrailingBytes} bytes finales no completan un sector de {sectorSize} B.");
+                Log($"Aviso: {entry.Info.TrailingBytes} bytes finales no completan un sector de {entry.Info.SectorSize} B.");
             }
-            MainTabs.SelectedItem = SectorsTab;
             return entry;
         }
         catch (EngineException ex)
@@ -157,6 +200,64 @@ public partial class MainWindow : Window
         finally
         {
             StatusText.Text = "Listo";
+        }
+    }
+
+    /// <summary>Formatos con lector en el motor (VMDK descriptor: el motor informa de la referencia externa).</summary>
+    private static bool IsReadable(ImageFormat f) =>
+        f is ImageFormat.Raw or ImageFormat.Vhd or ImageFormat.Vhdx or ImageFormat.Vmdk or ImageFormat.VmdkDescriptor;
+
+    private static bool LooksLikeFirstSegment(string path)
+    {
+        var ext = Path.GetExtension(path);
+        return ext.Length >= 4 && ext[1..].All(char.IsAsciiDigit) && ext[1..].TrimStart('0') is "" or "1";
+    }
+
+    private void AddSource(SourceEntry entry)
+    {
+        _sources.Add(entry);
+        SourcesList.SelectedItem = entry;
+        MainTabs.SelectedItem = SectorsTab;
+    }
+
+    private void OpenRange_Executed(object sender, ExecutedRoutedEventArgs e)
+    {
+        if (Selected is not { } s || s.Info.SectorCount == 0)
+        {
+            return;
+        }
+        var total = s.Info.SectorCount;
+        var first = new InputNumberDialog("Abrir rango de sectores", "LBA inicial del rango:", 0, total - 1, s.CurrentLba) { Owner = this };
+        if (first.ShowDialog() != true)
+        {
+            return;
+        }
+        var maxCount = total - first.Value;
+        var second = new InputNumberDialog("Abrir rango de sectores",
+            $"Número de sectores (1 – {maxCount:N0}) desde la LBA {first.Value:N0}:", 1, maxCount, maxCount) { Owner = this };
+        if (second.ShowDialog() != true)
+        {
+            return;
+        }
+        _ = OpenRangeAsync(s, first.Value, second.Value);
+    }
+
+    /// <summary>Abre un rango de sectores del origen como un origen independiente.</summary>
+    internal async Task<SourceEntry?> OpenRangeAsync(SourceEntry parent, ulong start, ulong count)
+    {
+        try
+        {
+            var src = await Task.Run(() => parent.Source.OpenRange(start, count));
+            var entry = new SourceEntry(src, parent.Detected, parent.ForcedRaw,
+                $"{parent.FileName} [LBA {start:N0}–{start + count - 1:N0}]");
+            AddSource(entry);
+            Log($"Rango abierto como dispositivo: {src.Description} ({count:N0} sectores).");
+            return entry;
+        }
+        catch (EngineException ex)
+        {
+            ShowError("No se pudo abrir el rango", ex);
+            return null;
         }
     }
 
@@ -185,15 +286,32 @@ public partial class MainWindow : Window
         NoSourceSectorsText.Visibility = NoSourceText.Visibility;
         HexView.Visibility = PropsGrid.Visibility;
         CommandManager.InvalidateRequerySuggested();
+        LbaScrollBar.Visibility = PropsGrid.Visibility;
         if (s is null)
         {
             HexView.Clear();
             SectorInfoText.Text = "";
             PositionText.Text = "";
+            UntrustedBanner.Visibility = Visibility.Collapsed;
             return;
         }
         PropPath.Text = s.Info.Path;
-        PropFormat.Text = s.ForcedRaw ? $"RAW (forzado; firmas de {s.Detected})" : "RAW (sector a sector)";
+        PropFormat.Text = s.Source.Description;
+        PropDetails.Text = s.Source.RangeStart is { } rs
+            ? $"Rango del origen padre desde la LBA {rs:N0}"
+            : s.ForcedRaw ? $"Leído como RAW por decisión del usuario (firmas de {s.Detected})" : $"Formato detectado: {s.Detected}";
+        _syncingScroll = true;
+        try
+        {
+            LbaScrollBar.Maximum = s.Info.SectorCount == 0 ? 0 : s.Info.SectorCount - 1;
+            LbaScrollBar.Value = s.CurrentLba;
+            LbaScrollBar.LargeChange = Math.Max(1, PageSectors);
+            LbaScrollBar.ViewportSize = Math.Max(1, PageSectors);
+        }
+        finally
+        {
+            _syncingScroll = false;
+        }
         PropSize.Text = $"{s.Info.SizeBytes:N0} bytes ({FormatSize(s.Info.SizeBytes)})";
         PropSector.Text = $"{s.Info.SectorSize} bytes";
         PropSectors.Text = $"{s.Info.SectorCount:N0} (LBA 0 – {(s.Info.SectorCount == 0 ? 0 : s.Info.SectorCount - 1):N0})";
@@ -222,28 +340,50 @@ public partial class MainWindow : Window
         var request = Interlocked.Increment(ref _pageRequest);
         try
         {
-            var data = await Task.Run(() => s.Source.ReadSectors(lba, count));
+            var page = await Task.Run(() => s.Source.ReadSectorsMapped(lba, count, retries: 1));
             if (request != _pageRequest || Selected != s)
             {
                 return false; // llegó una petición más reciente
             }
             var ss = s.Info.SectorSize;
             var sb = new StringBuilder();
+            var untrusted = 0;
             for (uint i = 0; i < count; i++)
             {
                 var sectorLba = lba + i;
                 var offset = sectorLba * ss;
-                sb.Append(CultureInfo.CurrentCulture, $"── LBA {sectorLba:N0} · desplazamiento {offset:N0} (0x{offset:X}) ──\n");
-                sb.Append(HexDump.Format(data.AsSpan((int)(i * ss), (int)ss), offset));
+                var state = page.States[i];
+                sb.Append(CultureInfo.CurrentCulture, $"── LBA {sectorLba:N0} · desplazamiento {offset:N0} (0x{offset:X}) · {state.Label()} ──\n");
+                if (!state.IsTrustworthy())
+                {
+                    // Nunca se presenta el relleno como si fueran datos del origen.
+                    untrusted++;
+                    sb.Append("!! SECTOR NO FIABLE: los bytes siguientes son un PATRÓN DE RELLENO generado por MemRescue, NO datos del origen.\n");
+                }
+                sb.Append(HexDump.Format(page.Data.AsSpan((int)(i * ss), (int)ss), offset));
             }
             HexView.Text = sb.ToString();
             HexView.ScrollToHome();
             s.CurrentLba = lba;
             LbaBox.Text = lba.ToString(CultureInfo.InvariantCulture);
+            _syncingScroll = true;
+            try
+            {
+                LbaScrollBar.Value = lba;
+            }
+            finally
+            {
+                _syncingScroll = false;
+            }
             var endLba = lba + count - 1;
-            SectorInfoText.Text = count == 1
+            var states = count == 1 ? $" · {page.States[0].Label()}" : untrusted > 0 ? $" · {untrusted} NO FIABLES" : "";
+            SectorInfoText.Text = (count == 1
                 ? $"LBA {lba:N0} de {total - 1:N0} · desplazamiento {lba * ss:N0} (0x{lba * ss:X}) · sector de {ss} B"
-                : $"LBA {lba:N0} – {endLba:N0} de {total - 1:N0} · desplazamiento {lba * ss:N0} (0x{lba * ss:X}) · {count} sectores de {ss} B";
+                : $"LBA {lba:N0} – {endLba:N0} de {total - 1:N0} · desplazamiento {lba * ss:N0} (0x{lba * ss:X}) · {count} sectores de {ss} B") + states;
+            UntrustedBanner.Visibility = untrusted > 0 ? Visibility.Visible : Visibility.Collapsed;
+            UntrustedBannerText.Text = untrusted > 0
+                ? $"{untrusted} de {count} sectores de esta página no se pudieron leer: su contenido es un patrón de relleno («BAD!»/«SKIP»), no datos del origen."
+                : "";
             PositionText.Text = $"LBA {lba:N0} / {total - 1:N0}";
             return true;
         }
@@ -337,7 +477,26 @@ public partial class MainWindow : Window
     {
         if (IsLoaded && Selected is { } s)
         {
+            LbaScrollBar.LargeChange = Math.Max(1, PageSectors);
+            LbaScrollBar.ViewportSize = Math.Max(1, PageSectors);
             _ = ShowSectorAsync(s.CurrentLba);
+        }
+    }
+
+    /// <summary>
+    /// Barra de posición: recorre todo el origen sin cargarlo (solo se lee la página visible; las
+    /// peticiones superadas por otras más recientes se descartan).
+    /// </summary>
+    private void LbaScrollBar_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
+    {
+        if (_syncingScroll || Selected is not { } s || s.Info.SectorCount == 0)
+        {
+            return;
+        }
+        var lba = (ulong)Math.Clamp(Math.Round(e.NewValue), 0, s.Info.SectorCount - 1);
+        if (lba != s.CurrentLba)
+        {
+            _ = ShowSectorAsync(lba);
         }
     }
 
@@ -477,7 +636,8 @@ public partial class MainWindow : Window
             return;
         }
         var retries = uint.Parse(((ComboBoxItem)RetriesBox.SelectedItem).Content.ToString()!, CultureInfo.InvariantCulture);
-        await RunVerifyAsync(s, retries);
+        var jump = ulong.Parse(((ComboBoxItem)JumpBox.SelectedItem).Content.ToString()!, CultureInfo.InvariantCulture);
+        await RunVerifyAsync(s, retries, jump, ReadBackBox.IsChecked == true && jump > 0);
     }
 
     private void VerifyCancel_Click(object sender, RoutedEventArgs e)
@@ -486,7 +646,7 @@ public partial class MainWindow : Window
         Log("Cancelación de la comprobación de legibilidad solicitada.");
     }
 
-    internal async Task<VerifyReport?> RunVerifyAsync(SourceEntry s, uint retries)
+    internal async Task<VerifyReport?> RunVerifyAsync(SourceEntry s, uint retries, ulong jump = 0, bool readBack = false)
     {
         VerifyStartButton.IsEnabled = false;
         VerifyCancelButton.IsEnabled = true;
@@ -494,10 +654,11 @@ public partial class MainWindow : Window
         VerifyProgress.Value = 0;
         _verifyCts = new CancellationTokenSource();
         var started = DateTime.Now;
-        Log($"Comprobando la legibilidad de {s.FileName} ({s.Info.SectorCount:N0} sectores, {retries} reintentos)…");
+        Log($"Comprobando la legibilidad de {s.FileName} ({s.Info.SectorCount:N0} sectores, {retries} reintentos" +
+            (jump > 0 ? $", salto de {jump} sectores{(readBack ? " con lectura hacia atrás" : "")}" : "") + ")…");
         try
         {
-            using var task = s.Source.StartVerify(retries: retries);
+            using var task = s.Source.StartVerify(retries: retries, jumpSectors: jump, readBack: readBack);
             var progress = new Progress<TaskProgress>(p =>
             {
                 VerifyProgress.Value = p.Fraction;
@@ -512,19 +673,24 @@ public partial class MainWindow : Window
             }
             var r = task.GetReport();
             var sb = new StringBuilder();
-            sb.AppendLine(CultureInfo.CurrentCulture, $"Sectores leídos correctamente: {r.SectorsOk:N0} de {r.SectorsRequested:N0}");
-            sb.AppendLine(CultureInfo.CurrentCulture, $"Sectores ilegibles:            {r.SectorsBad:N0}");
-            sb.AppendLine(CultureInfo.CurrentCulture, $"Lecturas repetidas:            {r.RetryReads:N0}");
-            foreach (var b in r.BadRanges)
+            sb.AppendLine(CultureInfo.CurrentCulture, $"Sectores fiables: {r.SectorsTrustworthy:N0} de {r.SectorsRequested:N0}");
+            sb.AppendLine(CultureInfo.CurrentCulture, $"  leídos             {r.SectorsRead:N0}");
+            sb.AppendLine(CultureInfo.CurrentCulture, $"  recuperados        {r.SectorsRecovered:N0}");
+            sb.AppendLine(CultureInfo.CurrentCulture, $"  dispersos (ceros)  {r.SectorsSparse:N0}");
+            sb.AppendLine(CultureInfo.CurrentCulture, $"Sectores NO fiables (contenido = patrón de relleno):");
+            sb.AppendLine(CultureInfo.CurrentCulture, $"  ilegibles          {r.SectorsUnreadable:N0}");
+            sb.AppendLine(CultureInfo.CurrentCulture, $"  saltados           {r.SectorsSkipped:N0}");
+            sb.AppendLine(CultureInfo.CurrentCulture, $"Lecturas repetidas:  {r.RetryReads:N0}");
+            foreach (var b in r.UntrustedRanges)
             {
-                sb.AppendLine(CultureInfo.CurrentCulture, $"  LBA {b.Lba:N0} – {b.Lba + b.Count - 1:N0} ({b.Count:N0} sectores)");
+                sb.AppendLine(CultureInfo.CurrentCulture, $"  LBA {b.Lba:N0} – {b.Lba + b.Count - 1:N0} ({b.Count:N0} sectores, {b.State.Label()})");
             }
-            if (r.BadRangesTruncated)
+            if (r.RangesTruncated)
             {
-                sb.AppendLine("  (lista de rangos truncada; el recuento total es exacto)");
+                sb.AppendLine("  (lista de tramos truncada; los recuentos son exactos)");
             }
             VerifyResults.Text = sb.ToString();
-            Log($"Comprobación terminada en {(DateTime.Now - started).TotalSeconds:0.00} s: {r.SectorsBad:N0} sectores ilegibles.");
+            Log($"Comprobación terminada en {(DateTime.Now - started).TotalSeconds:0.00} s: {r.SectorsUnreadable:N0} ilegibles, {r.SectorsSkipped:N0} saltados.");
             return r;
         }
         catch (EngineException ex)
@@ -555,7 +721,8 @@ public partial class MainWindow : Window
             $"MemRescue {typeof(MainWindow).Assembly.GetName().Version}\n" +
             $"Motor {Engine.EngineVersion} (ABI {Engine.AbiVersion})\n\n" +
             "Herramienta de recuperación de datos y edición de disco.\n" +
-            "Versión de desarrollo (hito M1): imágenes RAW en solo lectura, visor de sectores, hashes y comprobación de legibilidad.",
+            "Versión de desarrollo (hito M1): imágenes RAW, VHD, VHDX, VMDK monolithicSparse y divididas en solo lectura, " +
+            "rangos como dispositivo, visor de sectores con estado de validez, hashes y comprobación de legibilidad.",
             "Acerca de MemRescue", MessageBoxButton.OK, MessageBoxImage.Information);
 
     private void Exit_Click(object sender, RoutedEventArgs e) => Close();
@@ -587,6 +754,7 @@ public partial class MainWindow : Window
                 }
                 else
                 {
+                    lines.Add($"format={entry.Info.Format}");
                     lines.Add($"image_size={entry.Info.SizeBytes}");
                     lines.Add($"sector_size={entry.Info.SectorSize}");
                     lines.Add($"image_sectors={entry.Info.SectorCount}");
@@ -619,8 +787,10 @@ public partial class MainWindow : Window
                     }
                     else
                     {
-                        lines.Add($"verify_ok={v.SectorsOk}");
-                        lines.Add($"verify_bad={v.SectorsBad}");
+                        lines.Add($"verify_ok={v.SectorsRead + v.SectorsRecovered}");
+                        lines.Add($"verify_sparse={v.SectorsSparse}");
+                        lines.Add($"verify_bad={v.SectorsUnreadable}");
+                        lines.Add($"verify_skipped={v.SectorsSkipped}");
                     }
                     MainTabs.SelectedItem = SectorsTab;
                     await Dispatcher.InvokeAsync(() => { }, System.Windows.Threading.DispatcherPriority.Background);

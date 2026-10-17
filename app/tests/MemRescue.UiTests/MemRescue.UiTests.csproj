@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Pruebas de la interfaz real mediante UI Automation: lanzan MemRescue.exe compilado con
+    la opción «open» (abrir imagen al iniciar) y lo manejan desde fuera del proceso. Requieren una sesión de escritorio
+    interactiva (ver docs/PRUEBAS_UI.md).
+  -->
+  <PropertyGroup>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <!-- Da acceso a UIAutomationClient / UIAutomationTypes (System.Windows.Automation). -->
+    <UseWPF>true</UseWPF>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.4" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Solo para garantizar que MemRescue.exe se compila antes; no se referencia su ensamblado. -->
+    <ProjectReference Include="..\..\src\MemRescue\MemRescue.csproj" ReferenceOutputAssembly="false" Private="false" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- La configuración (Debug/Release) con la que se compilaron las pruebas decide qué MemRescue.exe se lanza. -->
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+      <_Parameter1>Configuration</_Parameter1>
+      <_Parameter2>$(Configuration)</_Parameter2>
+    </AssemblyAttribute>
+  </ItemGroup>
+
+</Project>

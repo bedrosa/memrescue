@@ -3,11 +3,12 @@
 //! Implementaciones actuales (todas de **solo lectura**):
 //! - [`ImageFile`]: imagen sector a sector (RAW/IMG/DD).
 //! - [`MemDevice`]: búfer en memoria (pruebas).
-//! - [`FaultyDevice`]: envoltorio que simula sectores ilegibles (pruebas del lector tolerante).
+//! - [`FaultyDevice`]: envoltorio que simula sectores ilegibles y regiones dispersas (pruebas).
+//! - [`RangeView`]: rango de sectores de otro dispositivo presentado como dispositivo propio.
 //!
 //! El acceso a dispositivos físicos está **prohibido** en esta fase: ver [`path_policy`].
-//! Los contenedores (VHD, VHDX, VMDK, E01…) se **detectan** ([`format`]) pero no se interpretan
-//! todavía, para no confundir su contenido con un disco RAW.
+//! Los contenedores (VHD, VHDX, VMDK…) se **detectan** aquí ([`format`]) y se interpretan en
+//! `mr-image`; [`ImageFile::open`] nunca los trata como RAW salvo petición explícita.
 
 pub mod fault;
 pub mod format;
@@ -18,9 +19,10 @@ pub mod resilient;
 pub mod view;
 
 pub use fault::FaultyDevice;
-pub use format::{probe_format, ImageFormat};
-pub use image::ImageFile;
+pub use format::{probe_file, probe_format, ImageFormat};
+pub use image::{read_exact_at, ImageFile};
 pub use mem::MemDevice;
+pub use view::RangeView;
 
 /// Estado de validez de cada sector entregado por una lectura. Toda exportación o recuperación debe
 /// conservarlo para no confundir datos sustituidos con datos reales.

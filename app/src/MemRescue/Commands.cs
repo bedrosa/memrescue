@@ -22,6 +22,9 @@ public static class Commands
     public static readonly RoutedUICommand LastSector = new("Último sector", nameof(LastSector), typeof(Commands),
         [new KeyGesture(Key.End, ModifierKeys.Control)]);
 
+    public static readonly RoutedUICommand OpenRange = new("Abrir rango de sectores como dispositivo", nameof(OpenRange), typeof(Commands),
+        [new KeyGesture(Key.R, ModifierKeys.Control | ModifierKeys.Shift)]);
+
     public static readonly RoutedUICommand CopyHex = new("Copiar volcado hexadecimal", nameof(CopyHex), typeof(Commands),
         [new KeyGesture(Key.C, ModifierKeys.Control | ModifierKeys.Shift)]);
 }

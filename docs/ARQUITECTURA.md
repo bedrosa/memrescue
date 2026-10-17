@@ -126,22 +126,23 @@ ni se simulan).
 - Fuzzing de cada parser; pruebas con imágenes corrompidas de forma determinista.
 - Escritura física deshabilitada en compilación hasta el hito correspondiente (ADR-006).
 
-## 7. Estado implementado (M1 iteración 1, 2026-10-17)
+## 7. Estado implementado (M1 iteración 2, 2026-10-17)
 
 | Componente | Ubicación | Qué hace hoy | Pruebas |
 |---|---|---|---|
 | `mr-common` | `core/mr-common` | `Lba`, `ByteRange` con aritmética comprobada; `Confidence`; hashes CRC-32/MD5/SHA-1/SHA-256 incrementales | 6 unitarias |
-| `mr-io` | `core/mr-io` | `BlockDevice` (+ `read_sectors`, `sector_span`); `path_policy` (lista blanca de rutas, ADR-014); `ImageFile`; `format` (detección de contenedores, ADR-015); `resilient` (lectura tolerante); `FaultyDevice`; `MemDevice` | 26 unitarias |
+| `mr-io` | `core/mr-io` | `BlockDevice` (+ `read_sectors`, `sector_span`, `allocation`); `path_policy` (lista blanca de rutas, ADR-014); `ImageFile`; `format` (detección de contenedores, ADR-015); `resilient` (lectura tolerante con mapa de validez, salto y lectura hacia atrás, ADR-019); `RangeView` (rango como dispositivo); `FaultyDevice` (ilegibles, intermitentes, dispersos, recuento de lecturas); `MemDevice` | 51 unitarias |
+| `mr-image` | `core/mr-image` | `open_image`/`open_split` (apertura unificada); VHD fijo/dinámico; VHDX fijo/dinámico + CRC-32C; VMDK monolithicSparse + intérprete de descriptores; imágenes divididas; `Reblocked` (ADR-017/018) | 56 unitarias + 15 de divididas + 8 contra qemu-img |
 | `mr-store` | `core/mr-store` | SQLite v1 con propietario exclusivo, `synchronous=FULL`, `quick_check`, transiciones atómicas (ADR-016) | 11 unitarias |
-| `mr-api` | `core/mr-api` | Tareas (pánicos capturados), `open_source`, `read_sectors`, hashes, verificación | 11 unitarias |
-| `mr-ffi` | `core/mr-ffi` | `memrescue_core.dll`, ABI 2 ([API_FFI.md](API_FFI.md)) | 13 unitarias |
-| `memrescue-cli` | `cli/` | `version`, `probe`, `image-info`, `sectors`, `verify`, `hash`, `db-init`, `jobs` | 7 extremo a extremo + 3 contra corpus |
-| `MemRescue.Core.Interop` | `app/src/MemRescue.Core.Interop` | `Engine`, `Source`, `HashTask`, `VerifyTask` (`EngineHandle` con finalizador), `HexDump` | 47 xUnit |
-| `MemRescue` (WPF) | `app/src/MemRescue` | Menús del flujo de referencia; orígenes; visor de sectores con navegación; propiedades; hashes; comprobación de legibilidad; registro; `--selftest`/`--screenshot` | Autodiagnóstico 512 y 4096 B en `scripts/test.ps1` |
+| `mr-api` | `core/mr-api` | Tareas (pánicos capturados), `OpenSource` (`Arc<dyn BlockDevice>` + metadatos), `open_with`/`open_split_source`/`open_range`, `read_sectors`/`read_sectors_mapped`, hashes estrictos, verificación | 13 unitarias + 1 de extremo a extremo con qemu-img (15 conversiones del corpus) |
+| `mr-ffi` | `core/mr-ffi` | `memrescue_core.dll`, ABI 3 ([API_FFI.md](API_FFI.md)) | 16 unitarias |
+| `memrescue-cli` | `cli/` | `version`, `probe`, `image-info`, `split-list`, `sectors` (con estado por sector), `verify` (`--jump`, `--read-back`), `hash`, `db-init`, `jobs`; opciones `--force-raw`, `--split`, `--range` | 8 extremo a extremo + 3 contra corpus |
+| `MemRescue.Core.Interop` | `app/src/MemRescue.Core.Interop` | `Engine`, `Source` (`OpenRange`, `ReadSectorsMapped`, `Description`), `HashTask`, `VerifyTask`, `SectorState`, `HexDump` | 52 xUnit |
+| `MemRescue` (WPF) | `app/src/MemRescue` | Menús del flujo de referencia; orígenes (contenedores, divididas con confirmación, rangos como dispositivo); visor con estado por sector, aviso de no fiables y barra de posición; propiedades; hashes; legibilidad con salto/lectura hacia atrás; registro; `--open`, `--selftest`, `--screenshot` | 9 pruebas UI Automation + autodiagnóstico 512 y 4096 B |
 | Generador y validador | `tests/generators` | Imágenes MBR/GPT deterministas + validador independiente + pruebas negativas | 128 comprobaciones + 9 corrupciones |
 
 No existe todavía: interpretación de particiones, sistemas de archivos, escaneo, recuperación, RAID,
-clonado, lectura de contenedores, acceso a dispositivos.
+clonado, contenedores diferenciales/EWF/QCOW/VDI/DMG, acceso a dispositivos.
 
 ## 8. Estructura del repositorio
 

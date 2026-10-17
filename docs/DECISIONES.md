@@ -212,3 +212,44 @@ corpus de referencia generado por una herramienta independiente.
 **Decisión.** Una base de trabajo SQLite pertenece a un solo `Store` a la vez (bloqueo exclusivo de
 `<base>.lock`). Con `synchronous=FULL` y `quick_check` al abrir. Así es seguro marcar como interrumpidos los
 trabajos huérfanos al abrir (REVISION_TECNICA_M1, S1–S5).
+
+---
+
+## ADR-017 · Formatos de contenedor: soporte por variante verificada (Aceptada, 2026-10-17)
+
+**Contexto.** Reconocer una cabecera no demuestra que se sepa leer el contenido (requisito del propietario).
+
+**Decisión.** Una variante de contenedor solo se declara soportada cuando su lectura completa coincide
+byte a byte (SHA-256 y rangos aleatorios) con la conversión a RAW hecha por una **referencia independiente**
+(qemu-img portable, `HERRAMIENTAS_TERCEROS.md`) y su mapa de regiones dispersas es coherente con
+`qemu-img map`. Hoy: VHD fijo/dinámico, VHDX fijo/dinámico, VMDK monolithicSparse. Todas las estructuras se
+validan contra el tamaño real del fichero con aritmética comprobada y memoria acotada (tablas ≤ 256 MiB);
+la estructura incoherente da `Corrupt`, nunca un pánico ni datos inventados. Si se pide un tamaño de sector
+distinto del nativo, se presentan los mismos bytes con otra división (`Reblocked`).
+
+---
+
+## ADR-018 · Referencias externas: nunca se siguen automáticamente (Aceptada, 2026-10-17)
+
+**Decisión.** Discos diferenciales (VHD/VHDX), padres y extensiones VMDK y descriptores VMDK separados
+devuelven `ExternalReference` con el nombre referenciado **como texto** (saneado y truncado). El motor nunca
+abre un fichero que no haya indicado el usuario: un descriptor malicioso con `..\..\Windows\…`, rutas
+absolutas o UNC no provoca ningún acceso. Las imágenes divididas tampoco se abren al descubrirlas: el motor
+lista los segmentos del **mismo directorio** y la apertura exige una petición explícita (`MR_OPEN_SPLIT`,
+confirmación en la interfaz). Abrir padres/extensiones será una operación explícita futura con la misma
+política de rutas.
+
+---
+
+## ADR-019 · Mapa de validez por sector obligatorio (Aceptada, 2026-10-17)
+
+**Contexto.** Requisito crítico del propietario: el relleno de sectores ilegibles no puede confundirse con
+datos.
+
+**Decisión.** Toda lectura tolerante entrega, junto a los datos, el estado de **cada** sector: `Read`,
+`Recovered`, `Unreadable`, `Skipped` o `Sparse`. Ilegibles (`BAD!`) y saltados (`SKIP`) llevan rellenos
+distintos y se marcan como no fiables en el motor, la ABI (`mr_source_read_mapped`, informe de
+verificación con los 5 recuentos), la CLI (código de salida 3) y el visor («NO FIABLE: patrón de relleno»).
+Las lecturas estrictas (`mr_source_read`) y los hashes fallan ante cualquier error: nunca se calcula un hash
+sobre bytes sustituidos. Los ceros de regiones dispersas son legítimos (`Sparse`, fiables). Detalle en
+`formatos/mapa-de-validez.md`.

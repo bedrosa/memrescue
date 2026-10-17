@@ -81,6 +81,17 @@ fn verify_and_probe() {
         .unwrap();
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     assert!(String::from_utf8_lossy(&o.stdout).contains("\"sectors\":2048,\"ok\":2048,\"bad\":0"));
+    assert!(String::from_utf8_lossy(&o.stdout).contains(
+        "\"states\":{\"read\":2048,\"recovered\":0,\"unreadable\":0,\"skipped\":0,\"sparse\":0},\"untrusted_ranges\":[]"
+    ));
+    let o = cli()
+        .args(["verify", img.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(o.status.success());
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(out.contains("Sectores fiables (leídos, recuperados o dispersos): 2048 de 2048"));
+    assert!(out.contains("ilegibles   0"));
 
     let vmdk = dir.path().join("d.vmdk");
     std::fs::write(&vmdk, b"# Disk DescriptorFile\nversion=1\n").unwrap();
@@ -94,7 +105,60 @@ fn verify_and_probe() {
         .output()
         .unwrap();
     assert_eq!(o.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&o.stderr).contains("todavía no está soportado"));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("no soportada"));
+}
+
+#[test]
+fn split_range_and_sector_states() {
+    let dir = tempfile::tempdir().unwrap();
+    let data: Vec<u8> = (0..64 * 512).map(|i| (i / 512) as u8).collect();
+    for (n, part) in data.chunks(20 * 512).enumerate() {
+        std::fs::write(dir.path().join(format!("s.{:03}", n + 1)), part).unwrap();
+    }
+    let first = dir.path().join("s.001");
+    let f = first.to_str().unwrap();
+    let o = cli().args(["split-list", f]).output().unwrap();
+    assert!(o.status.success());
+    assert_eq!(String::from_utf8_lossy(&o.stdout).lines().count(), 4);
+    let o = cli()
+        .args(["image-info", f, "--split", "--json"])
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(out.contains("\"sector_count\":64"), "{out}");
+    assert!(out.contains("4 segmentos"), "{out}");
+    // Rango 30..40 de la imagen dividida: su LBA 5 es la 35 del conjunto (cruza segmentos).
+    let o = cli()
+        .args(["sectors", f, "--split", "--range", "30:10", "--lba", "5"])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        out.contains("== LBA 5 (desplazamiento 2560 = 0xA00) [leído]"),
+        "{out}"
+    );
+    assert!(out.contains("23 23 23 23"), "{out}");
+    let o = cli()
+        .args(["sectors", f, "--split", "--range", "30:10", "--lba", "10"])
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(1));
+    let o = cli().args(["verify", f, "--read-back"]).output().unwrap();
+    assert_eq!(o.status.code(), Some(2));
+    let o = cli()
+        .args(["hash", f, "--split", "--json"])
+        .output()
+        .unwrap();
+    assert!(o.status.success());
+    // Mismo hash que el contenido concatenado.
+    let whole = dir.path().join("whole.img");
+    std::fs::write(&whole, &data).unwrap();
+    let o2 = cli()
+        .args(["hash", whole.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(o.stdout, o2.stdout);
 }
 
 #[test]

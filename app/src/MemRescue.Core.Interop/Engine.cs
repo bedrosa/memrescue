@@ -1,4 +1,4 @@
-using System.Text;
+﻿using System.Text;
 
 namespace MemRescue.Core.Interop;
 
@@ -17,6 +17,12 @@ public enum EngineStatus
     TaskFailed = 9,
     UnsupportedFormat = 10,
     OutOfRange = 11,
+    /// <summary>Estructura del contenedor dañada o incoherente.</summary>
+    Corrupt = 12,
+    /// <summary>El contenedor necesita otro fichero (padre, extensión) que no se abre.</summary>
+    ExternalReference = 13,
+    /// <summary>Variante del formato aún no soportada.</summary>
+    UnsupportedFeature = 14,
     Panic = 99,
 }
 
@@ -54,24 +60,72 @@ public enum ImageFormat : uint
     Dmg = 9,
 }
 
+/// <summary>Estado de validez de un sector entregado por el motor.</summary>
+public enum SectorState : byte
+{
+    /// <summary>Leído al primer intento.</summary>
+    Read = 0,
+    /// <summary>Leído tras reintentos.</summary>
+    Recovered = 1,
+    /// <summary>Ilegible: el contenido es un patrón de relleno, NO datos.</summary>
+    Unreadable = 2,
+    /// <summary>No leído (salto sobre zona dañada): patrón de relleno, NO datos.</summary>
+    Skipped = 3,
+    /// <summary>No asignado en el contenedor: ceros legítimos.</summary>
+    Sparse = 4,
+}
+
+public static class SectorStateExtensions
+{
+    /// <summary><c>true</c> si el contenido representa fielmente el origen.</summary>
+    public static bool IsTrustworthy(this SectorState s) => s is not (SectorState.Unreadable or SectorState.Skipped);
+
+    public static string Label(this SectorState s) => s switch
+    {
+        SectorState.Read => "leído",
+        SectorState.Recovered => "recuperado tras reintentos",
+        SectorState.Unreadable => "ILEGIBLE: bytes de relleno, no datos",
+        SectorState.Skipped => "SALTADO (no leído): bytes de relleno, no datos",
+        SectorState.Sparse => "disperso (ceros del formato)",
+        _ => "desconocido",
+    };
+}
+
 /// <summary>Error devuelto por el motor, con su código y el mensaje de mr_last_error.</summary>
 public sealed class EngineException(EngineStatus status, string message) : Exception(message)
 {
     public EngineStatus Status { get; } = status;
 }
 
-public readonly record struct ImageInfo(string Path, ulong SizeBytes, uint SectorSize, ulong SectorCount, ulong TrailingBytes);
+public readonly record struct ImageInfo(
+    string Path, ulong SizeBytes, uint SectorSize, ulong SectorCount, ulong TrailingBytes,
+    ImageFormat Format = ImageFormat.Raw);
 
 public readonly record struct TaskProgress(ulong Done, ulong Total)
 {
     public double Fraction => Total == 0 ? 0 : (double)Done / Total;
 }
 
-public readonly record struct BadRange(ulong Lba, ulong Count);
+/// <summary>Tramo no fiable (ilegible o saltado) del mapa de validez.</summary>
+public readonly record struct UntrustedRange(ulong Lba, ulong Count, SectorState State);
 
 public sealed record VerifyReport(
-    ulong SectorsRequested, ulong SectorsOk, ulong SectorsBad, ulong RetryReads,
-    IReadOnlyList<BadRange> BadRanges, bool BadRangesTruncated);
+    ulong SectorsRequested, ulong SectorsRead, ulong SectorsRecovered, ulong SectorsUnreadable,
+    ulong SectorsSkipped, ulong SectorsSparse, ulong RetryReads,
+    IReadOnlyList<UntrustedRange> UntrustedRanges, bool RangesTruncated)
+{
+    /// <summary>Sectores cuyo contenido representa fielmente el origen.</summary>
+    public ulong SectorsTrustworthy => SectorsRead + SectorsRecovered + SectorsSparse;
+
+    /// <summary><c>true</c> si ningún sector es ilegible ni se saltó.</summary>
+    public bool AllTrustworthy => SectorsUnreadable == 0 && SectorsSkipped == 0;
+}
+
+/// <summary>Sectores leídos con el estado de cada uno.</summary>
+public sealed record MappedSectors(byte[] Data, SectorState[] States)
+{
+    public bool AllTrustworthy => States.All(s => s.IsTrustworthy());
+}
 
 /// <summary>Punto de entrada seguro al motor de MemRescue.</summary>
 public static class Engine
@@ -105,30 +159,44 @@ public static class Engine
         return Enum.IsDefined(typeof(ImageFormat), f) ? (ImageFormat)f : ImageFormat.Unknown;
     }
 
-    public static ImageInfo GetImageInfo(string path, uint sectorSize = 512)
+    public static ImageInfo GetImageInfo(string path, uint sectorSize = 0)
     {
         var p = Utf8(path);
         Check(NativeMethods.mr_image_info_get(p, (nuint)p.Length, sectorSize, out var i));
-        return new ImageInfo(path, i.SizeBytes, i.SectorSize, i.SectorCount, i.TrailingBytes);
+        return ToInfo(path, i);
     }
 
-    /// <summary>Abre una imagen RAW en solo lectura.</summary>
+    /// <summary>Abre una imagen (RAW, VHD, VHDX o VMDK monolithicSparse) en solo lectura.</summary>
     /// <param name="path">Fichero de imagen; las rutas de dispositivo se rechazan.</param>
-    /// <param name="sectorSize">Tamaño de sector lógico (potencia de 2, 512–65536).</param>
+    /// <param name="sectorSize">Tamaño de sector lógico (potencia de 2, 512–65536); 0 = nativo del formato.</param>
     /// <param name="forceRaw">Interpretar como RAW aunque parezca un contenedor (VHD, VMDK…).</param>
-    public static Source OpenSource(string path, uint sectorSize = 512, bool forceRaw = false)
+    /// <param name="split">Abrir la imagen dividida que empieza en <paramref name="path"/> (x.001).</param>
+    public static Source OpenSource(string path, uint sectorSize = 0, bool forceRaw = false, bool split = false)
     {
         var p = Utf8(path);
-        Check(NativeMethods.mr_source_open(p, (nuint)p.Length, sectorSize, forceRaw ? 1u : 0u, out var h));
+        var flags = (forceRaw ? NativeMethods.OpenForceRaw : 0) | (split ? NativeMethods.OpenSplit : 0);
+        Check(NativeMethods.mr_source_open(p, (nuint)p.Length, sectorSize, flags, out var h));
         return new Source(h, path);
     }
+
+    /// <summary>Lista los segmentos de una imagen dividida (x.001, x.002…) sin abrirlos.</summary>
+    public static IReadOnlyList<string> DiscoverSplit(string firstSegment)
+    {
+        var p = Utf8(firstSegment);
+        var text = ReadString((b, c) => (NativeMethods.mr_split_discover(p, (nuint)p.Length, b, c, out var n, out _), n));
+        return text.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+    }
+
+    internal static ImageInfo ToInfo(string path, MrImageInfo i) =>
+        new(path, i.SizeBytes, i.SectorSize, i.SectorCount, i.TrailingBytes,
+            Enum.IsDefined(typeof(ImageFormat), i.Format) ? (ImageFormat)i.Format : ImageFormat.Unknown);
 
     /// <summary>Inicia el cálculo de hashes de una imagen en segundo plano (solo lectura).</summary>
     /// <param name="path">Fichero de imagen; las rutas de dispositivo se rechazan.</param>
     /// <param name="algorithms">Uno o varios algoritmos.</param>
     /// <param name="sectorSize">Tamaño de sector lógico (potencia de 2, 512–65536).</param>
     /// <param name="storePath">Base de datos de trabajo SQLite opcional donde registrar el trabajo.</param>
-    public static HashTask StartHash(string path, HashAlgorithms algorithms, uint sectorSize = 512, string? storePath = null)
+    public static HashTask StartHash(string path, HashAlgorithms algorithms, uint sectorSize = 0, string? storePath = null)
     {
         var p = Utf8(path);
         var s = storePath is null ? null : Utf8(storePath);
@@ -212,19 +280,55 @@ public abstract class EngineHandle : IDisposable
     }
 }
 
-/// <summary>Origen abierto en el motor (imagen RAW, solo lectura).</summary>
+/// <summary>Origen abierto en el motor (imagen, contenedor, imagen dividida o rango; solo lectura).</summary>
 public sealed class Source : EngineHandle
 {
-    internal Source(ulong handle, string path) : base(handle)
+    internal Source(ulong handle, string path, ulong? rangeStart = null) : base(handle)
     {
         Path = path;
+        RangeStart = rangeStart;
         Engine.Check(NativeMethods.mr_source_info(Handle, out var i));
-        Info = new ImageInfo(path, i.SizeBytes, i.SectorSize, i.SectorCount, i.TrailingBytes);
+        Info = Engine.ToInfo(path, i);
+        Description = Engine.ReadString((b, c) => (NativeMethods.mr_source_describe(Handle, b, c, out var n), n));
     }
 
     public string Path { get; }
 
     public ImageInfo Info { get; }
+
+    /// <summary>Descripción legible (variante del contenedor, segmentos, rango…).</summary>
+    public string Description { get; }
+
+    /// <summary>Si es un rango de otro origen, su LBA inicial en el padre.</summary>
+    public ulong? RangeStart { get; }
+
+    /// <summary>Abre <paramref name="count"/> sectores desde <paramref name="startLba"/> como un origen independiente.</summary>
+    public Source OpenRange(ulong startLba, ulong count)
+    {
+        Engine.Check(NativeMethods.mr_source_open_range(Handle, startLba, count, out var h));
+        return new Source(h, Path, startLba);
+    }
+
+    /// <summary>
+    /// Lee sectores tolerando errores, con el estado de cada uno. Los ilegibles llegan con un patrón
+    /// de relleno que NUNCA debe presentarse como datos: consulte <see cref="MappedSectors.States"/>.
+    /// </summary>
+    public MappedSectors ReadSectorsMapped(ulong lba, uint count, uint retries = 1)
+    {
+        if (count == 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(count));
+        }
+        var len = checked((int)(count * Info.SectorSize));
+        var buf = new byte[len];
+        var states = new byte[count];
+        Engine.Check(NativeMethods.mr_source_read_mapped(Handle, lba, count, retries, buf, (nuint)buf.Length, states, (nuint)states.Length, out var n));
+        if ((int)n != len)
+        {
+            throw new EngineException(EngineStatus.Io, $"Lectura incompleta: {n} de {len} bytes.");
+        }
+        return new MappedSectors(buf, states.Select(s => (SectorState)s).ToArray());
+    }
 
     /// <summary>Lee <paramref name="count"/> sectores completos desde <paramref name="lba"/>.</summary>
     public byte[] ReadSectors(ulong lba, uint count)
@@ -250,13 +354,16 @@ public sealed class Source : EngineHandle
         return new HashTask(h, algorithms);
     }
 
-    /// <summary>Lee todos los sectores (o un rango) tolerando errores e informa de los ilegibles.</summary>
+    /// <summary>Lee todos los sectores (o un rango) tolerando errores e informa del estado de cada uno.</summary>
     /// <param name="startLba">Primer sector.</param>
     /// <param name="count">Nº de sectores; 0 = hasta el final.</param>
     /// <param name="retries">Reintentos por sector ilegible (0–100).</param>
-    public VerifyTask StartVerify(ulong startLba = 0, ulong count = 0, uint retries = 1)
+    /// <param name="jumpSectors">Tras un sector ilegible, saltar estos sectores sin leerlos (0 = no saltar).</param>
+    /// <param name="readBack">Tras un salto, leer hacia atrás hasta el siguiente error.</param>
+    public VerifyTask StartVerify(ulong startLba = 0, ulong count = 0, uint retries = 1, ulong jumpSectors = 0, bool readBack = false)
     {
-        Engine.Check(NativeMethods.mr_source_verify_start(Handle, startLba, count, retries, out var h));
+        Engine.Check(NativeMethods.mr_source_verify_start(Handle, startLba, count, retries, jumpSectors,
+            readBack ? NativeMethods.VerifyReadBack : 0, out var h));
         return new VerifyTask(h);
     }
 
@@ -341,12 +448,13 @@ public sealed class VerifyTask : EngineTask
     public VerifyReport GetReport()
     {
         Engine.Check(NativeMethods.mr_verify_result(Handle, out var r));
-        var ranges = new List<BadRange>(checked((int)Math.Min(r.BadRangeCount, 100_000)));
-        for (ulong i = 0; i < r.BadRangeCount; i++)
+        var ranges = new List<UntrustedRange>(checked((int)Math.Min(r.UntrustedRangeCount, 100_000)));
+        for (ulong i = 0; i < r.UntrustedRangeCount; i++)
         {
-            Engine.Check(NativeMethods.mr_verify_bad_range(Handle, i, out var lba, out var count));
-            ranges.Add(new BadRange(lba, count));
+            Engine.Check(NativeMethods.mr_verify_untrusted_range(Handle, i, out var lba, out var count, out var state));
+            ranges.Add(new UntrustedRange(lba, count, (SectorState)state));
         }
-        return new VerifyReport(r.SectorsRequested, r.SectorsOk, r.SectorsBad, r.RetryReads, ranges, r.BadRangesTruncated != 0);
+        return new VerifyReport(r.SectorsRequested, r.SectorsRead, r.SectorsRecovered, r.SectorsUnreadable,
+            r.SectorsSkipped, r.SectorsSparse, r.RetryReads, ranges, r.RangesTruncated != 0);
     }
 }

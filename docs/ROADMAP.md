@@ -33,7 +33,7 @@ Resultado en `PROGRESO.md` (etapa 3). Pendiente heredado: oráculo de terceros p
 - Esqueleto de `mr-api` (tareas, progreso, cancelación) y `memrescue-cli`.
 - **Salida**: build reproducible; primeras imágenes del corpus con hashes.
 
-## M1 · Capa de bloques e imágenes (solo lectura): **EN CURSO** (iteración 1 entregada 2026-10-17)
+## M1 · Capa de bloques e imágenes (solo lectura): **EN CURSO** (iteración 2 entregada 2026-10-17; pendiente de revisión)
 
 Hecho en la iteración 1 (detalle en `PROGRESO.md`, etapa 4):
 - ✔ Revisión técnica previa con 25 correcciones y pruebas de regresión (`REVISION_TECNICA_M1.md`).
@@ -44,13 +44,25 @@ Hecho en la iteración 1 (detalle en `PROGRESO.md`, etapa 4):
 - ✔ Detección de contenedores (VHD, VHDX, VMDK, EWF, QCOW, VDI, DMG) como punto de extensión.
 - ✔ ABI 2, CLI (`probe`, `sectors`, `verify`), interfaz WPF: visor de sectores, navegación, comprobación de legibilidad.
 
+Hecho en la iteración 2 (detalle en `PROGRESO.md`, etapa 5):
+- ✔ qemu-img 11.1.2 portable con procedencia verificada (firmas MSYS2) como referencia independiente,
+  fuera de Git y del producto (`HERRAMIENTAS_TERCEROS.md`).
+- ✔ VHD fijo y dinámico, VHDX fijo y dinámico, VMDK monolithicSparse (`mr-image`), probados byte a byte
+  contra qemu-img; diferenciales, padres y extensiones externas → `ExternalReference` (nunca se abren).
+- ✔ Mapa de validez por sector (leído / recuperado / ilegible / saltado / disperso) en todo el motor, la
+  ABI 3, la CLI y el visor; el relleno nunca se presenta como dato.
+- ✔ Salto sobre sectores malos y lectura hacia atrás (IO-07), relleno distinto para saltados (IO-08).
+- ✔ Rango de sectores como dispositivo (`RangeView`), imágenes divididas (IM-02, lectura), adaptador de
+  tamaño de sector para contenedores.
+- ✔ Prueba automática de la interfaz (UI Automation, 9 pruebas), barra de posición para imágenes grandes.
+
 Pendiente en M1 (no se avanza a M2 sin revisión del propietario):
-- `PartitionView` (vista de un rango como dispositivo), `NullDevice`, imágenes divididas (IM-02).
-- Salto sobre sectores malos y lectura hacia atrás (IO-07), relleno de saltados, omitir por código (IO-09).
-- **VHD/VHDX/VMDK (IM-03…05)**: bloqueados por falta de un generador/oráculo independiente sin
-  administrador (qemu-img no instalado; `New-VHD`/`diskpart` requieren administrador). Opciones: autorizar
-  qemu-img portable, WSL o una VM; o aceptar VHD fijo generado por el generador propio (limitación documentada).
-- Prueba automática de la interfaz (UI Automation) para la navegación.
+- `NullDevice`; omitir errores por código (IO-09).
+- VHD/VHDX diferenciales, VHDX con registro pendiente, VMDK streamOptimized / multiextensión / flat
+  (exigen abrir otros ficheros con confirmación explícita del usuario o descomprimir).
+- Patrones de relleno configurables desde la interfaz; colores por estado dentro del volcado.
+- Decidir si una tabla de asignación parcialmente dañada debe abrirse marcando los bloques afectados como
+  ilegibles (hoy se rechaza la imagen entera: opción conservadora).
 
 - **Paridad objetivo**: IM-01, IM-02, IM-03, IM-04, IM-05, IO-06…IO-09 (simulados).
 

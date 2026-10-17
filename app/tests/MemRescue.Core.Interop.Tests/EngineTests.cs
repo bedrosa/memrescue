@@ -30,11 +30,11 @@ public sealed class EngineTests : IDisposable
     [Fact]
     public void AbiVersionMatchesAndStructLayoutsMatchHeader()
     {
-        Assert.Equal(2u, Engine.AbiVersion);
+        Assert.Equal(3u, Engine.AbiVersion);
         Engine.EnsureCompatible();
         Assert.Equal(32, Marshal.SizeOf<MrImageInfo>());
         Assert.Equal(24, Marshal.SizeOf<MrTaskStatus>());
-        Assert.Equal(48, Marshal.SizeOf<MrVerifyReport>());
+        Assert.Equal(72, Marshal.SizeOf<MrVerifyReport>());
     }
 
     [Fact]
@@ -110,11 +110,20 @@ public sealed class EngineTests : IDisposable
         "vhdxfile"u8.CopyTo(bytes);
         var p = TempFile("d.vhdx", bytes);
         Assert.Equal(ImageFormat.Vhdx, Engine.Probe(p));
+        // Firma VHDX sin estructuras válidas: se rechaza como dañado, nunca se lee como RAW por error.
         var ex = Assert.Throws<EngineException>(() => Engine.OpenSource(p));
-        Assert.Equal(EngineStatus.UnsupportedFormat, ex.Status);
+        Assert.Equal(EngineStatus.Corrupt, ex.Status);
         Assert.Contains("VHDX", ex.Message);
         using var forced = Engine.OpenSource(p, 512, forceRaw: true);
         Assert.Equal(8ul, forced.Info.SectorCount);
+        Assert.Equal(ImageFormat.Raw, forced.Info.Format);
+        Assert.Contains("forzado", forced.Description);
+        // Contenedor detectado sin lector (QCOW): formato no soportado.
+        var q = new byte[4096];
+        "QFI"u8.CopyTo(q);
+        q[3] = 0xFB;
+        Assert.Equal(EngineStatus.UnsupportedFormat,
+            Assert.Throws<EngineException>(() => Engine.OpenSource(TempFile("d.qcow2", q))).Status);
         Assert.Equal(ImageFormat.Raw, Engine.Probe(Numbered("r.img", 2, 512)));
     }
 
@@ -155,8 +164,9 @@ public sealed class EngineTests : IDisposable
         Assert.Equal(EngineTaskState.Completed, await t.WaitAsync(new SyncProgress(x => last = x)));
         Assert.Equal(new TaskProgress(3000, 3000), last);
         var r = t.GetReport();
-        Assert.Equal((3000ul, 3000ul, 0ul), (r.SectorsRequested, r.SectorsOk, r.SectorsBad));
-        Assert.Empty(r.BadRanges);
+        Assert.Equal((3000ul, 3000ul, 0ul, 0ul), (r.SectorsRequested, r.SectorsRead, r.SectorsUnreadable, r.SectorsSkipped));
+        Assert.True(r.AllTrustworthy);
+        Assert.Empty(r.UntrustedRanges);
         Assert.Equal(EngineStatus.InvalidArgument,
             Assert.Throws<EngineException>(() => src.StartVerify(retries: 1000)).Status);
     }

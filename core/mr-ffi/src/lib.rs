@@ -5,10 +5,10 @@
 //! Orígenes y tareas viven en un registro indexado por handles numéricos (nunca punteros).
 
 use mr_api::task::{Task, TaskState};
-use mr_api::{ApiError, HashOptions, HashResult, Source, VerifyOptions};
+use mr_api::{ApiError, HashOptions, HashResult, OpenOptions, Source, VerifyOptions};
 use mr_common::HashAlgorithm;
 use mr_io::resilient::{OnError, ReadPolicy, ReadReport};
-use mr_io::{BlockDevice, ImageFile, IoError};
+use mr_io::{BlockDevice, IoError, SectorState};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-pub const ABI_VERSION: u32 = 2;
+pub const ABI_VERSION: u32 = 3;
 pub const MAX_STRING_BYTES: usize = 65536;
 
 pub const MR_OK: i32 = 0;
@@ -31,6 +31,18 @@ pub const MR_ERR_BUFFER_TOO_SMALL: i32 = 8;
 pub const MR_ERR_TASK_FAILED: i32 = 9;
 pub const MR_ERR_UNSUPPORTED_FORMAT: i32 = 10;
 pub const MR_ERR_OUT_OF_RANGE: i32 = 11;
+pub const MR_ERR_CORRUPT: i32 = 12;
+pub const MR_ERR_EXTERNAL_REFERENCE: i32 = 13;
+pub const MR_ERR_UNSUPPORTED_FEATURE: i32 = 14;
+
+/// `mr_source_open`: leer como RAW aunque parezca un contenedor.
+pub const MR_OPEN_FORCE_RAW: u32 = 1;
+/// `mr_source_open`: abrir la imagen dividida que empieza en la ruta indicada.
+pub const MR_OPEN_SPLIT: u32 = 2;
+/// `mr_source_verify_start`: leer hacia atrás tras un salto.
+pub const MR_VERIFY_READ_BACK: u32 = 1;
+/// Máximo de reintentos por sector aceptado en la frontera C.
+pub const MAX_RETRIES: u32 = 100;
 pub const MR_ERR_PANIC: i32 = 99;
 
 #[repr(C)]
@@ -40,7 +52,8 @@ pub struct MrImageInfo {
     pub sector_count: u64,
     pub trailing_bytes: u64,
     pub sector_size: u32,
-    pub reserved: u32,
+    /// Código de `ImageFormat` con el que se interpreta (1 = RAW…).
+    pub format: u32,
 }
 
 #[repr(C)]
@@ -56,11 +69,16 @@ pub struct MrTaskStatus {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct MrVerifyReport {
     pub sectors_requested: u64,
-    pub sectors_ok: u64,
-    pub sectors_bad: u64,
+    pub sectors_read: u64,
+    pub sectors_recovered: u64,
+    pub sectors_unreadable: u64,
+    pub sectors_skipped: u64,
+    pub sectors_sparse: u64,
     pub retry_reads: u64,
-    pub bad_range_count: u64,
-    pub bad_ranges_truncated: u32,
+    /// Tramos no fiables (ilegibles o saltados) disponibles en `mr_verify_untrusted_range`.
+    pub untrusted_range_count: u64,
+    /// 1 si el mapa se truncó (los recuentos por estado siguen siendo exactos).
+    pub ranges_truncated: u32,
     pub reserved: u32,
 }
 
@@ -80,11 +98,10 @@ fn fail(code: i32, msg: impl Into<String>) -> i32 {
 fn io_error_code(e: &IoError) -> i32 {
     match e {
         IoError::DevicePathRejected(_) => MR_ERR_PATH_REJECTED,
-        // Provisional hasta la ABI 3 (integración de M1 iteración 2).
-        IoError::UnsupportedFormat(_)
-        | IoError::UnsupportedFeature { .. }
-        | IoError::ExternalReference { .. } => MR_ERR_UNSUPPORTED_FORMAT,
-        IoError::Corrupt { .. } => MR_ERR_IO,
+        IoError::UnsupportedFormat(_) => MR_ERR_UNSUPPORTED_FORMAT,
+        IoError::UnsupportedFeature { .. } => MR_ERR_UNSUPPORTED_FEATURE,
+        IoError::ExternalReference { .. } => MR_ERR_EXTERNAL_REFERENCE,
+        IoError::Corrupt { .. } => MR_ERR_CORRUPT,
         IoError::InvalidRange { .. }
         | IoError::OutOfBounds { .. }
         | IoError::RequestTooLarge { .. } => MR_ERR_OUT_OF_RANGE,
@@ -252,14 +269,19 @@ unsafe fn write_out<T>(out: *mut T, v: T) -> i32 {
     MR_OK
 }
 
-fn info_of(src: &ImageFile) -> MrImageInfo {
+fn info_of(src: &mr_api::OpenSource) -> MrImageInfo {
+    let i = src.info();
     MrImageInfo {
-        size_bytes: src.size(),
-        sector_count: src.sector_count(),
-        trailing_bytes: src.trailing_bytes(),
-        sector_size: src.sector_size(),
-        reserved: 0,
+        size_bytes: i.size_bytes,
+        sector_count: i.sector_count,
+        trailing_bytes: i.trailing_bytes,
+        sector_size: i.sector_size,
+        format: i.format.code(),
     }
+}
+
+fn state_code(s: SectorState) -> u8 {
+    s as u8
 }
 
 fn mask_bit(a: HashAlgorithm) -> u32 {
@@ -379,7 +401,7 @@ pub unsafe extern "C" fn mr_source_open(
         if out_source.is_null() {
             return fail(MR_ERR_INVALID_ARGUMENT, "puntero de salida nulo");
         }
-        if flags & !1 != 0 {
+        if flags & !(MR_OPEN_FORCE_RAW | MR_OPEN_SPLIT) != 0 {
             return fail(MR_ERR_INVALID_ARGUMENT, "opciones de apertura no válidas");
         }
         // SAFETY: contrato del llamador.
@@ -387,15 +409,19 @@ pub unsafe extern "C" fn mr_source_open(
             Ok(p) => p,
             Err(c) => return c,
         };
-        let r = if flags & 1 != 0 {
-            ImageFile::open_as_raw(p, sector_size)
+        let opts = OpenOptions {
+            sector_size,
+            force_raw: flags & MR_OPEN_FORCE_RAW != 0,
+        };
+        let r = if flags & MR_OPEN_SPLIT != 0 {
+            mr_api::open_split_source(p, opts)
         } else {
-            ImageFile::open(p, sector_size)
+            mr_api::open_with(p, opts)
         };
         match r {
             // SAFETY: `out_source` no es nulo.
-            Ok(img) => unsafe { write_out(out_source, insert(Entry::Source(Arc::new(img)))) },
-            Err(e) => fail(io_error_code(&e), e.to_string()),
+            Ok(src) => unsafe { write_out(out_source, insert(Entry::Source(src))) },
+            Err(e) => api_fail(&e),
         }
     })
 }
@@ -408,6 +434,152 @@ pub unsafe extern "C" fn mr_source_info(source_h: u64, out: *mut MrImageInfo) ->
         // SAFETY: contrato del llamador.
         Ok(s) => unsafe { write_out(out, info_of(&s)) },
         Err(c) => c,
+    })
+}
+
+/// Descripción legible del origen (variante del contenedor, segmentos, rango…).
+///
+/// # Safety
+/// Ver contrato de cadenas de salida.
+#[no_mangle]
+pub unsafe extern "C" fn mr_source_describe(
+    source_h: u64,
+    buf: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> i32 {
+    guard(|| match source(source_h) {
+        // SAFETY: contrato del llamador.
+        Ok(s) => unsafe { write_str(&s.info().description, buf, cap, out_len) },
+        Err(c) => c,
+    })
+}
+
+/// Lista (separada por saltos de línea) los segmentos de una imagen dividida, sin abrirlos.
+///
+/// # Safety
+/// `path` UTF-8 de `path_len` bytes; contrato de cadenas de salida; `out_count` válido o nulo.
+#[no_mangle]
+pub unsafe extern "C" fn mr_split_discover(
+    path: *const u8,
+    path_len: usize,
+    buf: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+    out_count: *mut u32,
+) -> i32 {
+    guard(|| {
+        // SAFETY: contrato del llamador.
+        let p = match unsafe { read_utf8(path, path_len) } {
+            Ok(p) => p,
+            Err(c) => return c,
+        };
+        let segs = match mr_api::discover_split(p) {
+            Ok(s) => s,
+            Err(e) => return api_fail(&e),
+        };
+        if !out_count.is_null() {
+            // SAFETY: puntero válido por contrato.
+            unsafe { *out_count = u32::try_from(segs.len()).unwrap_or(u32::MAX) };
+        }
+        let text = segs
+            .iter()
+            .map(|s| s.display().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        // SAFETY: contrato del llamador.
+        unsafe { write_str(&text, buf, cap, out_len) }
+    })
+}
+
+/// Abre `count` sectores de un origen desde `start_lba` como un origen nuevo (partición o rango).
+///
+/// # Safety
+/// `out_source` puntero válido.
+#[no_mangle]
+pub unsafe extern "C" fn mr_source_open_range(
+    source_h: u64,
+    start_lba: u64,
+    count: u64,
+    out_source: *mut u64,
+) -> i32 {
+    guard(|| {
+        if out_source.is_null() {
+            return fail(MR_ERR_INVALID_ARGUMENT, "puntero de salida nulo");
+        }
+        let parent = match source(source_h) {
+            Ok(s) => s,
+            Err(c) => return c,
+        };
+        match mr_api::open_range(&parent, start_lba, count) {
+            // SAFETY: `out_source` no es nulo.
+            Ok(src) => unsafe { write_out(out_source, insert(Entry::Source(src))) },
+            Err(e) => api_fail(&e),
+        }
+    })
+}
+
+/// Lectura tolerante para el visor: `buf` recibe los datos (relleno en los ilegibles) y `states`
+/// un byte por sector con su estado (0 leído, 1 recuperado, 2 ilegible, 3 saltado, 4 disperso).
+/// Devuelve `MR_OK` aunque haya sectores ilegibles: el llamador **debe** consultar `states`.
+///
+/// # Safety
+/// `buf` con `cap` bytes y `states` con `states_cap` bytes escribibles; `out_len` válido o nulo.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn mr_source_read_mapped(
+    source_h: u64,
+    lba: u64,
+    count: u32,
+    retries: u32,
+    buf: *mut u8,
+    cap: usize,
+    states: *mut u8,
+    states_cap: usize,
+    out_len: *mut usize,
+) -> i32 {
+    guard(|| {
+        if retries > MAX_RETRIES {
+            return fail(
+                MR_ERR_INVALID_ARGUMENT,
+                "demasiados reintentos (máximo 100)",
+            );
+        }
+        let s = match source(source_h) {
+            Ok(s) => s,
+            Err(c) => return c,
+        };
+        let len = match mr_io::sector_span(s.as_ref(), lba, u64::from(count)) {
+            Ok((_, len)) => len,
+            Err(e) => return fail(io_error_code(&e), e.to_string()),
+        };
+        if !out_len.is_null() {
+            // SAFETY: puntero válido por contrato.
+            unsafe { *out_len = len };
+        }
+        let n = count as usize;
+        if buf.is_null() || cap < len || states.is_null() || states_cap < n {
+            return fail(
+                MR_ERR_BUFFER_TOO_SMALL,
+                format!("se necesitan {len} bytes de datos y {n} de estados"),
+            );
+        }
+        let (data, st) =
+            match mr_api::read_sectors_mapped(s.as_ref(), lba, u64::from(count), retries) {
+                Ok(v) => v,
+                Err(e) => return api_fail(&e),
+            };
+        if data.len() != len || st.len() != n {
+            return fail(MR_ERR_IO, "lectura incompleta del motor");
+        }
+        // SAFETY: `buf` tiene ≥ len bytes y `states` ≥ n bytes escribibles (comprobado arriba).
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), buf, len);
+            for (i, v) in st.iter().enumerate() {
+                *states.add(i) = state_code(*v);
+            }
+        }
+        MR_OK
     })
 }
 
@@ -608,13 +780,21 @@ pub unsafe extern "C" fn mr_source_verify_start(
     start_lba: u64,
     count: u64,
     retries: u32,
+    jump_sectors: u64,
+    flags: u32,
     out_task: *mut u64,
 ) -> i32 {
     guard(|| {
         if out_task.is_null() {
             return fail(MR_ERR_INVALID_ARGUMENT, "puntero de salida nulo");
         }
-        if retries > 100 {
+        if flags & !MR_VERIFY_READ_BACK != 0 {
+            return fail(
+                MR_ERR_INVALID_ARGUMENT,
+                "opciones de verificación no válidas",
+            );
+        }
+        if retries > MAX_RETRIES {
             return fail(
                 MR_ERR_INVALID_ARGUMENT,
                 "demasiados reintentos (máximo 100)",
@@ -630,6 +810,8 @@ pub unsafe extern "C" fn mr_source_verify_start(
             policy: ReadPolicy {
                 retries,
                 on_error: OnError::FillAndContinue,
+                jump_sectors,
+                read_back: flags & MR_VERIFY_READ_BACK != 0,
                 ..ReadPolicy::default()
             },
         };
@@ -647,6 +829,15 @@ pub unsafe extern "C" fn mr_source_verify_start(
             Err(e) => api_fail(&e),
         }
     })
+}
+
+/// Tramos no fiables `(lba, nº, estado)` del mapa de validez, en orden.
+fn untrusted_runs(r: &ReadReport) -> impl Iterator<Item = (u64, u64, SectorState)> + '_ {
+    r.map
+        .runs()
+        .iter()
+        .copied()
+        .filter(|t| !t.2.is_trustworthy())
 }
 
 fn with_verify<R>(task: u64, f: impl FnOnce(&ReadReport) -> R) -> Result<R, i32> {
@@ -675,11 +866,14 @@ pub unsafe extern "C" fn mr_verify_result(task: u64, out: *mut MrVerifyReport) -
     guard(|| {
         let rep = with_verify(task, |r| MrVerifyReport {
             sectors_requested: r.sectors_requested,
-            sectors_ok: r.sectors_read_ok,
-            sectors_bad: r.sectors_bad,
+            sectors_read: r.map.count(SectorState::Read),
+            sectors_recovered: r.map.count(SectorState::Recovered),
+            sectors_unreadable: r.map.count(SectorState::Unreadable),
+            sectors_skipped: r.map.count(SectorState::Skipped),
+            sectors_sparse: r.map.count(SectorState::Sparse),
             retry_reads: r.retry_reads,
-            bad_range_count: r.bad_ranges.len() as u64,
-            bad_ranges_truncated: u32::from(r.bad_ranges_truncated),
+            untrusted_range_count: untrusted_runs(r).count() as u64,
+            ranges_truncated: u32::from(r.map.truncated()),
             reserved: 0,
         });
         match rep {
@@ -690,30 +884,34 @@ pub unsafe extern "C" fn mr_verify_result(task: u64, out: *mut MrVerifyReport) -
     })
 }
 
+/// Tramo no fiable número `index` (estado 2 = ilegible, 3 = saltado).
+///
 /// # Safety
-/// `out_lba` y `out_count` deben ser punteros válidos.
+/// `out_lba`, `out_count` y `out_state` deben ser punteros válidos.
 #[no_mangle]
-pub unsafe extern "C" fn mr_verify_bad_range(
+pub unsafe extern "C" fn mr_verify_untrusted_range(
     task: u64,
     index: u64,
     out_lba: *mut u64,
     out_count: *mut u64,
+    out_state: *mut u32,
 ) -> i32 {
     guard(|| {
-        if out_lba.is_null() || out_count.is_null() {
+        if out_lba.is_null() || out_count.is_null() || out_state.is_null() {
             return fail(MR_ERR_INVALID_ARGUMENT, "puntero de salida nulo");
         }
         let r = with_verify(task, |rep| {
             usize::try_from(index)
                 .ok()
-                .and_then(|i| rep.bad_ranges.get(i).copied())
+                .and_then(|i| untrusted_runs(rep).nth(i))
         });
         match r {
-            Ok(Some((lba, count))) => {
+            Ok(Some((lba, count, state))) => {
                 // SAFETY: punteros no nulos y válidos por contrato.
                 unsafe {
                     out_lba.write(lba);
                     out_count.write(count);
+                    out_state.write(u32::from(state_code(state)));
                 }
                 MR_OK
             }

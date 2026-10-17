@@ -54,9 +54,13 @@ impl ImageFormat {
         self as u32
     }
 
-    /// `true` si MemRescue sabe leer este formato en la versión actual.
+    /// `true` si MemRescue tiene lector para este formato en la versión actual (la variante concreta
+    /// aún puede rechazarse al abrir: p. ej. VMDK streamOptimized o discos diferenciales).
     pub fn is_supported(self) -> bool {
-        matches!(self, ImageFormat::Raw)
+        matches!(
+            self,
+            ImageFormat::Raw | ImageFormat::Vhd | ImageFormat::Vhdx | ImageFormat::Vmdk
+        )
     }
 }
 
@@ -106,7 +110,8 @@ pub fn classify(head: &[u8], tail: &[u8]) -> ImageFormat {
     ImageFormat::Raw
 }
 
-pub(crate) fn probe_file(file: &File, size: u64) -> Result<ImageFormat> {
+/// Identifica el formato de un fichero ya abierto (lee la cabecera y la cola, nunca escribe).
+pub fn probe_file(file: &File, size: u64) -> Result<ImageFormat> {
     let n = size.min(512) as usize;
     let mut head = vec![0u8; n];
     read_exact_at(file, 0, &mut head)?;

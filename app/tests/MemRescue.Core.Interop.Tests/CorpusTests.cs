@@ -103,7 +103,8 @@ public sealed class CorpusTests
         using var v = src.StartVerify();
         Assert.Equal(EngineTaskState.Completed, await v.WaitAsync());
         var r = v.GetReport();
-        Assert.Equal(src.Info.SectorCount, r.SectorsOk);
-        Assert.Equal(0ul, r.SectorsBad);
+        Assert.Equal(src.Info.SectorCount, r.SectorsRead);
+        Assert.Equal(0ul, r.SectorsUnreadable);
+        Assert.True(r.AllTrustworthy);
     }
 }

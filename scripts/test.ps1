@@ -4,8 +4,10 @@
   Solo usa ficheros sintéticos; no accede a discos ni requiere administrador.
 .PARAMETER SkipGui
   Omite el autodiagnóstico que abre la ventana de MemRescue.exe.
+.PARAMETER SkipQemu
+  Omite las pruebas cruzadas de formatos contra qemu-img (si falta qemu-img y no se omiten, el paso falla).
 #>
-param([switch] $SkipGui)
+param([switch] $SkipGui, [switch] $SkipQemu)
 . "$PSScriptRoot\env.ps1"
 Set-Location $Root
 
@@ -33,8 +35,18 @@ $fingerprint = Get-ChildItem "$gen\*.img" | ForEach-Object {
 Step 'Corpus: validación independiente vs manifiestos versionados' { & $Python -I -X utf8 tests\generators\validate_partition_images.py $gen $refs }
 Step 'Corpus: pruebas negativas del validador' { & $Python -I -X utf8 tests\generators\test_validator.py $gen $refs }
 Step 'Rust: pruebas cruzadas con el corpus' { cargo test -p memrescue-cli --test corpus -- --ignored }
+if (-not $SkipQemu) {
+    # Referencia independiente: qemu-img portable verificado (docs/HERRAMIENTAS_TERCEROS.md). Solo se usa
+    # sobre imágenes temporales creadas por las pruebas, con convert/info/map (nunca reparación).
+    $qemu = Join-Path $Root '.tools\qemu\bin\qemu-img.exe'
+    Step 'Formatos: VHD/VHDX/VMDK y corpus contra qemu-img' {
+        if (-not (Test-Path $qemu)) { Write-Host "  No se encuentra $qemu (use -SkipQemu para omitir)"; $global:LASTEXITCODE = 1; return }
+        $env:MR_QEMU_IMG = $qemu
+        cargo test --release -p mr-image -p mr-api -- --ignored
+    }
+}
 Step '.NET: compilación (warnings = errores)' { & $Dotnet build app\MemRescue.slnx -c Debug }
-Step '.NET: pruebas de interop (xUnit)' { & $Dotnet test app\MemRescue.slnx -c Debug --no-build }
+Step '.NET: pruebas de interop y de interfaz (xUnit + UI Automation)' { & $Dotnet test app\MemRescue.slnx -c Debug --no-build }
 
 function Invoke-GuiSelfTest([string] $name) {
     $manifest = "$refs\$name.manifest.toml"

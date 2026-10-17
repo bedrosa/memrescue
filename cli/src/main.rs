@@ -3,9 +3,10 @@
 //! Todas las operaciones son de solo lectura y solo aceptan ficheros de imagen.
 
 use mr_api::task::TaskState;
-use mr_api::{HashOptions, ImageInfo, VerifyOptions};
+use mr_api::{HashOptions, ImageInfo, OpenOptions, Source, VerifyOptions};
 use mr_common::HashAlgorithm;
 use mr_io::resilient::{OnError, ReadPolicy};
+use mr_io::SectorState;
 use mr_store::Store;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -18,15 +19,24 @@ memrescue-cli: motor de MemRescue
 USO:
   memrescue-cli version
   memrescue-cli probe <fichero>
-  memrescue-cli image-info <imagen> [--sector-size N] [--json]
-  memrescue-cli sectors <imagen> --lba N [--count M] [--sector-size N]
-  memrescue-cli verify <imagen> [--sector-size N] [--retries N] [--json]
-  memrescue-cli hash <imagen> [--algo crc32,md5,sha1,sha256] [--sector-size N] [--db trabajo.mrdb] [--json]
+  memrescue-cli image-info <imagen> [ORIGEN] [--json]
+  memrescue-cli split-list <imagen.001>
+  memrescue-cli sectors <imagen> --lba N [--count M] [--retries N] [ORIGEN]
+  memrescue-cli verify <imagen> [--retries N] [--jump N] [--read-back] [ORIGEN] [--json]
+  memrescue-cli hash <imagen> [--algo crc32,md5,sha1,sha256] [ORIGEN] [--db trabajo.mrdb] [--json]
   memrescue-cli db-init <trabajo.mrdb>
   memrescue-cli jobs <trabajo.mrdb>
 
-Tamaños de sector habituales: 512, 1024, 2048, 4096 (potencia de 2 entre 512 y 65536).
-Códigos de salida: 0 correcto, 1 error de operación, 2 uso incorrecto, 3 verificación con sectores ilegibles.
+ORIGEN (opcional):
+  --sector-size N    tamaño de sector lógico (por defecto, el nativo del formato; 512 en RAW)
+  --force-raw        leer como volcado sector a sector aunque parezca un contenedor
+  --split            abrir la imagen dividida que empieza en <imagen.001> (ver split-list)
+  --range INI:NUM    trabajar solo con NUM sectores desde el LBA INI (partición o rango)
+
+Formatos: RAW, VHD (fijo/dinámico), VHDX (fijo/dinámico), VMDK monolithicSparse e imágenes
+divididas. Tamaños de sector habituales: 512, 1024, 2048, 4096.
+Códigos de salida: 0 correcto, 1 error de operación, 2 uso incorrecto,
+3 hay sectores no fiables (ilegibles o saltados; su contenido es un patrón de relleno).
 ";
 
 struct Args {
@@ -38,6 +48,11 @@ struct Args {
     lba: Option<u64>,
     count: u64,
     retries: u32,
+    force_raw: bool,
+    split: bool,
+    range: Option<(u64, u64)>,
+    jump: u64,
+    read_back: bool,
 }
 
 fn num<T: std::str::FromStr>(
@@ -52,13 +67,18 @@ fn num<T: std::str::FromStr>(
 fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut a = Args {
         positional: vec![],
-        sector_size: 512,
+        sector_size: 0,
         algos: vec![HashAlgorithm::Sha256],
         db: None,
         json: false,
         lba: None,
         count: 1,
         retries: 1,
+        force_raw: false,
+        split: false,
+        range: None,
+        jump: 0,
+        read_back: false,
     };
     while let Some(s) = it.next() {
         match s.as_str() {
@@ -66,6 +86,22 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
             "--lba" => a.lba = Some(num(&mut it, "--lba")?),
             "--count" => a.count = num(&mut it, "--count")?,
             "--retries" => a.retries = num(&mut it, "--retries")?,
+            "--jump" => a.jump = num(&mut it, "--jump")?,
+            "--read-back" => a.read_back = true,
+            "--force-raw" => a.force_raw = true,
+            "--split" => a.split = true,
+            "--range" => {
+                let v = it.next().ok_or("falta el valor de --range")?;
+                let (s, c) = v
+                    .split_once(':')
+                    .ok_or(format!("--range debe ser INI:NUM, no {v}"))?;
+                let parse = |x: &str| {
+                    x.trim()
+                        .parse::<u64>()
+                        .map_err(|_| format!("valor no válido para --range: {v}"))
+                };
+                a.range = Some((parse(s)?, parse(c)?));
+            }
             "--algo" => {
                 let v = it.next().ok_or("falta el valor de --algo")?;
                 a.algos = v
@@ -97,18 +133,51 @@ fn json_str(s: &str) -> String {
     o
 }
 
+/// Abre el origen indicado por los argumentos (formato automático, dividida, forzada, rango).
+fn open_src(a: &Args, p: &str) -> Result<Source, mr_api::ApiError> {
+    let opts = OpenOptions {
+        sector_size: a.sector_size,
+        force_raw: a.force_raw,
+    };
+    let src = if a.split {
+        mr_api::open_split_source(p, opts)?
+    } else {
+        mr_api::open_with(p, opts)?
+    };
+    match a.range {
+        Some((start, count)) => mr_api::open_range(&src, start, count),
+        None => Ok(src),
+    }
+}
+
 fn print_info(i: &ImageInfo, json: bool) {
     if json {
+        let segs: Vec<String> = i
+            .segments
+            .iter()
+            .map(|s| json_str(&s.display().to_string()))
+            .collect();
         println!(
-            "{{\"path\":{},\"size_bytes\":{},\"sector_size\":{},\"sector_count\":{},\"trailing_bytes\":{}}}",
+            "{{\"path\":{},\"format\":{},\"description\":{},\"size_bytes\":{},\"sector_size\":{},\"sector_count\":{},\"trailing_bytes\":{},\"segments\":[{}],\"range\":{}}}",
             json_str(&i.path.display().to_string()),
+            json_str(i.format.name()),
+            json_str(&i.description),
             i.size_bytes,
             i.sector_size,
             i.sector_count,
-            i.trailing_bytes
+            i.trailing_bytes,
+            segs.join(","),
+            match i.range {
+                Some((s, c)) => format!("[{s},{c}]"),
+                None => "null".into(),
+            }
         );
     } else {
         println!("Imagen:          {}", i.path.display());
+        println!("Formato:         {}", i.description);
+        if !i.segments.is_empty() {
+            println!("Segmentos:       {}", i.segments.len());
+        }
         println!("Tamaño:          {} bytes", i.size_bytes);
         println!("Tamaño sector:   {} bytes", i.sector_size);
         println!("Sectores:        {}", i.sector_count);
@@ -173,32 +242,63 @@ fn run(args: Vec<String>) -> Result<(), (u8, String)> {
             };
             println!("{} ({soporte})", f.name());
         }
+        "split-list" => {
+            let p = one(&a)?;
+            let segs = mr_api::discover_split(&p).map_err(|e| op(&e))?;
+            for s in &segs {
+                println!("{}", s.display());
+            }
+            eprintln!(
+                "{} segmentos (ábralos con --split; no se ha abierto ninguno)",
+                segs.len()
+            );
+        }
         "sectors" => {
             let p = one(&a)?;
             let lba = a.lba.ok_or_else(|| usage("falta --lba"))?;
             if a.count == 0 || a.count > 256 {
                 return Err(usage("--count debe estar entre 1 y 256"));
             }
-            let src = mr_api::open_source(&p, a.sector_size).map_err(|e| op(&e))?;
-            let data = mr_api::read_sectors(src.as_ref(), lba, a.count).map_err(|e| op(&e))?;
-            let ss = usize::try_from(a.sector_size).unwrap_or(512);
-            for (i, sector) in data.chunks(ss).enumerate() {
+            if a.retries > 100 {
+                return Err(usage("--retries debe estar entre 0 y 100"));
+            }
+            let src = open_src(&a, &p).map_err(|e| op(&e))?;
+            let ss = src.info().sector_size;
+            let (data, states) = mr_api::read_sectors_mapped(src.as_ref(), lba, a.count, a.retries)
+                .map_err(|e| op(&e))?;
+            let mut untrusted = 0u64;
+            for (i, (sector, st)) in data.chunks(ss as usize).zip(&states).enumerate() {
                 let l = lba + i as u64;
+                let off = l * u64::from(ss);
                 println!(
-                    "== LBA {l} (desplazamiento {} = 0x{:X})",
-                    l * u64::from(a.sector_size),
-                    l * u64::from(a.sector_size)
+                    "== LBA {l} (desplazamiento {off} = 0x{off:X}) [{}]",
+                    state_label_one(*st)
                 );
-                hexdump(l * u64::from(a.sector_size), sector);
+                if !st.is_trustworthy() {
+                    untrusted += 1;
+                    println!("!! NO FIABLE: el contenido mostrado es un patrón de relleno, NO datos del origen");
+                }
+                hexdump(off, sector);
+            }
+            if untrusted > 0 {
+                return Err((3, format!("{untrusted} sectores no fiables")));
             }
         }
         "verify" => {
             let p = one(&a)?;
-            let src = mr_api::open_source(&p, a.sector_size).map_err(|e| op(&e))?;
+            if a.retries > 100 {
+                return Err(usage("--retries debe estar entre 0 y 100"));
+            }
+            if a.read_back && a.jump == 0 {
+                return Err(usage("--read-back requiere --jump N (N > 0)"));
+            }
+            let src = open_src(&a, &p).map_err(|e| op(&e))?;
             let opts = VerifyOptions {
                 policy: ReadPolicy {
                     retries: a.retries,
                     on_error: OnError::FillAndContinue,
+                    jump_sectors: a.jump,
+                    read_back: a.read_back,
                     ..ReadPolicy::default()
                 },
                 ..VerifyOptions::default()
@@ -215,37 +315,68 @@ fn run(args: Vec<String>) -> Result<(), (u8, String)> {
                 eprintln!();
             }
             let r = task.wait().map_err(|e| op(&e))?;
+            let m = &r.map;
+            let ok = m.count(SectorState::Read) + m.count(SectorState::Recovered);
+            let bad = m.count(SectorState::Unreadable);
+            let untrusted = bad + m.count(SectorState::Skipped);
             if a.json {
-                let ranges: Vec<String> = r
-                    .bad_ranges
+                let ranges: Vec<String> = m
+                    .untrusted_runs()
+                    .filter(|t| t.2 == SectorState::Unreadable)
+                    .map(|(l, c, _)| format!("[{l},{c}]"))
+                    .collect();
+                let untrusted_runs: Vec<String> = m
+                    .untrusted_runs()
+                    .map(|(l, c, s)| format!("[{l},{c},\"{}\"]", state_name(s)))
+                    .collect();
+                let states: Vec<String> = SectorState::ALL
                     .iter()
-                    .map(|(l, c)| format!("[{l},{c}]"))
+                    .map(|&s| format!("\"{}\":{}", state_name(s), m.count(s)))
                     .collect();
                 println!(
-                    "{{\"sectors\":{},\"ok\":{},\"bad\":{},\"bad_ranges\":[{}]}}",
+                    "{{\"sectors\":{},\"ok\":{ok},\"bad\":{bad},\"bad_ranges\":[{}],\"states\":{{{}}},\"untrusted_ranges\":[{}],\"ranges_truncated\":{}}}",
                     r.sectors_requested,
-                    r.sectors_read_ok,
-                    r.sectors_bad,
-                    ranges.join(",")
+                    ranges.join(","),
+                    states.join(","),
+                    untrusted_runs.join(","),
+                    m.truncated()
                 );
             } else {
                 println!(
-                    "Sectores leídos correctamente: {} de {}",
-                    r.sectors_read_ok, r.sectors_requested
+                    "Sectores fiables (leídos, recuperados o dispersos): {} de {}",
+                    r.sectors_requested - untrusted,
+                    r.sectors_requested
                 );
-                println!("Sectores ilegibles: {}", r.sectors_bad);
-                for (l, c) in &r.bad_ranges {
-                    println!("  LBA {l} – {} ({c} sectores)", l + c - 1);
+                for s in SectorState::ALL {
+                    println!("  {:<11} {}", state_label(s), m.count(s));
+                }
+                if untrusted > 0 {
+                    println!("Tramos NO fiables (el contenido es un patrón de relleno, no datos):");
+                    for (l, c, s) in m.untrusted_runs() {
+                        println!(
+                            "  LBA {l} – {} ({c} sectores, {})",
+                            l + c - 1,
+                            state_label(s)
+                        );
+                    }
+                    if m.truncated() {
+                        println!(
+                            "  … lista incompleta (demasiados tramos); los recuentos son exactos"
+                        );
+                    }
                 }
             }
-            if r.sectors_bad > 0 {
-                return Err((3, format!("{} sectores ilegibles", r.sectors_bad)));
+            if untrusted > 0 {
+                return Err((
+                    3,
+                    format!("{untrusted} sectores no fiables ({bad} ilegibles)"),
+                ));
             }
         }
         "image-info" => {
             let p = one(&a)?;
-            let i = mr_api::image_info(&p, a.sector_size).map_err(|e| op(&e))?;
-            print_info(&i, a.json);
+            let src = open_src(&a, &p).map_err(|e| op(&e))?;
+            print_info(src.info(), a.json);
         }
         "hash" => {
             let p = one(&a)?;
@@ -254,8 +385,8 @@ fn run(args: Vec<String>) -> Result<(), (u8, String)> {
                 store_path: a.db.clone(),
                 ..HashOptions::default()
             };
-            let task = mr_api::start_hash_task(PathBuf::from(&p), a.sector_size, opts)
-                .map_err(|e| op(&e))?;
+            let src = open_src(&a, &p).map_err(|e| op(&e))?;
+            let task = mr_api::start_hash_task_on(src, opts).map_err(|e| op(&e))?;
             let start = Instant::now();
             while task.state() == TaskState::Running {
                 let (d, t) = task.progress();
@@ -325,5 +456,38 @@ fn main() -> ExitCode {
             eprintln!("error: {msg}");
             ExitCode::from(code)
         }
+    }
+}
+
+/// Nombre estable (JSON) de un estado de sector.
+fn state_name(s: SectorState) -> &'static str {
+    match s {
+        SectorState::Read => "read",
+        SectorState::Recovered => "recovered",
+        SectorState::Unreadable => "unreadable",
+        SectorState::Skipped => "skipped",
+        SectorState::Sparse => "sparse",
+    }
+}
+
+/// Nombre legible de un único sector.
+fn state_label_one(s: SectorState) -> &'static str {
+    match s {
+        SectorState::Read => "leído",
+        SectorState::Recovered => "recuperado tras reintentos",
+        SectorState::Unreadable => "ILEGIBLE",
+        SectorState::Skipped => "SALTADO (no leído)",
+        SectorState::Sparse => "disperso (ceros del formato)",
+    }
+}
+
+/// Nombre legible de un estado de sector.
+fn state_label(s: SectorState) -> &'static str {
+    match s {
+        SectorState::Read => "leídos",
+        SectorState::Recovered => "recuperados",
+        SectorState::Unreadable => "ilegibles",
+        SectorState::Skipped => "saltados",
+        SectorState::Sparse => "dispersos",
     }
 }

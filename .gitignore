@@ -26,3 +26,7 @@ obj/
 # Python
 __pycache__/
 *.pyc
+
+# Registros y temporales
+*.log
+*.tmp

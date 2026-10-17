@@ -73,11 +73,7 @@ impl BlockDevice for ImageFile {
 
 /// Lectura posicional completa. Reintenta `Interrupted`; un fichero que se ha acortado desde que
 /// se abrió produce `UnexpectedEof` (nunca datos inventados).
-pub(crate) fn read_exact_at(
-    file: &File,
-    mut offset: u64,
-    mut buf: &mut [u8],
-) -> std::io::Result<()> {
+pub fn read_exact_at(file: &File, mut offset: u64, mut buf: &mut [u8]) -> std::io::Result<()> {
     while !buf.is_empty() {
         #[cfg(windows)]
         let r = std::os::windows::fs::FileExt::seek_read(file, buf, offset);

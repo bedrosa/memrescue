@@ -16,6 +16,7 @@
         <CommandBinding Command="local:Commands.FirstSector" Executed="FirstSector_Executed" CanExecute="HasSource_CanExecute" />
         <CommandBinding Command="local:Commands.LastSector" Executed="LastSector_Executed" CanExecute="HasSource_CanExecute" />
         <CommandBinding Command="local:Commands.CopyHex" Executed="CopyHex_Executed" CanExecute="HasSource_CanExecute" />
+        <CommandBinding Command="local:Commands.OpenRange" Executed="OpenRange_Executed" CanExecute="HasSource_CanExecute" />
     </Window.CommandBindings>
 
     <DockPanel>
@@ -25,13 +26,16 @@
             el hito del roadmap en que se implementa; nada simula funcionar.
         -->
         <Menu DockPanel.Dock="Top" Padding="2">
-            <MenuItem Header="_Disco">
+            <MenuItem Header="_Disco" AutomationProperties.AutomationId="DiskMenu">
                 <MenuItem Header="_Abrir imagen de disco…" Command="Open" InputGestureText="Ctrl+O" />
                 <MenuItem Header="_Cerrar origen" Command="Close" InputGestureText="Ctrl+F4" />
+                <MenuItem Header="Abrir _rango de sectores como dispositivo…" AutomationProperties.AutomationId="OpenRangeMenuItem"
+                          Command="local:Commands.OpenRange" InputGestureText="Ctrl+Mayús+R"
+                          ToolTip="Presenta un tramo de sectores del origen seleccionado (p. ej. una partición) como un origen independiente" />
                 <Separator />
                 <MenuItem Header="_Seleccionar disco físico…" IsEnabled="False" InputGestureText="(M9)" ToolTip="Pendiente: acceso a discos físicos (hito M9)" />
                 <MenuItem Header="Construir _RAID virtual…" IsEnabled="False" InputGestureText="(M5)" ToolTip="Pendiente: RAID virtual (hito M5)" />
-                <MenuItem Header="_Particiones…" IsEnabled="False" InputGestureText="(M2)" ToolTip="Pendiente: lectura de MBR/GPT y búsqueda de particiones (hito M2)" />
+                <MenuItem Header="_Particiones…" AutomationProperties.AutomationId="PartitionsMenuItem" IsEnabled="False" InputGestureText="(M2)" ToolTip="Pendiente: lectura de MBR/GPT y búsqueda de particiones (hito M2)" />
                 <MenuItem Header="_Bloquear volúmenes…" IsEnabled="False" InputGestureText="(M9)" ToolTip="Pendiente (hito M9)" />
                 <MenuItem Header="Parámetros de _E/S…" IsEnabled="False" InputGestureText="(M9)" ToolTip="Pendiente: política de errores en dispositivos reales (hito M9)" />
                 <Separator />
@@ -61,8 +65,8 @@
                 <MenuItem Header="_Panel de ficheros" IsEnabled="False" InputGestureText="(M10)" ToolTip="Pendiente (hito M10)" />
                 <MenuItem Header="Panel de _búsqueda" IsEnabled="False" InputGestureText="(M10)" ToolTip="Pendiente (hito M10)" />
             </MenuItem>
-            <MenuItem Header="_Editor">
-                <MenuItem Header="Ir a _sector…" Command="local:Commands.GoToSector" InputGestureText="Ctrl+G" />
+            <MenuItem Header="_Editor" AutomationProperties.AutomationId="EditorMenu">
+                <MenuItem Header="Ir a _sector…" AutomationProperties.AutomationId="GoToSectorMenuItem" Command="local:Commands.GoToSector" InputGestureText="Ctrl+G" />
                 <MenuItem Header="Ir a _desplazamiento…" Command="local:Commands.GoToOffset" InputGestureText="Ctrl+Mayús+G" />
                 <Separator />
                 <MenuItem Header="Sector _anterior" Command="local:Commands.PrevSector" InputGestureText="RePág" />
@@ -70,7 +74,7 @@
                 <MenuItem Header="_Primer sector" Command="local:Commands.FirstSector" InputGestureText="Ctrl+Inicio" />
                 <MenuItem Header="Ú_ltimo sector" Command="local:Commands.LastSector" InputGestureText="Ctrl+Fin" />
                 <Separator />
-                <MenuItem Header="Ir a cluster / registro…" IsEnabled="False" InputGestureText="(M3)" ToolTip="Pendiente: requiere sistemas de archivos (hito M3)" />
+                <MenuItem Header="Ir a cluster / registro…" AutomationProperties.AutomationId="GoToClusterMenuItem" IsEnabled="False" InputGestureText="(M3)" ToolTip="Pendiente: requiere sistemas de archivos (hito M3)" />
             </MenuItem>
             <MenuItem Header="_Modo">
                 <MenuItem Header="_Hexadecimal / texto" IsCheckable="True" IsChecked="True" ToolTip="Vista actual del editor" />
@@ -91,8 +95,9 @@
             <ToolBar>
                 <Button Command="Open" Content="Abrir imagen…" ToolTip="Abrir un fichero de imagen de disco en solo lectura (Ctrl+O)" />
                 <TextBlock Text="Sector al abrir:" VerticalAlignment="Center" Margin="6,0,4,0" />
-                <ComboBox x:Name="SectorSizeBox" Width="70" SelectedIndex="0"
-                          ToolTip="Tamaño de sector lógico con el que se interpretará la próxima imagen que se abra">
+                <ComboBox x:Name="SectorSizeBox" Width="90" SelectedIndex="0" AutomationProperties.AutomationId="SectorSizeBox"
+                          ToolTip="Tamaño de sector lógico con el que se interpretará la próxima imagen que se abra (Automático: el nativo del contenedor; 512 en RAW)">
+                    <ComboBoxItem Content="Automático" />
                     <ComboBoxItem Content="512" />
                     <ComboBoxItem Content="1024" />
                     <ComboBoxItem Content="2048" />
@@ -158,14 +163,14 @@
                 <TabItem x:Name="SectorsTab" Header="Sectores">
                     <DockPanel Margin="6">
                         <WrapPanel DockPanel.Dock="Top" Margin="0,0,0,6">
-                            <Button Content="|◀" Command="local:Commands.FirstSector" ToolTip="Primer sector (Ctrl+Inicio)" />
-                            <Button Content="◀" Command="local:Commands.PrevSector" ToolTip="Sector anterior (RePág)" />
+                            <Button Content="|◀" AutomationProperties.AutomationId="FirstSectorButton" Command="local:Commands.FirstSector" ToolTip="Primer sector (Ctrl+Inicio)" />
+                            <Button Content="◀" AutomationProperties.AutomationId="PrevSectorButton" Command="local:Commands.PrevSector" ToolTip="Sector anterior (RePág)" />
                             <TextBlock Text="LBA:" VerticalAlignment="Center" Margin="6,0,4,0" />
                             <TextBox x:Name="LbaBox" Width="140" FontFamily="Consolas" VerticalContentAlignment="Center"
                                      KeyDown="LbaBox_KeyDown" ToolTip="Número de sector (decimal, 0x… o …h). Intro para ir." />
-                            <Button Content="Ir" Click="GoLba_Click" />
-                            <Button Content="▶" Command="local:Commands.NextSector" ToolTip="Sector siguiente (AvPág)" />
-                            <Button Content="▶|" Command="local:Commands.LastSector" ToolTip="Último sector (Ctrl+Fin)" />
+                            <Button Content="Ir" AutomationProperties.AutomationId="GoLbaButton" Click="GoLba_Click" />
+                            <Button Content="▶" AutomationProperties.AutomationId="NextSectorButton" Command="local:Commands.NextSector" ToolTip="Sector siguiente (AvPág)" />
+                            <Button Content="▶|" AutomationProperties.AutomationId="LastSectorButton" Command="local:Commands.LastSector" ToolTip="Último sector (Ctrl+Fin)" />
                             <TextBlock Text="Sectores por página:" VerticalAlignment="Center" Margin="12,0,4,0" />
                             <ComboBox x:Name="PageSizeBox" Width="50" SelectedIndex="0" SelectionChanged="PageSizeBox_SelectionChanged">
                                 <ComboBoxItem Content="1" />
@@ -176,7 +181,16 @@
                         </WrapPanel>
                         <TextBlock x:Name="SectorInfoText" DockPanel.Dock="Top" Margin="0,0,0,4" FontFamily="Consolas"
                                    Foreground="{StaticResource BrandBrush}" />
+                        <Border x:Name="UntrustedBanner" DockPanel.Dock="Top" Visibility="Collapsed" Margin="0,0,0,4" Padding="6,3"
+                                Background="#FFFCE4E4" BorderBrush="#FFC62828" BorderThickness="1">
+                            <TextBlock x:Name="UntrustedBannerText" Foreground="#FFB71C1C" FontWeight="SemiBold" TextWrapping="Wrap"
+                                       AutomationProperties.AutomationId="UntrustedBannerText" />
+                        </Border>
                         <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
                             <TextBlock x:Name="NoSourceSectorsText" Text="Abra una imagen de disco (Disco → Abrir imagen…, Ctrl+O) para ver sus sectores."
                                        Foreground="{StaticResource MutedBrush}" TextWrapping="Wrap" Margin="4" />
                             <TextBox x:Name="HexView" IsReadOnly="True" FontFamily="Consolas" FontSize="13"
@@ -184,6 +198,11 @@
                                      BorderBrush="{StaticResource BorderBrush}"
                                      HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto"
                                      PreviewKeyDown="HexView_PreviewKeyDown" Visibility="Collapsed" />
+                            <ScrollBar x:Name="LbaScrollBar" Grid.Column="1" Orientation="Vertical" Minimum="0" Maximum="0"
+                                       SmallChange="1" Visibility="Collapsed" Margin="2,0,0,0"
+                                       AutomationProperties.AutomationId="LbaScrollBar"
+                                       ToolTip="Posición en el origen (arrastre para recorrer imágenes grandes)"
+                                       ValueChanged="LbaScrollBar_ValueChanged" />
                         </Grid>
                     </DockPanel>
                 </TabItem>
@@ -198,6 +217,7 @@
                                 <ColumnDefinition Width="*" />
                             </Grid.ColumnDefinitions>
                             <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto" />
                                 <RowDefinition Height="Auto" />
                                 <RowDefinition Height="Auto" />
                                 <RowDefinition Height="Auto" />
@@ -220,6 +240,9 @@
                             <TextBox Grid.Row="5" Grid.Column="1" x:Name="PropTrailing" Style="{StaticResource PropValue}" />
                             <TextBlock Grid.Row="6" Text="Acceso" Style="{StaticResource PropName}" />
                             <TextBox Grid.Row="6" Grid.Column="1" Text="Solo lectura (fichero de imagen)" Style="{StaticResource PropValue}" />
+                            <TextBlock Grid.Row="7" Text="Detalles" Style="{StaticResource PropName}" />
+                            <TextBox Grid.Row="7" Grid.Column="1" x:Name="PropDetails" Style="{StaticResource PropValue}"
+                                     AutomationProperties.AutomationId="PropDetails" />
                         </Grid>
                     </Grid>
                 </TabItem>
@@ -248,7 +271,7 @@
                                      HorizontalScrollBarVisibility="Auto" />
 
                             <TextBlock Text="Comprobación de legibilidad" Style="{StaticResource SectionHeader}" Margin="0,18,0,6" />
-                            <TextBlock Text="Lee todos los sectores completos. Si un bloque falla, relee sector a sector con los reintentos indicados e informa de los sectores ilegibles."
+                            <TextBlock Text="Lee todos los sectores completos. Si un bloque falla, relee sector a sector con los reintentos indicados. Cada sector queda clasificado como leído, recuperado, ilegible, saltado o disperso; ilegibles y saltados contienen un patrón de relleno, nunca datos."
                                        Foreground="{StaticResource MutedBrush}" Margin="0,0,0,8" TextWrapping="Wrap" />
                             <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
                                 <TextBlock Text="Reintentos por sector:" VerticalAlignment="Center" Margin="0,0,6,0" />
@@ -258,6 +281,17 @@
                                     <ComboBoxItem Content="3" />
                                     <ComboBoxItem Content="10" />
                                 </ComboBox>
+                                <TextBlock Text="Tras un ilegible, saltar:" VerticalAlignment="Center" Margin="12,0,6,0" />
+                                <ComboBox x:Name="JumpBox" Width="70" SelectedIndex="0" AutomationProperties.AutomationId="JumpBox"
+                                          ToolTip="Sectores que se marcan como saltados (sin leerlos) tras cada sector ilegible, para no castigar zonas dañadas">
+                                    <ComboBoxItem Content="0" />
+                                    <ComboBoxItem Content="64" />
+                                    <ComboBoxItem Content="256" />
+                                    <ComboBoxItem Content="4096" />
+                                </ComboBox>
+                                <CheckBox x:Name="ReadBackBox" Content="Leer hacia atrás tras el salto" VerticalAlignment="Center" Margin="8,0,0,0"
+                                          AutomationProperties.AutomationId="ReadBackBox"
+                                          ToolTip="Tras saltar, lee desde el final del salto hacia atrás hasta el siguiente error para recuperar los sectores legibles" />
                                 <Button x:Name="VerifyStartButton" Content="Comprobar" Click="VerifyStart_Click" Margin="12,0,4,0" />
                                 <Button x:Name="VerifyCancelButton" Content="Cancelar" Click="VerifyCancel_Click" IsEnabled="False" />
                             </StackPanel>

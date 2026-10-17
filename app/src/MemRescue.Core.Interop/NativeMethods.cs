@@ -3,13 +3,17 @@ using System.Runtime.InteropServices;
 namespace MemRescue.Core.Interop;
 
 /// <summary>
-/// Declaraciones de la interfaz C de memrescue_core.dll (ABI 2).
+/// Declaraciones de la interfaz C de memrescue_core.dll (ABI 3).
 /// Contrato completo en core/mr-ffi/include/memrescue_core.h y docs/API_FFI.md.
 /// </summary>
 internal static partial class NativeMethods
 {
     internal const string Dll = "memrescue_core";
-    internal const uint ExpectedAbiVersion = 2;
+    internal const uint ExpectedAbiVersion = 3;
+
+    internal const uint OpenForceRaw = 1;
+    internal const uint OpenSplit = 2;
+    internal const uint VerifyReadBack = 1;
 
     [LibraryImport(Dll)]
     internal static partial uint mr_abi_version();
@@ -33,10 +37,24 @@ internal static partial class NativeMethods
     internal static partial int mr_source_info(ulong source, out MrImageInfo info);
 
     [LibraryImport(Dll)]
+    internal static partial int mr_source_describe(ulong source, byte[]? buf, nuint cap, out nuint outLen);
+
+    [LibraryImport(Dll)]
     internal static partial int mr_source_read(ulong source, ulong lba, uint count, byte[] buf, nuint cap, out nuint outLen);
 
     [LibraryImport(Dll)]
+    internal static partial int mr_source_read_mapped(
+        ulong source, ulong lba, uint count, uint retries,
+        byte[] buf, nuint cap, byte[] states, nuint statesCap, out nuint outLen);
+
+    [LibraryImport(Dll)]
+    internal static partial int mr_source_open_range(ulong source, ulong startLba, ulong count, out ulong rangeSource);
+
+    [LibraryImport(Dll)]
     internal static partial int mr_source_close(ulong source);
+
+    [LibraryImport(Dll)]
+    internal static partial int mr_split_discover(byte[] path, nuint pathLen, byte[]? buf, nuint cap, out nuint outLen, out uint count);
 
     [LibraryImport(Dll)]
     internal static partial int mr_hash_start(
@@ -50,13 +68,14 @@ internal static partial class NativeMethods
     internal static partial int mr_hash_result(ulong task, uint algorithm, byte[]? buf, nuint cap, out nuint outLen);
 
     [LibraryImport(Dll)]
-    internal static partial int mr_source_verify_start(ulong source, ulong startLba, ulong count, uint retries, out ulong task);
+    internal static partial int mr_source_verify_start(
+        ulong source, ulong startLba, ulong count, uint retries, ulong jumpSectors, uint flags, out ulong task);
 
     [LibraryImport(Dll)]
     internal static partial int mr_verify_result(ulong task, out MrVerifyReport report);
 
     [LibraryImport(Dll)]
-    internal static partial int mr_verify_bad_range(ulong task, ulong index, out ulong lba, out ulong count);
+    internal static partial int mr_verify_untrusted_range(ulong task, ulong index, out ulong lba, out ulong count, out uint state);
 
     [LibraryImport(Dll)]
     internal static partial int mr_task_status_get(ulong task, out MrTaskStatus status);
@@ -76,7 +95,7 @@ public struct MrImageInfo
     public ulong SectorCount;
     public ulong TrailingBytes;
     public uint SectorSize;
-    public uint Reserved;
+    public uint Format;
 }
 
 /// <summary>Espejo de <c>mr_task_status</c> (24 bytes).</summary>
@@ -89,15 +108,18 @@ public struct MrTaskStatus
     public ulong Total;
 }
 
-/// <summary>Espejo de <c>mr_verify_report</c> (48 bytes).</summary>
+/// <summary>Espejo de <c>mr_verify_report</c> (72 bytes).</summary>
 [StructLayout(LayoutKind.Sequential)]
 public struct MrVerifyReport
 {
     public ulong SectorsRequested;
-    public ulong SectorsOk;
-    public ulong SectorsBad;
+    public ulong SectorsRead;
+    public ulong SectorsRecovered;
+    public ulong SectorsUnreadable;
+    public ulong SectorsSkipped;
+    public ulong SectorsSparse;
     public ulong RetryReads;
-    public ulong BadRangeCount;
-    public uint BadRangesTruncated;
+    public ulong UntrustedRangeCount;
+    public uint RangesTruncated;
     public uint Reserved;
 }

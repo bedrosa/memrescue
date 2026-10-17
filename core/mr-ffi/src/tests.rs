@@ -9,8 +9,8 @@ use std::time::Duration;
 fn struct_layouts_match_header() {
     assert_eq!(std::mem::size_of::<MrImageInfo>(), 32);
     assert_eq!(std::mem::size_of::<MrTaskStatus>(), 24);
-    assert_eq!(std::mem::size_of::<MrVerifyReport>(), 48);
-    assert_eq!(mr_abi_version(), 2);
+    assert_eq!(std::mem::size_of::<MrVerifyReport>(), 72);
+    assert_eq!(mr_abi_version(), 3);
 }
 
 fn temp_image(name: &str, sectors: usize, ss: usize) -> (tempfile::TempDir, String) {
@@ -138,7 +138,7 @@ fn verify_flow_reports_clean_image() {
     let src = open(&p, 512, 0).unwrap();
     let mut task = 0u64;
     assert_eq!(
-        unsafe { mr_source_verify_start(src, 0, 0, 1, &mut task) },
+        unsafe { mr_source_verify_start(src, 0, 0, 1, 0, 0, &mut task) },
         MR_OK
     );
     let st = wait(task);
@@ -148,21 +148,37 @@ fn verify_flow_reports_clean_image() {
     assert_eq!(
         (
             rep.sectors_requested,
-            rep.sectors_ok,
-            rep.sectors_bad,
-            rep.bad_range_count
+            rep.sectors_read,
+            rep.sectors_recovered,
+            rep.sectors_unreadable,
+            rep.sectors_skipped,
+            rep.sectors_sparse,
+            rep.untrusted_range_count
         ),
-        (300, 300, 0, 0)
+        (300, 300, 0, 0, 0, 0, 0)
     );
-    let (mut l, mut c) = (0, 0);
+    let (mut l, mut c, mut st) = (0, 0, 0);
     assert_eq!(
-        unsafe { mr_verify_bad_range(task, 0, &mut l, &mut c) },
+        unsafe { mr_verify_untrusted_range(task, 0, &mut l, &mut c, &mut st) },
         MR_ERR_OUT_OF_RANGE
     );
     assert_eq!(
-        unsafe { mr_source_verify_start(src, 0, 0, 1000, &mut task) },
+        unsafe { mr_source_verify_start(src, 0, 0, 1000, 0, 0, &mut task) },
         MR_ERR_INVALID_ARGUMENT
     );
+    assert_eq!(
+        unsafe { mr_source_verify_start(src, 0, 0, 1, 0, 2, &mut task) },
+        MR_ERR_INVALID_ARGUMENT
+    );
+    // Con salto y lectura hacia atrás activados (imagen sana: sin efecto).
+    assert_eq!(
+        unsafe { mr_source_verify_start(src, 10, 50, 0, 64, MR_VERIFY_READ_BACK, &mut task) },
+        MR_OK
+    );
+    assert_eq!(wait(task).state, 2);
+    assert_eq!(unsafe { mr_verify_result(task, &mut rep) }, MR_OK);
+    assert_eq!((rep.sectors_requested, rep.sectors_read), (50, 50));
+    mr_task_free(task);
     mr_source_close(src);
 }
 
@@ -180,11 +196,40 @@ fn probe_and_unsupported_containers() {
         MR_OK
     );
     assert_eq!(f, 3);
-    assert_eq!(open(ps, 512, 0), Err(MR_ERR_UNSUPPORTED_FORMAT));
+    // Cabecera VHDX sin estructuras válidas: dañado, nunca se lee como RAW por error.
+    assert_eq!(open(ps, 0, 0), Err(MR_ERR_CORRUPT));
     assert!(last_error().contains("VHDX"));
-    let h = open(ps, 512, 1).expect("forzar RAW debe abrir");
+    let h = open(ps, 512, MR_OPEN_FORCE_RAW).expect("forzar RAW debe abrir");
+    let mut info = MrImageInfo::default();
+    assert_eq!(unsafe { mr_source_info(h, &mut info) }, MR_OK);
+    assert_eq!(info.format, 1);
+    assert!(describe(h).contains("forzado"));
     mr_source_close(h);
     assert_eq!(open(ps, 512, 4), Err(MR_ERR_INVALID_ARGUMENT));
+
+    // QCOW: detectado pero sin lector → formato no soportado.
+    let q = dir.path().join("x.qcow2");
+    let mut d = vec![0u8; 4096];
+    d[..4].copy_from_slice(b"QFI\xfb");
+    std::fs::write(&q, d).unwrap();
+    assert_eq!(
+        open(q.to_str().unwrap(), 0, 0),
+        Err(MR_ERR_UNSUPPORTED_FORMAT)
+    );
+
+    // Descriptor VMDK separado: referencia externa que no se sigue.
+    let v = dir.path().join("flat.vmdk");
+    std::fs::write(
+        &v,
+        "# Disk DescriptorFile\nversion=1\nCID=1\nparentCID=ffffffff\n\
+         createType=\"monolithicFlat\"\nRW 64 FLAT \"..\\..\\Windows\\win.ini\" 0\n",
+    )
+    .unwrap();
+    assert_eq!(
+        open(v.to_str().unwrap(), 0, 0),
+        Err(MR_ERR_EXTERNAL_REFERENCE)
+    );
+    assert!(last_error().contains("win.ini"));
 }
 
 #[test]
@@ -329,4 +374,188 @@ fn rejects_bad_algorithm_mask() {
     assert_eq!(rc, MR_ERR_INVALID_ARGUMENT);
     let rc = unsafe { mr_hash_start(p.as_ptr(), p.len(), 512, 0x10, std::ptr::null(), 0, &mut h) };
     assert_eq!(rc, MR_ERR_INVALID_ARGUMENT);
+}
+
+fn describe(h: u64) -> String {
+    let mut buf = vec![0u8; 4096];
+    let mut len = 0usize;
+    assert_eq!(
+        unsafe { mr_source_describe(h, buf.as_mut_ptr(), buf.len(), &mut len) },
+        MR_OK
+    );
+    String::from_utf8_lossy(&buf[..len]).into_owned()
+}
+
+#[test]
+fn read_mapped_reports_a_state_per_sector() {
+    let (_d, p) = temp_image("m.img", 16, 512);
+    let h = open(&p, 0, 0).unwrap();
+    let mut buf = vec![0u8; 4 * 512];
+    let mut states = vec![0xEEu8; 4];
+    let mut n = 0usize;
+    let rc = unsafe {
+        mr_source_read_mapped(
+            h,
+            12,
+            4,
+            1,
+            buf.as_mut_ptr(),
+            buf.len(),
+            states.as_mut_ptr(),
+            states.len(),
+            &mut n,
+        )
+    };
+    assert_eq!(rc, MR_OK);
+    assert_eq!(n, 2048);
+    assert_eq!(states, vec![0, 0, 0, 0]);
+    assert!(buf[..512].iter().all(|&b| b == 12));
+    // Búfer de estados insuficiente.
+    let rc = unsafe {
+        mr_source_read_mapped(
+            h,
+            12,
+            4,
+            1,
+            buf.as_mut_ptr(),
+            buf.len(),
+            states.as_mut_ptr(),
+            3,
+            &mut n,
+        )
+    };
+    assert_eq!(rc, MR_ERR_BUFFER_TOO_SMALL);
+    // Fuera de rango y reintentos excesivos.
+    let rc = unsafe {
+        mr_source_read_mapped(
+            h,
+            14,
+            4,
+            1,
+            buf.as_mut_ptr(),
+            buf.len(),
+            states.as_mut_ptr(),
+            4,
+            &mut n,
+        )
+    };
+    assert_eq!(rc, MR_ERR_OUT_OF_RANGE);
+    let rc = unsafe {
+        mr_source_read_mapped(
+            h,
+            0,
+            1,
+            101,
+            buf.as_mut_ptr(),
+            buf.len(),
+            states.as_mut_ptr(),
+            4,
+            &mut n,
+        )
+    };
+    assert_eq!(rc, MR_ERR_INVALID_ARGUMENT);
+    mr_source_close(h);
+}
+
+#[test]
+fn range_sources_are_bounded_and_nest() {
+    let (_d, p) = temp_image("r.img", 100, 512);
+    let parent = open(&p, 512, 0).unwrap();
+    let mut r = 0u64;
+    assert_eq!(
+        unsafe { mr_source_open_range(parent, 10, 20, &mut r) },
+        MR_OK
+    );
+    let mut info = MrImageInfo::default();
+    assert_eq!(unsafe { mr_source_info(r, &mut info) }, MR_OK);
+    assert_eq!((info.sector_count, info.sector_size), (20, 512));
+    assert!(describe(r).contains("Rango LBA 10–29"));
+    let mut buf = vec![0u8; 512];
+    let mut n = 0;
+    assert_eq!(
+        unsafe { mr_source_read(r, 0, 1, buf.as_mut_ptr(), buf.len(), &mut n) },
+        MR_OK
+    );
+    assert!(buf.iter().all(|&b| b == 10));
+    assert_eq!(
+        unsafe { mr_source_read(r, 20, 1, buf.as_mut_ptr(), buf.len(), &mut n) },
+        MR_ERR_OUT_OF_RANGE
+    );
+    // Anidado: sector 5 del rango 5.. del rango 10.. = sector 20 del padre.
+    let mut r2 = 0u64;
+    assert_eq!(unsafe { mr_source_open_range(r, 5, 10, &mut r2) }, MR_OK);
+    assert_eq!(
+        unsafe { mr_source_read(r2, 5, 1, buf.as_mut_ptr(), buf.len(), &mut n) },
+        MR_OK
+    );
+    assert!(buf.iter().all(|&b| b == 20));
+    // Rangos no válidos.
+    let mut bad = 0u64;
+    for (s, c) in [(90, 11), (0, 0), (u64::MAX, 2)] {
+        assert_eq!(
+            unsafe { mr_source_open_range(parent, s, c, &mut bad) },
+            MR_ERR_OUT_OF_RANGE,
+            "{s} {c}"
+        );
+    }
+    // Cerrar el padre no invalida los rangos abiertos.
+    mr_source_close(parent);
+    assert_eq!(
+        unsafe { mr_source_read(r2, 0, 1, buf.as_mut_ptr(), buf.len(), &mut n) },
+        MR_OK
+    );
+    mr_source_close(r2);
+    mr_source_close(r);
+}
+
+#[test]
+fn split_images_are_listed_then_opened_explicitly() {
+    let dir = tempfile::tempdir().unwrap();
+    let data: Vec<u8> = (0..4096u32).map(|i| (i / 512) as u8).collect();
+    std::fs::write(dir.path().join("d.001"), &data[..1536]).unwrap();
+    std::fs::write(dir.path().join("d.002"), &data[1536..3072]).unwrap();
+    std::fs::write(dir.path().join("d.003"), &data[3072..]).unwrap();
+    let first = dir.path().join("d.001");
+    let fp = first.to_str().unwrap();
+    let mut buf = vec![0u8; 4096];
+    let (mut len, mut count) = (0usize, 0u32);
+    assert_eq!(
+        unsafe {
+            mr_split_discover(
+                fp.as_ptr(),
+                fp.len(),
+                buf.as_mut_ptr(),
+                buf.len(),
+                &mut len,
+                &mut count,
+            )
+        },
+        MR_OK
+    );
+    assert_eq!(count, 3);
+    let list = String::from_utf8_lossy(&buf[..len]).into_owned();
+    assert_eq!(list.lines().count(), 3);
+    assert!(list.lines().nth(2).unwrap().ends_with("d.003"));
+    // Sin la opción, solo se abre el primer segmento.
+    let one = open(fp, 0, 0).unwrap();
+    let mut info = MrImageInfo::default();
+    unsafe { mr_source_info(one, &mut info) };
+    assert_eq!(info.size_bytes, 1536);
+    mr_source_close(one);
+    let h = open(fp, 0, MR_OPEN_SPLIT).unwrap();
+    unsafe { mr_source_info(h, &mut info) };
+    assert_eq!((info.size_bytes, info.sector_count), (4096, 8));
+    assert!(describe(h).contains("3 segmentos"));
+    let mut n = 0;
+    let mut s = vec![0u8; 1024];
+    assert_eq!(
+        unsafe { mr_source_read(h, 2, 2, s.as_mut_ptr(), s.len(), &mut n) },
+        MR_OK
+    );
+    assert_eq!(&s[..], &data[1024..2048]);
+    mr_source_close(h);
+    // Un nombre que no es primer segmento.
+    let second = dir.path().join("d.002");
+    let sp = second.to_str().unwrap();
+    assert_eq!(open(sp, 0, MR_OPEN_SPLIT), Err(MR_ERR_UNSUPPORTED_FEATURE));
 }

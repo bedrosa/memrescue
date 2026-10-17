@@ -3,8 +3,8 @@
 ## Imports estáticos (tabla de importación)
 
 Fuente: `search_procedures` (evidencia `ev_4e3537859c354fc78e5e60e338c3a966e9eca5551fc5d0aed371e317a019aa73`).
-Ghidra reporta 386 funciones externas y 402 thunks. El listado completo por DLL está en
-[datos/imports_por_dll.txt](datos/imports_por_dll.txt).
+Ghidra reporta 386 funciones externas y 402 thunks. El listado completo por DLL se conserva
+en local (`datos/imports_por_dll.txt`, no versionado).
 
 | DLL | Nº | APIs significativas | Uso deducido |
 |---|---|---|---|

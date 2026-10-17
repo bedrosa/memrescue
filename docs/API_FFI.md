@@ -1,4 +1,4 @@
-# Interfaz entre el motor (Rust) y la interfaz (C#): ABI 2
+# Interfaz entre el motor (Rust) y la interfaz (C#): ABI 3
 
 Fuente de verdad: [core/mr-ffi/include/memrescue_core.h](../core/mr-ffi/include/memrescue_core.h).
 Implementación: [core/mr-ffi/src/lib.rs](../core/mr-ffi/src/lib.rs).
@@ -9,13 +9,13 @@ Cliente .NET: [app/src/MemRescue.Core.Interop/](../app/src/MemRescue.Core.Intero
 ```
 MemRescue.exe (WPF, C#)
    └─ MemRescue.Core.Interop.dll  ── P/Invoke ([LibraryImport]) ──▶  memrescue_core.dll (Rust, cdylib)
-                                                                       └─ mr-api → mr-io / mr-store / mr-common
+                                                                       └─ mr-api → mr-image / mr-io / mr-store / mr-common
 memrescue-cli.exe (Rust) ──────────────── llamada directa ──────────▶  mr-api
 ```
 
 - La DLL es la **única** dependencia binaria de la GUI con el motor. La GUI no conoce tipos Rust.
 - La CLI usa `mr-api` directamente (sin FFI); las pruebas comprueban que ambas vías dan los mismos resultados.
-- Versionado: `mr_abi_version()` devuelve 2 (ABI 1 en M0). La GUI lo comprueba al arrancar (`Engine.EnsureCompatible`) y se
+- Versionado: `mr_abi_version()` devuelve 3 (ABI 1 en M0, ABI 2 en M1-iteración 1). La GUI lo comprueba al arrancar (`Engine.EnsureCompatible`) y se
   niega a funcionar con una DLL incompatible. Cualquier cambio incompatible en firmas, estructuras o
   significados incrementa la versión de ABI; añadir funciones nuevas no.
 
@@ -27,7 +27,7 @@ memrescue-cli.exe (Rust) ──────────────── llamad
 | Retorno | `int32_t mr_status`: 0 = `MR_OK`; ver tabla de códigos |
 | Cadenas de entrada | UTF-8, puntero + longitud en bytes; no requieren terminador. Puntero nulo solo con longitud 0 |
 | Cadenas de salida | El llamador aporta `(buf, cap, out_len)`. Si cabe, el motor escribe UTF-8 + `\0` y `*out_len` = longitud sin `\0`. Si no, `MR_ERR_BUFFER_TOO_SMALL` y `*out_len` = longitud necesaria (el cliente reintenta con `out_len + 1`) |
-| Estructuras | `#[repr(C)]`, campos de ancho fijo, relleno explícito (`reserved`). Tamaños comprobados por pruebas en ambos lados: `mr_image_info` = 32 B, `mr_task_status` = 24 B |
+| Estructuras | `#[repr(C)]`, campos de ancho fijo, relleno explícito (`reserved`). Tamaños comprobados por pruebas en ambos lados: `mr_image_info` = 32 B, `mr_task_status` = 24 B, `mr_verify_report` = 72 B |
 | Enteros | `uint64_t` para tamaños y LBA; `uint32_t` para enumeraciones y máscaras |
 | Booleanos | No se usan en la ABI (evita discrepancias de tamaño) |
 
@@ -56,6 +56,11 @@ memrescue-cli.exe (Rust) ──────────────── llamad
 | 7 | `MR_ERR_INVALID_HANDLE` | Handle de tarea desconocido o ya liberado |
 | 8 | `MR_ERR_BUFFER_TOO_SMALL` | Búfer de salida insuficiente (`*out_len` indica lo necesario) |
 | 9 | `MR_ERR_TASK_FAILED` | La tarea terminó con error (mensaje en `mr_last_error`) |
+| 10 | `MR_ERR_UNSUPPORTED_FORMAT` | Contenedor detectado sin lector (EWF, QCOW, VDI, DMG); se puede forzar RAW |
+| 11 | `MR_ERR_OUT_OF_RANGE` | LBA, recuento o rango fuera del origen; petición mayor de 64 MiB |
+| 12 | `MR_ERR_CORRUPT` | Estructura del contenedor dañada o incoherente (cabeceras, sumas, tablas fuera del fichero…) |
+| 13 | `MR_ERR_EXTERNAL_REFERENCE` | El contenedor necesita otro fichero (padre, extensión, descriptor); **nunca** se abre automáticamente |
+| 14 | `MR_ERR_UNSUPPORTED_FEATURE` | Variante del formato aún no soportada (VMDK streamOptimized, VHDX con registro pendiente…) |
 | 99 | `MR_ERR_PANIC` | Error interno capturado; el proceso **no** se cae |
 
 - `mr_last_error` devuelve el mensaje del **último error del hilo que llama** (almacenamiento local de
@@ -82,30 +87,42 @@ mr_task_free(handle)
 - Persistencia opcional: si se pasa una ruta de base de datos de trabajo, el motor registra el trabajo
   (fuente, estado, progreso, resultado) en SQLite. Ver [ARQUITECTURA.md](ARQUITECTURA.md) §4.
 
-## Funciones (ABI 2)
+## Funciones (ABI 3)
 
 | Función | Descripción |
 |---|---|
-| `mr_abi_version()` | Versión de la ABI (2) |
+| `mr_abi_version()` | Versión de la ABI (3) |
 | `mr_engine_version(buf, cap, out_len)` | Versión del motor |
 | `mr_last_error(buf, cap, out_len)` | Mensaje del último error del hilo |
 | `mr_image_probe(path, len, out_format)` | Formato detectado por firmas: 1 RAW, 2 VHD, 3 VHDX, 4 VMDK, 5 VMDK descriptor, 6 EWF, 7 QCOW, 8 VDI, 9 DMG |
-| `mr_image_info_get(path, len, sector_size, out)` | Tamaño, sectores y bytes sobrantes (rechaza contenedores no soportados) |
-| `mr_source_open(path, len, sector_size, flags, out_source)` | Abre un origen en solo lectura (`flags`: 1 = forzar RAW) |
-| `mr_source_info(source, out)` | Datos del origen |
-| `mr_source_read(source, lba, count, buf, cap, out_len)` | Lee `count` sectores completos (máx. 64 MiB por llamada); `*out_len` = bytes necesarios/escritos |
+| `mr_image_info_get(path, len, sector_size, out)` | Tamaño, sectores, bytes sobrantes y formato (abre el contenedor si hay lector) |
+| `mr_source_open(path, len, sector_size, flags, out_source)` | Abre un origen en solo lectura. `sector_size` 0 = nativo del formato (512 en RAW); si difiere del nativo, mismos bytes con otra división en sectores. `flags`: 1 = forzar RAW, 2 = imagen dividida |
+| `mr_source_info(source, out)` | Datos del origen (`format` = formato con el que se interpreta) |
+| `mr_source_describe(source, buf, cap, out_len)` | Descripción legible: variante del contenedor, segmentos, rango |
+| `mr_source_read(source, lba, count, buf, cap, out_len)` | Lectura **estricta** de `count` sectores (máx. 64 MiB); falla ante cualquier error |
+| `mr_source_read_mapped(source, lba, count, retries, buf, cap, states, states_cap, out_len)` | Lectura **tolerante** con un byte de estado por sector (0 leído, 1 recuperado, 2 ilegible, 3 saltado, 4 disperso). Devuelve `MR_OK` aunque haya ilegibles: el llamador **debe** consultar `states` |
+| `mr_source_open_range(source, start_lba, count, out_source)` | Rango de sectores como origen independiente (vista acotada; anidable; sobrevive al cierre del padre) |
+| `mr_split_discover(path, len, buf, cap, out_len, out_count)` | Lista los segmentos de una imagen dividida (uno por línea) **sin abrirlos** |
 | `mr_source_close(source)` | Cierra el origen (las tareas en curso conservan su referencia) |
 | `mr_hash_start(path, …)` / `mr_source_hash_start(source, mask, store, store_len, out_task)` | Hashes (CRC-32=1, MD5=2, SHA-1=4, SHA-256=8); estricto ante errores |
 | `mr_hash_result(task, alg, buf, cap, out_len)` | Resumen hexadecimal de un algoritmo |
-| `mr_source_verify_start(source, start_lba, count, retries, out_task)` | Lectura completa tolerante a errores (`count` 0 = hasta el final; reintentos 0–100) |
-| `mr_verify_result(task, out)` | Informe: solicitados, correctos, ilegibles, relecturas, nº de rangos, truncado |
-| `mr_verify_bad_range(task, index, out_lba, out_count)` | Rango ilegible nº `index` |
+| `mr_source_verify_start(source, start_lba, count, retries, jump_sectors, flags, out_task)` | Lectura completa tolerante (`count` 0 = hasta el final; reintentos 0–100; `jump_sectors` tras cada ilegible; `flags` 1 = lectura hacia atrás) |
+| `mr_verify_result(task, out)` | Informe con el recuento exacto de cada estado, relecturas, nº de tramos no fiables y truncado |
+| `mr_verify_untrusted_range(task, index, out_lba, out_count, out_state)` | Tramo no fiable nº `index` (2 ilegible, 3 saltado). Sustituye a `mr_verify_bad_range` (ABI 2) |
 | `mr_task_status_get(task, out)` | Estado y progreso (bytes en hash, sectores en verificación) |
 | `mr_task_cancel(task)` | Solicita la cancelación |
 | `mr_task_free(task)` | Libera el handle (cancela si sigue en marcha) |
 
-Códigos añadidos en ABI 2: `MR_ERR_UNSUPPORTED_FORMAT` (10) y `MR_ERR_OUT_OF_RANGE` (11). Límites:
+Códigos añadidos en ABI 2: 10 y 11; en ABI 3: 12, 13 y 14. Límites:
 cadenas de entrada ≤ 64 KiB (`MR_MAX_STRING_BYTES`), lecturas ≤ 64 MiB (`MR_MAX_READ_BYTES`).
+
+## Garantía sobre datos sustituidos (ABI 3)
+
+- Los sectores ilegibles o saltados se entregan con un patrón de relleno (`BAD!` / `SKIP`) **y** su estado.
+  Ninguna función presenta el relleno como dato: `mr_source_read` y los hashes son estrictos (fallan) y
+  `mr_source_read_mapped` / la verificación devuelven siempre el estado de cada sector.
+- En C#, `Source.ReadSectorsMapped` devuelve `MappedSectors(Data, States)` y el visor marca cada sector
+  no fiable con «NO FIABLE: patrón de relleno, no datos del origen».
 
 ## Propiedad en C#
 
@@ -115,9 +132,11 @@ después de liberarlos.
 
 ## Pruebas que garantizan el contrato
 
-- Rust (`core/mr-ffi/src/tests.rs`, 13 pruebas): tamaños de estructuras, protocolo de búfer pequeño, rutas
+- Rust (`core/mr-ffi/src/tests.rs`, 16 pruebas): tamaños de estructuras, protocolo de búfer pequeño, rutas
   de dispositivo, UTF-8 inválido, punteros nulos y cadenas desmesuradas, handles inválidos o de otro
-  tipo, orígenes en los 4 tamaños de sector, cierre con tarea en curso, verificación, formatos.
-- C# (`app/tests/MemRescue.Core.Interop.Tests`, 47 pruebas): los mismos contratos desde .NET contra la DLL
-  real, finalizadores, rutas no ASCII, cancelación, base de datos de trabajo, inmutabilidad del origen y el
+  tipo, orígenes en los 4 tamaños de sector, cierre con tarea en curso, verificación con salto y lectura
+  hacia atrás, códigos 10/12/13/14, lectura con estados, rangos anidados, imágenes divididas.
+- C# (`app/tests/MemRescue.Core.Interop.Tests`, 52 pruebas): los mismos contratos desde .NET contra la DLL
+  real (incluidos VHD fijo construido según la especificación, descriptor VMDK malicioso, rangos, estados y
+  divididas), finalizadores, rutas no ASCII, cancelación, base de datos de trabajo, inmutabilidad del origen y el
   corpus sintético (lectura de marcadores en LBA exactas y cabeceras GPT).

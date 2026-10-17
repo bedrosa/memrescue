@@ -131,8 +131,57 @@ IM-02, VHD/VHDX/VMDK, prueba de UI).
   se cubre con pruebas léxicas y de uniones.
 - La navegación de la interfaz se verifica por autodiagnóstico y captura, no por automatización de UI.
 
+## Etapa 5 · M1 (iteración 2): contenedores, mapa de validez, rangos y prueba de UI, 2026-10-17, Entregada para revisión
+
+**Herramienta de referencia**: qemu-img 11.1.2 portable (MSYS2 ucrt64) en `.tools/qemu`, con base de datos
+y paquetes firmados verificados (firmante certificado por ≥ 2 llaves maestras de MSYS2), SHA-256 por
+paquete, licencias y `PROVENANCE.json`. Fuera de Git y del producto; sin instalación, sin PATH, sin
+administrador (`HERRAMIENTAS_TERCEROS.md`). Solo se usa con `convert`/`info`/`map` sobre imágenes temporales.
+
+**Entregado** (motor 0.2.0, ABI 3):
+- `mr-image`: VHD fijo/dinámico, VHDX fijo/dinámico (+ CRC-32C propio), VMDK monolithicSparse, imágenes
+  divididas, apertura unificada por formato y adaptador de tamaño de sector (ADR-017).
+- Referencias externas (diferenciales, padres, extensiones, descriptores separados) → `ExternalReference`
+  sin abrir nada (ADR-018).
+- Mapa de validez por sector con 5 estados en motor, ABI, CLI y visor; salto y lectura hacia atrás;
+  rellenos `BAD!`/`SKIP` distintos; hashes estrictos (ADR-019).
+- `RangeView`: un rango (p. ej. una partición) como dispositivo, anidable.
+- CLI: `split-list`, `--split`, `--range`, `--force-raw`, `verify --jump/--read-back`, `sectors` con estados.
+- WPF: tamaño de sector «Automático», apertura de contenedores, confirmación de imágenes divididas,
+  «Abrir rango de sectores como dispositivo…» (Ctrl+Mayús+R), visor con estado por sector y aviso de no
+  fiables, barra de posición para imágenes grandes, verificación con salto/lectura hacia atrás y recuento
+  por estado, mensajes específicos para dañado/referencia externa/variante no soportada.
+- Pruebas de UI Automation (`--open`), 9 pruebas.
+
+**Errores corregidos durante la integración**: copias duplicadas de la lectura posicional en 4 lectores
+(ahora `mr_io::read_exact_at` público); rutas absolutas de qemu-img en las pruebas (ahora relativas al
+repositorio); descriptor VMDK separado devuelto como «no soportado» en vez de referencia externa; códigos
+FFI provisionales (dañado → E/S) sustituidos por 12/13/14.
+
+**Verificado (ejecución real)**
+
+| Comprobación | Resultado |
+|---|---|
+| `scripts\test.ps1` | **13/13 pasos OK** |
+| Pruebas Rust | **176** por defecto + **12** ignoradas que ejecuta `test.ps1` (3 corpus, 9 qemu-img): 188/188 |
+| Contra qemu-img | VHD 4 conversiones, VHDX 14, VMDK 4 (+ rechazos), corpus × 5 variantes = 15: hash, rangos y mapa idénticos |
+| Pruebas .NET | **52/52** interop + **9/9** interfaz (UI Automation) |
+| `build.ps1` Debug y `-Configuration Release -Publish` | Correctos, 0 advertencias, 0 errores |
+| Exe publicado sin SDK | Abre un VHDX dinámico de qemu-img con `gpt_4kn`: ABI 3, SHA-256 = manifiesto, 2048 sectores leídos, 0 ilegibles, contenedor intacto |
+| Orígenes | Corpus 3/3 intacto; cada prueba de formato comprueba hash/tamaño/fecha de RAW y contenedores |
+
+**Limitaciones conocidas**
+- Diferenciales, VHDX con registro pendiente, VMDK streamOptimized/flat/multiextensión: se rechazan con
+  error específico (no se declaran soportados).
+- Un contenedor con una sola entrada de tabla fuera del fichero se rechaza entero (conservador).
+- qemu-img no genera VHDX con sector lógico de 4096 ni VMDK con granos a cero: esos casos solo se prueban con
+  imágenes sintéticas construidas según la especificación.
+- La prueba de enlace simbólico → dispositivo sigue sin ejecutarse aquí (requiere privilegios); protección
+  cubierta por pruebas léxicas, de uniones y por la verificación de atributos tras abrir.
+- Las pruebas de UI necesitan una sesión de escritorio desbloqueada; no cubren diálogos modales.
+
 ## Siguiente tarea (pendiente de revisión del propietario; no se avanza a M2)
 
-1. Revisión de M1-iteración 1 por el propietario y decisión sobre el commit de esta etapa.
-2. Decidir cómo validar VHD/VHDX/VMDK: herramienta de terceros (qemu-img portable / WSL / VM) o generador propio documentado.
-3. Completar M1: `PartitionView`, IO-07/IO-09, IM-02 y prueba de UI.
+1. Revisión de M1-iteración 2.
+2. Decidir los pendientes de M1 (`ROADMAP.md`): IO-09, `NullDevice`, diferenciales/streamOptimized y la
+   política ante tablas parcialmente dañadas.

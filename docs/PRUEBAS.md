@@ -58,7 +58,7 @@ Una fila de `PARIDAD_DMDE_PRO.md` pasa a **Paridad** solo si:
 ```powershell
 # Desde la raíz del repositorio (no requiere administrador)
 powershell -ExecutionPolicy Bypass -File scripts\build.ps1                 # compila todo (Debug)
-powershell -ExecutionPolicy Bypass -File scripts\test.ps1                  # 10 pasos de verificación
+powershell -ExecutionPolicy Bypass -File scripts\test.ps1                  # 13 pasos (-SkipGui, -SkipQemu)
 powershell -ExecutionPolicy Bypass -File scripts\build.ps1 -Configuration Release -Publish   # exe autocontenido
 ```
 
@@ -79,6 +79,13 @@ Pasos de `test.ps1`:
 | 12 | Orígenes intactos | SHA-256, tamaño y fecha de las imágenes iguales antes y después de todas las operaciones |
 
 (Desde M1 el paso 3 ejecuta 77 pruebas Rust y el 7 incluye la lectura de marcadores en LBA exactas.)
+
+Desde M1-iteración 2 (13 pasos): el paso 3 ejecuta **176** pruebas Rust; un paso nuevo, **«Formatos contra
+qemu-img»**, ejecuta las 9 pruebas ignoradas por defecto (`MR_QEMU_IMG`): VHD/VHDX/VMDK generados por
+qemu-img comparados byte a byte y en su mapa de dispersos, rechazo de streamOptimized/flat/diferenciales y
+el corpus GPT/MBR convertido a 5 variantes de contenedor y leído con la detección automática. El paso de
+`dotnet test` ejecuta 52 pruebas de interop y **9 de interfaz** con UI Automation (`PRUEBAS_UI.md`).
+Documentación de cada formato y de sus pruebas en `formatos/`.
 
 Corpus actual (`tests/corpus/manifests`, imágenes en `tests/corpus/generated`, no versionadas):
 
