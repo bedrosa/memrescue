@@ -10,6 +10,7 @@ fn struct_layouts_match_header() {
     assert_eq!(std::mem::size_of::<MrImageInfo>(), 32);
     assert_eq!(std::mem::size_of::<MrTaskStatus>(), 24);
     assert_eq!(std::mem::size_of::<MrVerifyReport>(), 72);
+    assert_eq!(std::mem::size_of::<MrVerifyOptions>(), 48);
     assert_eq!(mr_abi_version(), 3);
 }
 
@@ -558,4 +559,194 @@ fn split_images_are_listed_then_opened_explicitly() {
     let second = dir.path().join("d.002");
     let sp = second.to_str().unwrap();
     assert_eq!(open(sp, 0, MR_OPEN_SPLIT), Err(MR_ERR_UNSUPPORTED_FEATURE));
+}
+
+// ---------- Verificación extendida: política de omisión de errores (IO-09) ----------
+
+fn verify_options(flags: u32, retries: u32, codes: &[i32]) -> MrVerifyOptions {
+    MrVerifyOptions {
+        struct_size: std::mem::size_of::<MrVerifyOptions>() as u32,
+        flags,
+        start_lba: 0,
+        count: 0,
+        jump_sectors: 0,
+        retries,
+        skip_code_count: codes.len() as u32,
+        skip_codes: if codes.is_empty() {
+            std::ptr::null()
+        } else {
+            codes.as_ptr()
+        },
+    }
+}
+
+/// Origen con fallos simulados registrado como cualquier otro (sin pasar por un fichero).
+fn faulty_source() -> u64 {
+    let dev = mr_io::FaultyDevice::new(mr_io::MemDevice::new(vec![0x5Au8; 512 * 64], 512).unwrap())
+        .with_bad_code([10], 23)
+        .with_bad_code([20], 1117)
+        .with_bad([30]);
+    insert(Entry::Source(mr_api::source_from_device(
+        Arc::new(dev),
+        "fallos simulados",
+    )))
+}
+
+fn run_verify_ex(src: u64, o: &MrVerifyOptions) -> (u64, MrVerifyReport) {
+    let mut task = 0u64;
+    assert_eq!(
+        unsafe { mr_source_verify_start_ex(src, o, &mut task) },
+        MR_OK,
+        "{}",
+        last_error()
+    );
+    assert_eq!(wait(task).state, 2);
+    let mut rep = MrVerifyReport::default();
+    assert_eq!(unsafe { mr_verify_result(task, &mut rep) }, MR_OK);
+    (task, rep)
+}
+
+fn error_codes(task: u64) -> (u64, Vec<(i32, u64)>) {
+    let (mut omitted, mut n) = (0u64, 0u32);
+    assert_eq!(
+        unsafe { mr_verify_error_summary(task, &mut omitted, &mut n) },
+        MR_OK
+    );
+    let mut v = Vec::new();
+    for i in 0..n {
+        let (mut c, mut k) = (0i32, 0u64);
+        assert_eq!(
+            unsafe { mr_verify_error_code(task, i, &mut c, &mut k) },
+            MR_OK
+        );
+        v.push((c, k));
+    }
+    let (mut c, mut k) = (0i32, 0u64);
+    assert_eq!(
+        unsafe { mr_verify_error_code(task, n, &mut c, &mut k) },
+        MR_ERR_OUT_OF_RANGE
+    );
+    (omitted, v)
+}
+
+#[test]
+fn verify_ex_applies_skip_codes_and_ignore_all() {
+    let src = faulty_source();
+    // Sin política: todos los ilegibles se reintentan (un bloque de 64 + 2 reintentos × 3 sectores).
+    let (task, rep) = run_verify_ex(src, &verify_options(0, 2, &[]));
+    assert_eq!((rep.sectors_unreadable, rep.retry_reads), (3, 1 + 6));
+    assert_eq!(error_codes(task), (0, vec![(23, 1), (1117, 1)]));
+    mr_task_free(task);
+    // Códigos 23 y 1117 omitidos (con duplicados en la lista): solo el 30 se reintenta.
+    let codes = [1117, 23, 23];
+    let (task, rep) = run_verify_ex(src, &verify_options(0, 2, &codes));
+    assert_eq!(
+        (
+            rep.sectors_read,
+            rep.sectors_unreadable,
+            rep.sectors_recovered
+        ),
+        (61, 3, 0)
+    );
+    assert_eq!(rep.retry_reads, 1 + 2);
+    assert_eq!(error_codes(task), (2, vec![(23, 1), (1117, 1)]));
+    // Los tramos no fiables son los tres ilegibles, nunca datos.
+    assert_eq!(rep.untrusted_range_count, 3);
+    mr_task_free(task);
+    // Ignorar todo, con salto y lectura hacia atrás.
+    let mut o = verify_options(MR_VERIFY_IGNORE_ALL_ERRORS | MR_VERIFY_READ_BACK, 5, &[]);
+    o.jump_sectors = 4;
+    let (task, rep) = run_verify_ex(src, &o);
+    assert_eq!(rep.sectors_unreadable, 3);
+    assert_eq!(rep.sectors_read + rep.sectors_unreadable, 64);
+    // Sin reintentos: solo las relecturas sector a sector de los 3 bloques que fallaron.
+    assert_eq!(rep.retry_reads, 3);
+    assert_eq!(error_codes(task).0, 3);
+    mr_task_free(task);
+    // Rango acotado que solo contiene el 20.
+    let mut o = verify_options(0, 3, &[1117]);
+    o.start_lba = 15;
+    o.count = 10;
+    let (task, rep) = run_verify_ex(src, &o);
+    assert_eq!((rep.sectors_requested, rep.sectors_unreadable), (10, 1));
+    assert_eq!(error_codes(task), (1, vec![(1117, 1)]));
+    mr_task_free(task);
+    mr_source_close(src);
+}
+
+#[test]
+fn verify_ex_validates_its_options() {
+    let (_d, p) = temp_image("x.img", 32, 512);
+    let src = open(&p, 512, 0).unwrap();
+    let mut task = 0u64;
+    let bad = |o: &MrVerifyOptions| {
+        let mut t = 0u64;
+        let rc = unsafe { mr_source_verify_start_ex(src, o, &mut t) };
+        assert_eq!(t, 0);
+        rc
+    };
+    let mut o = verify_options(0, 1, &[]);
+    o.struct_size = 40;
+    assert_eq!(bad(&o), MR_ERR_INVALID_ARGUMENT);
+    assert!(last_error().contains("mr_verify_options"));
+    o.struct_size = 56;
+    assert_eq!(bad(&o), MR_ERR_INVALID_ARGUMENT);
+    assert_eq!(bad(&verify_options(4, 1, &[])), MR_ERR_INVALID_ARGUMENT);
+    assert_eq!(bad(&verify_options(0, 101, &[])), MR_ERR_INVALID_ARGUMENT);
+    assert_eq!(
+        bad(&verify_options(0, 1, &[23, 0])),
+        MR_ERR_INVALID_ARGUMENT
+    );
+    assert_eq!(bad(&verify_options(0, 1, &[-5])), MR_ERR_INVALID_ARGUMENT);
+    let many = vec![23i32; 257];
+    assert_eq!(bad(&verify_options(0, 1, &many)), MR_ERR_INVALID_ARGUMENT);
+    let mut o = verify_options(0, 1, &[]);
+    o.skip_code_count = 2;
+    assert_eq!(bad(&o), MR_ERR_INVALID_ARGUMENT);
+    // Punteros nulos y handle inválido.
+    let o = verify_options(0, 1, &[23]);
+    assert_eq!(
+        unsafe { mr_source_verify_start_ex(src, std::ptr::null(), &mut task) },
+        MR_ERR_INVALID_ARGUMENT
+    );
+    assert_eq!(
+        unsafe { mr_source_verify_start_ex(src, &o, std::ptr::null_mut()) },
+        MR_ERR_INVALID_ARGUMENT
+    );
+    assert_eq!(
+        unsafe { mr_source_verify_start_ex(999_999, &o, &mut task) },
+        MR_ERR_INVALID_HANDLE
+    );
+    // Rango fuera del origen: la tarea falla con la posición.
+    let mut o = verify_options(0, 1, &[23]);
+    o.start_lba = 30;
+    o.count = 5;
+    assert_eq!(
+        unsafe { mr_source_verify_start_ex(src, &o, &mut task) },
+        MR_OK
+    );
+    assert_eq!(wait(task).state, 3);
+    mr_task_free(task);
+    // Imagen sana con política activada: todo leído; 256 códigos es el máximo admitido.
+    let many = vec![23i32; 256];
+    let (t, rep) = run_verify_ex(src, &verify_options(MR_VERIFY_IGNORE_ALL_ERRORS, 1, &many));
+    assert_eq!((rep.sectors_read, rep.retry_reads), (32, 0));
+    assert_eq!(error_codes(t), (0, vec![]));
+    // El resumen de errores rechaza punteros nulos y tareas de otro tipo.
+    let mut n = 0u32;
+    assert_eq!(
+        unsafe { mr_verify_error_summary(t, std::ptr::null_mut(), &mut n) },
+        MR_ERR_INVALID_ARGUMENT
+    );
+    assert_eq!(
+        unsafe { mr_verify_error_code(src, 0, &mut 0, &mut 0) },
+        MR_ERR_INVALID_HANDLE
+    );
+    mr_task_free(t);
+    // La función anterior sigue rechazando el indicador nuevo (su contrato no cambia).
+    assert_eq!(
+        unsafe { mr_source_verify_start(src, 0, 0, 1, 0, MR_VERIFY_IGNORE_ALL_ERRORS, &mut task) },
+        MR_ERR_INVALID_ARGUMENT
+    );
+    mr_source_close(src);
 }

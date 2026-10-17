@@ -43,6 +43,10 @@ pub const MR_OPEN_SPLIT: u32 = 2;
 pub const MR_VERIFY_READ_BACK: u32 = 1;
 /// Máximo de reintentos por sector aceptado en la frontera C.
 pub const MAX_RETRIES: u32 = 100;
+/// `mr_source_verify_start_ex`: modo «ignorar todo», ningún error se reintenta.
+pub const MR_VERIFY_IGNORE_ALL_ERRORS: u32 = 2;
+/// Máximo de códigos de error a omitir en `MrVerifyOptions::skip_codes`.
+pub const MAX_SKIP_CODES: u32 = 256;
 pub const MR_ERR_PANIC: i32 = 99;
 
 #[repr(C)]
@@ -80,6 +84,27 @@ pub struct MrVerifyReport {
     /// 1 si el mapa se truncó (los recuentos por estado siguen siendo exactos).
     pub ranges_truncated: u32,
     pub reserved: u32,
+}
+
+/// Opciones de `mr_source_verify_start_ex` (48 bytes). `struct_size` permite ampliar la estructura
+/// en el futuro sin romper la ABI: el llamador escribe `sizeof(mr_verify_options)` de su cabecera.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct MrVerifyOptions {
+    pub struct_size: u32,
+    /// `MR_VERIFY_READ_BACK | MR_VERIFY_IGNORE_ALL_ERRORS`.
+    pub flags: u32,
+    pub start_lba: u64,
+    /// 0 = hasta el último sector.
+    pub count: u64,
+    /// Sectores que se saltan tras cada ilegible (0 = sin salto).
+    pub jump_sectors: u64,
+    /// Reintentos por sector (0–100).
+    pub retries: u32,
+    /// Número de elementos de `skip_codes` (≤ `MAX_SKIP_CODES`).
+    pub skip_code_count: u32,
+    /// Códigos de error del sistema que no se reintentan (positivos); nulo si `skip_code_count` = 0.
+    pub skip_codes: *const i32,
 }
 
 thread_local! {
@@ -800,10 +825,6 @@ pub unsafe extern "C" fn mr_source_verify_start(
                 "demasiados reintentos (máximo 100)",
             );
         }
-        let src = match source(source_h) {
-            Ok(s) => s,
-            Err(c) => return c,
-        };
         let opts = VerifyOptions {
             start_lba,
             count: (count != 0).then_some(count),
@@ -815,21 +836,207 @@ pub unsafe extern "C" fn mr_source_verify_start(
                 ..ReadPolicy::default()
             },
         };
-        match mr_api::start_verify_task(src, opts) {
-            // SAFETY: `out_task` no es nulo.
-            Ok(task) => unsafe {
-                write_out(
-                    out_task,
-                    insert(Entry::Verify {
-                        task,
-                        outcome: None,
-                    }),
-                )
-            },
-            Err(e) => api_fail(&e),
+        // SAFETY: `out_task` no es nulo.
+        unsafe { spawn_verify(source_h, opts, out_task) }
+    })
+}
+
+/// Lanza la verificación y escribe el handle de la tarea.
+///
+/// # Safety
+/// `out_task` no es nulo y es válido para escritura.
+unsafe fn spawn_verify(source_h: u64, opts: VerifyOptions, out_task: *mut u64) -> i32 {
+    let src = match source(source_h) {
+        Ok(s) => s,
+        Err(c) => return c,
+    };
+    match mr_api::start_verify_task(src, opts) {
+        // SAFETY: contrato de la función.
+        Ok(task) => unsafe {
+            write_out(
+                out_task,
+                insert(Entry::Verify {
+                    task,
+                    outcome: None,
+                }),
+            )
+        },
+        Err(e) => api_fail(&e),
+    }
+}
+
+// ---------- Verificación extendida: política de omisión de errores (IO-09) ----------
+
+/// Convierte y valida las opciones C de la verificación extendida.
+///
+/// # Safety
+/// `o.skip_codes` debe apuntar a `o.skip_code_count` enteros válidos (o ser nulo con 0).
+unsafe fn verify_options_ex(o: &MrVerifyOptions) -> Result<VerifyOptions, i32> {
+    if o.flags & !(MR_VERIFY_READ_BACK | MR_VERIFY_IGNORE_ALL_ERRORS) != 0 {
+        return Err(fail(
+            MR_ERR_INVALID_ARGUMENT,
+            "opciones de verificación no válidas",
+        ));
+    }
+    if o.retries > MAX_RETRIES {
+        return Err(fail(
+            MR_ERR_INVALID_ARGUMENT,
+            "demasiados reintentos (máximo 100)",
+        ));
+    }
+    if o.skip_code_count > MAX_SKIP_CODES {
+        return Err(fail(
+            MR_ERR_INVALID_ARGUMENT,
+            format!("demasiados códigos de error a omitir (máximo {MAX_SKIP_CODES})"),
+        ));
+    }
+    let codes: &[i32] = match (o.skip_codes.is_null(), o.skip_code_count) {
+        (_, 0) => &[],
+        (true, _) => {
+            return Err(fail(
+                MR_ERR_INVALID_ARGUMENT,
+                "lista de códigos nula con recuento distinto de 0",
+            ))
+        }
+        // SAFETY: puntero no nulo con `skip_code_count` elementos por contrato.
+        (false, n) => unsafe { std::slice::from_raw_parts(o.skip_codes, n as usize) },
+    };
+    if let Some(c) = codes.iter().find(|&&c| c <= 0) {
+        return Err(fail(
+            MR_ERR_INVALID_ARGUMENT,
+            format!("código de error no válido: {c} (debe ser positivo)"),
+        ));
+    }
+    let mut skip = codes.to_vec();
+    skip.sort_unstable();
+    skip.dedup();
+    Ok(VerifyOptions {
+        start_lba: o.start_lba,
+        count: (o.count != 0).then_some(o.count),
+        policy: ReadPolicy {
+            retries: o.retries,
+            on_error: OnError::FillAndContinue,
+            jump_sectors: o.jump_sectors,
+            read_back: o.flags & MR_VERIFY_READ_BACK != 0,
+            skip_error_codes: skip,
+            ignore_all_errors: o.flags & MR_VERIFY_IGNORE_ALL_ERRORS != 0,
+            ..ReadPolicy::default()
+        },
+    })
+}
+
+/// Verificación con opciones extendidas: además de las de `mr_source_verify_start`, la política de
+/// omisión de errores (códigos que no se reintentan y modo «ignorar todo»).
+///
+/// # Safety
+/// `options` y `out_task` deben ser punteros válidos; `options.skip_codes` debe apuntar a
+/// `options.skip_code_count` enteros (o ser nulo con recuento 0).
+#[no_mangle]
+pub unsafe extern "C" fn mr_source_verify_start_ex(
+    source_h: u64,
+    options: *const MrVerifyOptions,
+    out_task: *mut u64,
+) -> i32 {
+    guard(|| {
+        if out_task.is_null() || options.is_null() {
+            return fail(MR_ERR_INVALID_ARGUMENT, "puntero nulo");
+        }
+        // Se lee primero solo `struct_size`, para no leer más allá de una estructura más pequeña.
+        // SAFETY: `options` no es nulo y contiene al menos su primer campo.
+        let size = unsafe { options.cast::<u32>().read_unaligned() };
+        let expected = std::mem::size_of::<MrVerifyOptions>();
+        if size as usize != expected {
+            return fail(
+                MR_ERR_INVALID_ARGUMENT,
+                format!("tamaño de mr_verify_options no válido: {size} (se esperaba {expected})"),
+            );
+        }
+        // SAFETY: el tamaño declarado coincide con el de la estructura.
+        let o = unsafe { options.read_unaligned() };
+        // SAFETY: contrato del llamador sobre `skip_codes`.
+        let opts = match unsafe { verify_options_ex(&o) } {
+            Ok(v) => v,
+            Err(c) => return c,
+        };
+        // SAFETY: `out_task` no es nulo.
+        unsafe { spawn_verify(source_h, opts, out_task) }
+    })
+}
+
+/// Resumen de la política de errores aplicada: sectores cuyo error se omitió (sin agotar
+/// reintentos) y número de códigos de error del sistema distintos registrados.
+///
+/// # Safety
+/// `out_omitted` y `out_code_count` deben ser punteros válidos.
+#[no_mangle]
+pub unsafe extern "C" fn mr_verify_error_summary(
+    task: u64,
+    out_omitted: *mut u64,
+    out_code_count: *mut u32,
+) -> i32 {
+    guard(|| {
+        if out_omitted.is_null() || out_code_count.is_null() {
+            return fail(MR_ERR_INVALID_ARGUMENT, "puntero de salida nulo");
+        }
+        match with_verify(task, |r| {
+            (
+                r.omitted_errors,
+                u32::try_from(r.error_codes.len()).unwrap_or(u32::MAX),
+            )
+        }) {
+            Ok((omitted, n)) => {
+                // SAFETY: punteros no nulos y válidos por contrato.
+                unsafe {
+                    out_omitted.write(omitted);
+                    out_code_count.write(n);
+                }
+                MR_OK
+            }
+            Err(c) => c,
         }
     })
 }
+
+/// Código de error del sistema nº `index` (en orden creciente) y número de sectores ilegibles
+/// cuyo último intento falló con él.
+///
+/// # Safety
+/// `out_code` y `out_sectors` deben ser punteros válidos.
+#[no_mangle]
+pub unsafe extern "C" fn mr_verify_error_code(
+    task: u64,
+    index: u32,
+    out_code: *mut i32,
+    out_sectors: *mut u64,
+) -> i32 {
+    guard(|| {
+        if out_code.is_null() || out_sectors.is_null() {
+            return fail(MR_ERR_INVALID_ARGUMENT, "puntero de salida nulo");
+        }
+        match with_verify(task, |r| {
+            r.error_codes
+                .iter()
+                .nth(index as usize)
+                .map(|(&c, &n)| (c, n))
+        }) {
+            Ok(Some((code, n))) => {
+                // SAFETY: punteros no nulos y válidos por contrato.
+                unsafe {
+                    out_code.write(code);
+                    out_sectors.write(n);
+                }
+                MR_OK
+            }
+            Ok(None) => fail(
+                MR_ERR_OUT_OF_RANGE,
+                format!("índice de código de error fuera de límites: {index}"),
+            ),
+            Err(c) => c,
+        }
+    })
+}
+
+// ---------- Fin de la verificación extendida ----------
 
 /// Tramos no fiables `(lba, nº, estado)` del mapa de validez, en orden.
 fn untrusted_runs(r: &ReadReport) -> impl Iterator<Item = (u64, u64, SectorState)> + '_ {

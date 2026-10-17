@@ -125,6 +125,18 @@ pub enum IoError {
     },
 }
 
+impl IoError {
+    /// Código de error del sistema operativo que causó el fallo de E/S, si lo hay (en Windows,
+    /// p. ej. 23 = `ERROR_CRC`, 1117 = `ERROR_IO_DEVICE`). `None` para errores sin código del
+    /// sistema (estructurales, de rango, simulados sin código…).
+    pub fn os_error_code(&self) -> Option<i32> {
+        match self {
+            IoError::Io(e) | IoError::Read { source: e, .. } => e.raw_os_error(),
+            _ => None,
+        }
+    }
+}
+
 pub type Result<T> = std::result::Result<T, IoError>;
 
 /// Dispositivo de bloques de solo lectura.

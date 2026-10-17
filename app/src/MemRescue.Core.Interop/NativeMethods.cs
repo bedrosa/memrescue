@@ -14,6 +14,8 @@ internal static partial class NativeMethods
     internal const uint OpenForceRaw = 1;
     internal const uint OpenSplit = 2;
     internal const uint VerifyReadBack = 1;
+    internal const uint VerifyIgnoreAllErrors = 2;
+    internal const int MaxSkipCodes = 256;
 
     [LibraryImport(Dll)]
     internal static partial uint mr_abi_version();
@@ -72,7 +74,16 @@ internal static partial class NativeMethods
         ulong source, ulong startLba, ulong count, uint retries, ulong jumpSectors, uint flags, out ulong task);
 
     [LibraryImport(Dll)]
+    internal static partial int mr_source_verify_start_ex(ulong source, in MrVerifyOptions options, out ulong task);
+
+    [LibraryImport(Dll)]
     internal static partial int mr_verify_result(ulong task, out MrVerifyReport report);
+
+    [LibraryImport(Dll)]
+    internal static partial int mr_verify_error_summary(ulong task, out ulong omitted, out uint codeCount);
+
+    [LibraryImport(Dll)]
+    internal static partial int mr_verify_error_code(ulong task, uint index, out int code, out ulong sectors);
 
     [LibraryImport(Dll)]
     internal static partial int mr_verify_untrusted_range(ulong task, ulong index, out ulong lba, out ulong count, out uint state);
@@ -106,6 +117,23 @@ public struct MrTaskStatus
     public uint Reserved;
     public ulong Done;
     public ulong Total;
+}
+
+/// <summary>
+/// Espejo de <c>mr_verify_options</c> (48 bytes). <see cref="SkipCodes"/> apunta a un
+/// <c>int[]</c> fijado en memoria durante la llamada.
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct MrVerifyOptions
+{
+    public uint StructSize;
+    public uint Flags;
+    public ulong StartLba;
+    public ulong Count;
+    public ulong JumpSectors;
+    public uint Retries;
+    public uint SkipCodeCount;
+    public nint SkipCodes;
 }
 
 /// <summary>Espejo de <c>mr_verify_report</c> (72 bytes).</summary>

@@ -24,13 +24,18 @@ incluye un mapa de validez con recuentos exactos.
 ## API (`mr_io::resilient`)
 
 - `ReadPolicy { chunk_sectors (2048), retries (1), on_error (Fail), bad_fill (BAD!),
-  skip_fill (SKIP), jump_sectors (0), read_back (false) }`.
+  skip_fill (SKIP), jump_sectors (0), read_back (false), skip_error_codes ([]),
+  ignore_all_errors (false) }` y `ReadPolicy::omits(&IoError) -> bool`.
+- `IoError::os_error_code() -> Option<i32>`: código de error del sistema de un fallo de E/S.
 - `read_range(dev, start, count, policy, sink, progress) -> Result<ReadReport>`:
   `sink(lba, datos, estados)` recibe tramos con **un estado por sector**, siempre en orden
   creciente, contiguos y sin huecos ni solapes; `progress(hechos, total)` en sectores, `false` cancela.
 - `read_sectors_mapped(dev, lba, count, policy) -> Result<(Vec<u8>, Vec<SectorState>)>`: lectura
   acotada a `MAX_READ_REQUEST` para el visor hexadecimal.
-- `ReadReport { sectors_requested, retry_reads, map: ValidityMap }`.
+- `ReadReport { sectors_requested, retry_reads, omitted_errors, error_codes, map: ValidityMap }`:
+  `omitted_errors` cuenta los sectores cuyo error se omitió por la política; `error_codes`
+  (`BTreeMap<i32, u64>`) cuenta, por código del sistema, los sectores `Unreadable` cuyo último
+  intento falló con él (incluida la lectura hacia atrás; los errores sin código no aparecen).
 - `ValidityMap`: `new`, `push`, `runs`, `truncated`, `count`, `all_trustworthy`, y además
   `total` y `untrusted_runs` (tramos `Unreadable`/`Skipped` guardados).
 - Constantes: `MAX_MAP_RUNS = 100_000`, `READ_BACK_MAX_BYTES = 8 MiB`.
@@ -58,7 +63,23 @@ incluye un mapa de validez con recuentos exactos.
    hacia atrás, **un intento por sector** (sin reintentos), saltándose los `Sparse`. Los legibles
    pasan a `Read`; el primer fallo queda `Unreadable` y el resto (hacia el inicio del salto) sigue
    `Skipped`. La lectura hacia atrás no provoca nuevos saltos.
-6. **Progreso y cancelación**: se consulta `progress` antes de cada bloque y antes de cada trozo de
+6. **Omisión de errores** (IO-09; `skip_error_codes`, `ignore_all_errors`): se evalúa en **cada
+   intento individual fallido** de la fase 3. Si el error tiene un código del sistema incluido en
+   `skip_error_codes` (p. ej. 23 `ERROR_CRC`, 1117 `ERROR_IO_DEVICE`), o si `ignore_all_errors`, el
+   sector **no se reintenta más** y pasa directamente a fallo definitivo. Detalles:
+   - El estado resultante es siempre `Unreadable` con `bad_fill` (se intentó leer y falló), nunca
+     `Recovered` ni `Read`. `Skipped` sigue reservado a sectores que no se intentan leer (saltos).
+   - La política decide **si se insiste**, no si se aborta: con `OnError::Fail` el error omitido
+     sigue abortando con su posición exacta (los hashes siguen siendo estrictos).
+   - `retries` solo se aplica a errores no omitidos; con «ignorar todo» nunca hay `Recovered`.
+   - Un error sin código del sistema (estructural, simulado sin código) solo se omite en modo
+     «ignorar todo».
+   - La lectura del **bloque** no se evalúa: un bloque fallido siempre se relee sector a sector (un
+     intento por sector como mínimo) para no marcar como ilegibles sectores legibles.
+   - **Salto**: un sector omitido es `Unreadable` como cualquier otro, así que provoca el salto de
+     `jump_sectors` si está configurado. **Lectura hacia atrás**: ya es de un intento sin reintentos;
+     la política no la cambia, pero su fallo también se registra en `error_codes`.
+7. **Progreso y cancelación**: se consulta `progress` antes de cada bloque y antes de cada trozo de
    un salto (los saltos enormes también se pueden cancelar). Cancelación → `IoError::Cancelled`.
    Un error devuelto por `sink` se propaga tal cual.
 
@@ -97,17 +118,23 @@ Independientes del tamaño del rango y del salto:
 ## Uso en el resto del motor
 
 - `mr_api::verify` devuelve el `ReadReport` con el mapa.
-- `mr-ffi` (ABI 2): `sectors_ok = Read + Recovered`, `sectors_bad = Unreadable`, los «rangos
-  ilegibles» son los tramos `Unreadable`. Esta ABI no activa saltos. El resto de estados se
-  expondrá en la ABI 3.
+- `mr-ffi` (ABI 3): `mr_source_verify_start` (reintentos, salto, lectura hacia atrás) y
+  `mr_source_verify_start_ex` con `mr_verify_options` (además, `skip_codes` y
+  `MR_VERIFY_IGNORE_ALL_ERRORS`); `mr_verify_error_summary` / `mr_verify_error_code` exponen
+  `omitted_errors` y `error_codes`. Ver `docs/API_FFI.md`.
+- Interfaz: pestaña Comprobaciones, casilla «Ignorar todos los errores (sin reintentos)»
+  (`IgnoreErrorsBox`) y lista «No reintentar los códigos de error» (`SkipCodesBox`).
 - CLI `verify`: muestra el recuento por estado y los tramos no fiables; con `--json` añade
   `states`, `untrusted_ranges` y `ranges_truncated` (se conservan `sectors`, `ok`, `bad`,
-  `bad_ranges`). Código de salida 3 si hay algún sector no fiable.
+  `bad_ranges`). Código de salida 3 si hay algún sector no fiable. `--skip-codes 23,1117` e
+  `--ignore-errors` activan la política; el texto y el JSON (`error_policy`, `omitted_errors`,
+  `error_codes`) registran la política aplicada y su efecto.
 
 ## Pruebas (datos sintéticos; `cargo test -p mr-io`)
 
 Dispositivos: `MemDevice` (sector `l` relleno con `l as u8`), `FaultyDevice` (ilegibles,
-intermitentes, regiones dispersas y contador de lecturas por sector) y un dispositivo virtual de
+intermitentes, regiones dispersas, contador de lecturas por sector y un código de error del sistema
+por sector con `with_bad_code` / `with_flaky_code`, mediante `io::Error::from_raw_os_error`) y un dispositivo virtual de
 2 GiB sin datos en memoria. Una comprobación común (`assert_honest`) verifica sector a sector que el
 contenido corresponde al estado y que mapa, recuentos y `all_trustworthy()` coinciden con lo entregado.
 
@@ -130,7 +157,13 @@ contenido corresponde al estado y que mapa, recuentos y `all_trustworthy()` coin
 | `incoherent_allocation_is_rejected` | asignación incoherente → `Corrupt` |
 | `validity_map_*` (4) | fusión, huecos, pánico por desorden/desbordamiento, truncado con recuentos exactos |
 | `read_sectors_mapped_for_every_common_sector_size` | visor: estados por sector, errores y límite |
-| `fault::tests` (3) | superposición de dispersos, solapes rechazados, contador por sector |
+| `skip_codes_avoid_retries_only_for_listed_codes` | códigos de la lista sin reintentos (2 lecturas), otros códigos y sin código con reintentos; recuentos y tabla de códigos |
+| `ignore_all_never_retries_and_never_recovers` | «ignorar todo»: un intermitente recuperable queda `Unreadable`; la lista no afecta a errores sin código |
+| `omitted_errors_still_abort_in_strict_mode` | con `Fail`, el error omitido aborta con posición y código, sin reintentos |
+| `omitted_errors_combine_with_jump_and_read_back` | omisión + salto (con y sin lectura hacia atrás), saltados sin leer |
+| `omitted_errors_at_the_edges_of_the_range` | primer/último sector del rango, vecinos fuera del rango nunca leídos, salto acotado, rango de 1 sector |
+| `policy_omits_by_code_or_all` | `ReadPolicy::omits` y `IoError::os_error_code` |
+| `fault::tests` (4) | superposición de dispersos, solapes rechazados, contador por sector, códigos por sector |
 
-Resultado: `cargo test --workspace` correcto (mr-io: 43 pruebas, de ellas 20 de este módulo y 3 de
+Resultado: `cargo test --workspace` correcto (mr-io: 58 pruebas, de ellas 26 de este módulo y 4 de
 `fault`), `cargo clippy --workspace --all-targets -- -D warnings` sin avisos, `cargo fmt --all` aplicado.

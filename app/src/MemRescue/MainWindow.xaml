@@ -295,6 +295,18 @@
                                 <Button x:Name="VerifyStartButton" Content="Comprobar" Click="VerifyStart_Click" Margin="12,0,4,0" />
                                 <Button x:Name="VerifyCancelButton" Content="Cancelar" Click="VerifyCancel_Click" IsEnabled="False" />
                             </StackPanel>
+                            <!-- Política de omisión de errores (IO-09) -->
+                            <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                                <CheckBox x:Name="IgnoreErrorsBox" Content="Ignorar todos los errores (sin reintentos)" VerticalAlignment="Center"
+                                          AutomationProperties.AutomationId="IgnoreErrorsBox"
+                                          Checked="IgnoreErrorsBox_Changed" Unchecked="IgnoreErrorsBox_Changed"
+                                          ToolTip="Ningún sector se reintenta: al primer fallo queda ilegible (patrón de relleno, nunca datos). Útil en discos muy dañados" />
+                                <TextBlock x:Name="SkipCodesLabel" Text="No reintentar los códigos de error:" VerticalAlignment="Center" Margin="16,0,6,0" />
+                                <TextBox x:Name="SkipCodesBox" Width="140" VerticalAlignment="Center"
+                                         AutomationProperties.AutomationId="SkipCodesBox"
+                                         AutomationProperties.LabeledBy="{Binding ElementName=SkipCodesLabel}"
+                                         ToolTip="Códigos de error del sistema separados por comas, p. ej. 23 (error de CRC), 1117 (error de E/S del dispositivo). Un sector que falla con uno de ellos queda ilegible sin reintentos" />
+                            </StackPanel>
                             <ProgressBar x:Name="VerifyProgress" Height="16" Minimum="0" Maximum="1" />
                             <TextBlock x:Name="VerifyProgressText" Margin="0,4,0,6" Foreground="{StaticResource MutedBrush}" />
                             <TextBox x:Name="VerifyResults" IsReadOnly="True" FontFamily="Consolas" MinHeight="70" TextWrapping="NoWrap"
