@@ -130,6 +130,22 @@ imagen dividida con `MAX_SEGMENTS` segmentos y un repetido al final
 O(1) de 10 000 tramos no fiables por la FFI (`untrusted_ranges_are_indexed_in_constant_time`) y el perfil
 Release compila con `overflow-checks = true` (`cargo test --release --workspace` pasa con ellas).
 
+Memoria acotada al abrir contenedores (issue #38, addendum de ADR-020): `core/mr-ffi/tests/table_memory.rs`
+(4 pruebas, no ignoradas) genera en un directorio temporal imágenes sintéticas con la tabla al límite de
+`MAX_TABLE_BYTES` y entradas duplicadas (VHD con BAT de 256 MiB y bloques de 512 B; VHDX con BAT de
+256 MiB y bloques de 1 MiB; VMDK con GD de 256 MiB y todas las entradas en la misma GT; VMDK con
+131 072 GT y todos los granos en el mismo sector), las abre en modo estricto (debe dar `Corrupt`) y
+tolerante (debe descartar todos los bloques o granos) y mide el pico de memoria con un asignador global
+que cuenta los bytes vivos; el pico debe quedar dentro de `mr_image::open_memory_budget` más 4 MiB
+para reservas que no son tablas. Está en `mr-ffi` porque es el único crate con `unsafe` permitido
+(`GlobalAlloc`); las medidas se serializan con un mutex. Cada imagen ocupa unos 260 MiB en disco y se
+borra al terminar; el pico de memoria del proceso de pruebas es de unos 530 MiB. Duración: unos 75 s en
+Debug y unos 8 s en Release (`cargo test --release -p mr-ffi --test table_memory -- --nocapture`
+muestra los picos). Además, pruebas unitarias en `mr-image` del recorrido en flujo de la detección de
+solapes (un millón de zonas idénticas, parada en el primer error), del registro de daños como mapa de
+bits, del fallo inmediato en modo estricto y del contador de presupuesto (límite, liberación y fallo
+de asignación informado como error).
+
 **Integración continua** (`.github/workflows/ci.yml`, detalle en `CONTRIBUTING.md`): las mismas
 comprobaciones se ejecutan en GitHub Actions en cada rama `feat/` o `fix/` y en cada PR, más la auditoría
 de higiene del repositorio (`tools/check_repo_hygiene.py`: rutas personales, correos, credenciales,

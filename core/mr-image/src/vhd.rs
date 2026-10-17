@@ -18,7 +18,8 @@
 //! como datos no fiables. El pie, la cabecera dinámica y la ubicación de la BAT siguen siendo
 //! críticos (`Corrupt` en ambos modos).
 
-use crate::tolerant::{self, Damage, Zone};
+use crate::budget::{Budget, TABLE_CHUNK};
+use crate::tolerant::{self, Damage, Hit, Zone};
 use mr_io::{Allocation, AllocationRun, BlockDevice, IoError, Result};
 use std::fs::File;
 use std::sync::{Arc, Mutex};
@@ -479,71 +480,97 @@ impl VhdImage {
                 crate::MAX_TABLE_BYTES
             )));
         }
-        // Solo se leen las entradas que cubren el tamaño virtual (needed ≤ max_entries).
-        let needed_bytes = usize::try_from(needed * 4)
-            .map_err(|_| unsupported("BAT demasiado grande para esta plataforma"))?;
-        let mut raw = vec![0u8; needed_bytes];
-        read_meta(file, h.table_offset, &mut raw)?;
-        let mut bat: Vec<u32> = raw
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|&c| u32::from_be_bytes(c))
-            .collect();
+        // Solo se leen las entradas que cubren el tamaño virtual (needed ≤ max_entries), por
+        // trozos y decodificándolas sobre la marcha: la BAT en bruto nunca se guarda entera.
+        let table_bytes = needed * 4;
+        let mut budget = Budget::new(FORMAT);
+        budget.add_tables(table_bytes);
+        let mut bat: Vec<u32> = budget.vec(needed, "BAT")?;
+        let mut buf = vec![0u8; TABLE_CHUNK.min(table_bytes as usize)];
+        let mut pos = 0u64;
+        while pos < table_bytes {
+            let len = (table_bytes - pos).min(buf.len() as u64) as usize;
+            let chunk = &mut buf[..len];
+            read_meta(file, h.table_offset + pos, chunk)?;
+            bat.extend(
+                chunk
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|&c| u32::from_be_bytes(c)),
+            );
+            pos += len as u64;
+        }
+        drop(buf);
 
         // Mapa de bits: un bit por sector, redondeado a múltiplo de 512 bytes.
         let bitmap_bytes = (block_size / SECTOR).div_ceil(8).div_ceil(SECTOR) * SECTOR;
 
         // Correspondencia inequívoca de cada bloque asignado: mapa de bits + parte útil dentro de la
         // zona de datos, sin solapar la copia del pie, la cabecera dinámica, la BAT ni otro bloque.
+        // En modo estricto la apertura falla en la primera entrada inválida.
         let span = |i: u64| -> (u64, u64) {
             let start = u64::from(bat[i as usize]) * SECTOR;
             // El último bloque puede cubrir más que el tamaño virtual: solo se exige la parte útil.
             let useful = block_size.min(size - i * block_size);
             (start, start.saturating_add(bitmap_bytes + useful))
         };
-        let mut damage = Damage::default();
-        let mut candidates = Vec::new();
+        let in_file = |i: u64| span(i).1 <= data_end;
+        let mut damage = Damage::new(FORMAT, needed, tolerant, &mut budget)?;
+        let mut allocated = 0u64;
         for (i, &entry) in bat.iter().enumerate() {
             if entry == UNALLOCATED {
                 continue;
             }
             let i = i as u64;
-            let (_, end) = span(i);
-            if end > data_end {
+            if in_file(i) {
+                allocated += 1;
+            } else {
                 damage.add(i, || {
                     format!("el bloque {i} (sector {entry:#x} del fichero) queda fuera del fichero")
-                });
-            } else {
-                candidates.push(i);
+                })?;
             }
         }
-        let zones = [
+        // Índices `u32`: la BAT tiene como mucho MAX_TABLE_BYTES / 4 = 2^26 entradas.
+        let mut candidates: Vec<u32> = budget.vec(allocated, "lista de bloques asignados")?;
+        candidates.extend(
+            (0..needed)
+                .filter(|&i| bat[i as usize] != UNALLOCATED && in_file(i))
+                .map(|i| i as u32),
+        );
+        let mut zones = vec![
             Zone::fixed(0, FOOTER_LEN as u64),
             Zone::fixed(footer.data_offset, DYN_HEADER_LEN as u64),
             Zone::fixed(h.table_offset, bat_bytes),
         ];
-        for i in tolerant::overlaps(candidates, span, &zones).entries {
-            let entry = bat[i as usize];
-            damage.add(i, || {
-                format!(
-                    "el bloque {i} (sector {entry:#x} del fichero) solapa las estructuras del contenedor u otro bloque"
-                )
-            });
-        }
-        if !damage.is_empty() && !tolerant {
-            return Err(corrupt(damage.first().unwrap_or_default()));
-        }
-        let bad = damage.into_sorted();
-        for &i in &bad {
+        tolerant::overlaps(
+            &mut candidates,
+            |i| span(u64::from(i)),
+            &mut zones,
+            |hit| match hit {
+                Hit::Entry(i) => {
+                    let entry = bat[i as usize];
+                    damage.add(u64::from(i), || {
+                        format!(
+                            "el bloque {i} (sector {entry:#x} del fichero) solapa las estructuras del contenedor u otro bloque"
+                        )
+                    })
+                }
+                Hit::Tag(_) => Ok(()),
+            },
+        )?;
+        budget.release(candidates);
+        for i in damage.iter() {
             bat[i as usize] = DISCARDED;
         }
+        let discarded = damage.count();
+        damage.release(&mut budget);
 
         Ok(Dynamic {
             block_size,
             bitmap_bytes,
             bat,
-            discarded: bad.len() as u64,
+            discarded,
             cache: Mutex::new(None),
         })
     }

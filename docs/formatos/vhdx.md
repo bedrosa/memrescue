@@ -51,6 +51,13 @@ Implementación original a partir de la especificación pública; no se ha usado
    - Tamaño de la BAT ≤ `MAX_TABLE_BYTES` (256 MiB; si no, `UnsupportedFeature`) y ≤ longitud de la
      región (que ya está dentro del fichero): la memoria queda acotada por ambos **antes** de reservar.
      Se lee por trozos de 1 MiB y solo se guarda un `u64` por bloque de datos.
+   - Memoria de trabajo de la apertura ≤ `open_memory_budget(t)` = 17/8 × `t` + 64 KiB, con `t` =
+     bytes de BAT (ADR-020, addendum): bloques decodificados (8 bytes por bloque), lista de índices
+     `u32` de los bloques presentes para la detección de solapes y, en modo tolerante, un bit por
+     bloque. Reservas con `try_reserve_exact`; un fallo o un exceso es `UnsupportedFeature`. Con la
+     BAT al límite (33 546 243 bloques de 1 MiB) y todas las entradas en el mismo bloque, el pico
+     medido es de 385 MiB (estricto) y 389 MiB (tolerante); antes, 1,4 GiB. En modo estricto la
+     apertura falla en la primera entrada inválida o en el primer solape encontrado.
    - Estados de bloque: NOT_PRESENT, UNDEFINED, ZERO, UNMAPPED → ceros (`Allocation::Sparse`);
      FULLY_PRESENT → datos; PARTIALLY_PRESENT (solo válido con padre) y 4/5 → `Corrupt` en modo
      estricto, bloque descartado en modo tolerante.

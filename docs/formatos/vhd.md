@@ -94,6 +94,14 @@ siendo críticos (`Corrupt` en ambos modos).
 
 - Bloques entre 512 B y 256 MiB (mapa de bits ≤ 64 KiB por bloque).
 - BAT ≤ 256 MiB (`MAX_TABLE_BYTES`) y siempre ≤ tamaño del fichero.
+- Memoria de trabajo de la apertura ≤ `open_memory_budget(t)` = 17/8 × `t` + 64 KiB, con `t` = bytes
+  de BAT leídos (ADR-020, addendum): la BAT se lee por trozos de 1 MiB y se decodifica sobre la marcha
+  (4 bytes por entrada, lo que conserva la imagen), la detección de solapes usa una lista de índices
+  `u32` de los bloques asignados y el modo tolerante un bit por entrada. Las reservas usan
+  `try_reserve_exact`: un fallo o un exceso de presupuesto es `UnsupportedFeature`, nunca un aborto.
+  Con la BAT al límite y todas las entradas duplicadas el pico medido es de 512 MiB (estricto) y
+  520 MiB (tolerante); antes, 2,8 GiB. En modo estricto la apertura falla en la primera entrada
+  inválida o en el primer solape encontrado.
 - Las peticiones de lectura no se trocean más allá de los bloques: el tamaño de cada `read_at` lo
   limita quien llama.
 

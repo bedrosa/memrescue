@@ -16,6 +16,7 @@ mr-api.workspace = true
 mr-io.workspace = true
 
 [dev-dependencies]
+mr-image.workspace = true
 tempfile.workspace = true
 
 # Único crate con `unsafe` permitido: la frontera FFI.

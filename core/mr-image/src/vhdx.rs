@@ -24,8 +24,9 @@
 //!   disco sin padre: se cuentan y se ignoran. Identificador, cabeceras, tablas de regiones,
 //!   metadatos y la ubicación de la BAT siguen siendo críticos (`Corrupt` en ambos modos).
 
+use crate::budget::Budget;
 use crate::crc32c::crc32c;
-use crate::tolerant::{self, Damage, Zone};
+use crate::tolerant::{self, Damage, Hit, Zone};
 use crate::MAX_TABLE_BYTES;
 use mr_io::{Allocation, AllocationRun, BlockDevice, IoError, Result};
 use std::fs::File;
@@ -617,9 +618,14 @@ impl VhdxImage {
                 bat.longitud
             )));
         }
-        // Ya sabemos que la BAT cabe en el fichero: la reserva está acotada por su tamaño.
-        let mut bloques = Vec::with_capacity(n_bloques as usize);
-        let mut dano = Damage::default();
+        // Ya sabemos que la BAT cabe en el fichero: la reserva está acotada por su tamaño y por
+        // el presupuesto de la apertura. La BAT se lee por trozos; en modo estricto la apertura
+        // falla en la primera entrada inválida.
+        let mut presupuesto = Budget::new(FORMATO);
+        presupuesto.add_tables(bytes_bat);
+        let mut bloques: Vec<u64> = presupuesto.vec(n_bloques, "BAT")?;
+        let mut dano = Damage::new(FORMATO, n_bloques, tolerante, &mut presupuesto)?;
+        let mut presentes = 0u64;
         let mut mapas_ignorados = 0u64;
         let mut buf = vec![0u8; TROZO_BAT.min(bytes_bat as usize)];
         let mut indice = 0u64;
@@ -643,9 +649,14 @@ impl VhdxImage {
                 } else {
                     let b = bloques.len() as u64;
                     match validar_bloque(entrada, b, tb, tam_virtual, tam_fichero) {
-                        Ok(destino) => bloques.push(destino),
+                        Ok(destino) => {
+                            if destino != 0 {
+                                presentes += 1;
+                            }
+                            bloques.push(destino);
+                        }
                         Err(motivo) => {
-                            dano.add(b, || motivo);
+                            dano.add(b, || motivo)?;
                             bloques.push(DESCARTADO);
                         }
                     }
@@ -661,33 +672,40 @@ impl VhdxImage {
         }
         // Correspondencia inequívoca: ningún bloque presente solapa las zonas del contenedor
         // (cabeceras, registro, regiones) ni otro bloque.
-        let tramo = |b: u64| -> (u64, u64) {
+        let tramo = |b: u32| -> (u64, u64) {
+            let b = u64::from(b);
             let off = bloques[b as usize];
             let util = tb.min(tam_virtual - b * tb);
             (off, off + util)
         };
-        let candidatos: Vec<u64> = (0..n_bloques)
-            .filter(|&b| !matches!(bloques[b as usize], 0 | DESCARTADO))
-            .collect();
-        let zonas: Vec<Zone> = tramos
+        // Índices `u32`: la BAT tiene como mucho MAX_TABLE_BYTES / 8 = 2^25 entradas.
+        let mut candidatos: Vec<u32> = presupuesto.vec(presentes, "lista de bloques presentes")?;
+        candidatos.extend(
+            (0..n_bloques)
+                .filter(|&b| !matches!(bloques[b as usize], 0 | DESCARTADO))
+                .map(|b| b as u32),
+        );
+        let mut zonas: Vec<Zone> = tramos
             .iter()
             .map(|t| Zone::fixed(t.inicio, t.fin - t.inicio))
             .collect();
-        for b in tolerant::overlaps(candidatos, tramo, &zonas).entries {
-            let off = bloques[b as usize];
-            dano.add(b, || {
-                format!(
-                    "el bloque {b} (desplazamiento {off}) se solapa con las estructuras del contenedor o con otro bloque"
-                )
-            });
-        }
-        if !dano.is_empty() && !tolerante {
-            return Err(corrupto(dano.first().unwrap_or_default()));
-        }
-        let descartados = dano.into_sorted();
-        for &b in &descartados {
+        tolerant::overlaps(&mut candidatos, tramo, &mut zonas, |solape| match solape {
+            Hit::Entry(b) => {
+                let off = bloques[b as usize];
+                dano.add(u64::from(b), || {
+                    format!(
+                        "el bloque {b} (desplazamiento {off}) se solapa con las estructuras del contenedor o con otro bloque"
+                    )
+                })
+            }
+            Hit::Tag(_) => Ok(()),
+        })?;
+        presupuesto.release(candidatos);
+        for b in dano.iter() {
             bloques[b as usize] = DESCARTADO;
         }
+        let descartados = dano.count();
+        dano.release(&mut presupuesto);
 
         Ok(VhdxImage {
             file,
@@ -698,7 +716,7 @@ impl VhdxImage {
             dejar_asignados: banderas & PARAM_DEJAR_BLOQUES_ASIGNADOS != 0,
             bloques,
             tolerante,
-            descartados: descartados.len() as u64,
+            descartados,
             mapas_ignorados,
         })
     }

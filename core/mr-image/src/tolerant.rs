@@ -14,7 +14,8 @@
 //! de otra entrada y el estado de la entrada es válido. Cuando dos o más zonas se solapan entre sí
 //! se invalidan **todas** las implicadas: nunca se elige una de las interpretaciones.
 
-use mr_io::IoError;
+use crate::budget::Budget;
+use mr_io::{IoError, Result};
 use std::io;
 
 /// Zona fija del fichero: estructura del contenedor (`tag = None`) o tabla secundaria que se puede
@@ -37,18 +38,18 @@ impl Zone {
     }
 }
 
-/// Elementos implicados en algún solape.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct Overlaps {
-    /// Entradas (índices) cuya zona solapa otra zona; ordenadas y sin repetir.
-    pub entries: Vec<u64>,
-    /// Etiquetas de las zonas fijas solapadas por otra zona; ordenadas y sin repetir.
-    pub tags: Vec<u64>,
+/// Elemento implicado en un solape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Hit {
+    /// Entrada (índice) cuya zona solapa otra zona.
+    Entry(u32),
+    /// Etiqueta de una zona fija solapada por otra zona.
+    Tag(u64),
 }
 
 #[derive(Clone, Copy)]
 enum Who {
-    Entry(u64),
+    Entry(u32),
     Zone(Option<u64>),
 }
 
@@ -59,35 +60,37 @@ enum Who {
 /// ignoran. Los solapes entre dos zonas fijas sin etiqueta no se informan (son estructuras del
 /// contenedor y el lector las valida antes, con `Corrupt` en ambos modos).
 ///
-/// Memoria: la lista de entradas (8 bytes por entrada) y la de zonas fijas.
+/// Los grupos se procesan en flujo: cada elemento implicado se entrega **una sola vez** a `hit`,
+/// por orden de inicio en el fichero, en cuanto su grupo tiene dos elementos. Si `hit` devuelve
+/// un error, el recorrido se detiene y lo devuelve (el modo estricto falla en el primer solape).
+///
+/// Memoria: ninguna reserva propia. `entries` y `zones` se filtran y ordenan en su sitio y de
+/// cada grupo solo se guarda el primer elemento mientras el grupo no tiene un segundo. Los
+/// índices son `u32`: ninguna tabla acotada por [`crate::MAX_TABLE_BYTES`] tiene más de 2^26
+/// entradas.
 pub(crate) fn overlaps(
-    mut entries: Vec<u64>,
-    span: impl Fn(u64) -> (u64, u64),
-    zones: &[Zone],
-) -> Overlaps {
+    entries: &mut Vec<u32>,
+    span: impl Fn(u32) -> (u64, u64),
+    zones: &mut Vec<Zone>,
+    mut hit: impl FnMut(Hit) -> Result<()>,
+) -> Result<()> {
     entries.retain(|&e| {
         let (a, b) = span(e);
         a < b
     });
     entries.sort_unstable_by_key(|&e| span(e).0);
-    let mut zones: Vec<Zone> = zones.iter().copied().filter(|z| z.start < z.end).collect();
+    zones.retain(|z| z.start < z.end);
     zones.sort_by_key(|z| z.start);
 
-    let mut out = Overlaps::default();
-    let mut group: Vec<Who> = Vec::new();
-    let mut max_end = 0u64;
-    let flush = |group: &mut Vec<Who>, out: &mut Overlaps| {
-        if group.len() >= 2 {
-            for w in group.iter() {
-                match *w {
-                    Who::Entry(e) => out.entries.push(e),
-                    Who::Zone(Some(t)) => out.tags.push(t),
-                    Who::Zone(None) => {}
-                }
-            }
-        }
-        group.clear();
+    let mut emit = |w: Who| match w {
+        Who::Entry(e) => hit(Hit::Entry(e)),
+        Who::Zone(Some(t)) => hit(Hit::Tag(t)),
+        Who::Zone(None) => Ok(()),
     };
+    // Primer elemento del grupo en curso, mientras el grupo no tiene un segundo.
+    let mut pending: Option<Who> = None;
+    let mut in_group = false;
+    let mut max_end = 0u64;
     let (mut i, mut j) = (0usize, 0usize);
     loop {
         let next_entry = entries.get(i).map(|&e| (span(e), e));
@@ -107,20 +110,20 @@ pub(crate) fn overlaps(
                 (Who::Zone(z.tag), z.start, z.end)
             }
         };
-        if group.is_empty() || a >= max_end {
-            flush(&mut group, &mut out);
+        if !in_group || a >= max_end {
+            // Empieza un grupo nuevo.
+            in_group = true;
+            pending = Some(who);
             max_end = b;
-        } else {
-            max_end = max_end.max(b);
+            continue;
         }
-        group.push(who);
+        max_end = max_end.max(b);
+        if let Some(first) = pending.take() {
+            emit(first)?;
+        }
+        emit(who)?;
     }
-    flush(&mut group, &mut out);
-    out.entries.sort_unstable();
-    out.entries.dedup();
-    out.tags.sort_unstable();
-    out.tags.dedup();
-    out
+    Ok(())
 }
 
 /// Error de lectura de un bloque o grano descartado en modo tolerante. Lleva el rango **virtual**
@@ -153,37 +156,94 @@ pub(crate) fn describe_suffix(discarded: u64, singular: &str, plural: &str) -> S
     }
 }
 
-/// Primer problema encontrado (para el mensaje de `Corrupt` en modo estricto) y lista de
-/// entradas descartadas.
-#[derive(Debug, Default)]
+/// Registro de las entradas de asignación inválidas.
+///
+/// En modo estricto no guarda nada: la primera entrada inválida hace fallar la apertura con
+/// `Corrupt` y su motivo. En modo tolerante guarda un bit por entrada (reservado en el
+/// [`Budget`]) y el número de entradas marcadas; nunca una copia de las entradas.
+#[derive(Debug)]
 pub(crate) struct Damage {
-    first: Option<String>,
-    bad: Vec<u64>,
+    format: &'static str,
+    tolerant: bool,
+    bits: Vec<u64>,
+    count: u64,
 }
 
 impl Damage {
-    /// Registra la entrada `index` como inválida por `why` (solo se guarda el primer motivo).
-    pub(crate) fn add(&mut self, index: u64, why: impl FnOnce() -> String) {
-        if self.first.is_none() {
-            self.first = Some(why());
+    /// Registro para las entradas `0..entries`.
+    pub(crate) fn new(
+        format: &'static str,
+        entries: u64,
+        tolerant: bool,
+        budget: &mut Budget,
+    ) -> Result<Self> {
+        let mut bits = Vec::new();
+        if tolerant {
+            let words = entries.div_ceil(64);
+            bits = budget.vec(words, "registro de entradas descartadas")?;
+            bits.resize(bits.capacity(), 0);
         }
-        self.bad.push(index);
+        Ok(Self {
+            format,
+            tolerant,
+            bits,
+            count: 0,
+        })
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
-        self.bad.is_empty()
+    /// Registra la entrada `index` como inválida por `why`. En modo estricto devuelve `Corrupt`
+    /// con ese motivo (la apertura falla en la primera entrada inválida).
+    pub(crate) fn add(&mut self, index: u64, why: impl FnOnce() -> String) -> Result<()> {
+        if !self.tolerant {
+            return Err(IoError::Corrupt {
+                format: self.format,
+                detail: why(),
+            });
+        }
+        let word = usize::try_from(index / 64)
+            .ok()
+            .and_then(|w| self.bits.get_mut(w));
+        if let Some(word) = word {
+            let bit = 1u64 << (index % 64);
+            if *word & bit == 0 {
+                *word |= bit;
+                self.count += 1;
+            }
+        }
+        Ok(())
     }
 
-    /// Primer motivo registrado.
-    pub(crate) fn first(&self) -> Option<&str> {
-        self.first.as_deref()
+    /// `true` si la entrada `index` está registrada.
+    pub(crate) fn contains(&self, index: u64) -> bool {
+        usize::try_from(index / 64)
+            .ok()
+            .and_then(|w| self.bits.get(w))
+            .is_some_and(|&word| word & (1u64 << (index % 64)) != 0)
     }
 
-    /// Entradas descartadas, ordenadas y sin repetir.
-    pub(crate) fn into_sorted(mut self) -> Vec<u64> {
-        self.bad.sort_unstable();
-        self.bad.dedup();
-        self.bad
+    /// Número de entradas registradas (sin repetir).
+    pub(crate) fn count(&self) -> u64 {
+        self.count
+    }
+
+    /// Entradas registradas, en orden creciente.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = u64> + '_ {
+        self.bits.iter().enumerate().flat_map(|(w, &word)| {
+            let mut rest = word;
+            std::iter::from_fn(move || {
+                if rest == 0 {
+                    return None;
+                }
+                let bit = u64::from(rest.trailing_zeros());
+                rest &= rest - 1;
+                Some(w as u64 * 64 + bit)
+            })
+        })
+    }
+
+    /// Libera el registro y descuenta su reserva del presupuesto.
+    pub(crate) fn release(self, budget: &mut Budget) {
+        budget.release(self.bits);
     }
 }
 
@@ -315,9 +375,38 @@ pub(crate) mod check {
 mod tests {
     use super::*;
 
+    /// Elementos implicados en algún solape, ordenados.
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct Overlaps {
+        entries: Vec<u32>,
+        tags: Vec<u64>,
+    }
+
     fn run(spans: &[(u64, u64)], zones: &[Zone]) -> Overlaps {
-        let entries = (0..spans.len() as u64).collect();
-        overlaps(entries, |e| spans[e as usize], zones)
+        let mut entries = (0..spans.len() as u32).collect();
+        let mut zones = zones.to_vec();
+        let mut out = Overlaps::default();
+        overlaps(
+            &mut entries,
+            |e| spans[e as usize],
+            &mut zones,
+            |h| {
+                match h {
+                    Hit::Entry(e) => out.entries.push(e),
+                    Hit::Tag(t) => out.tags.push(t),
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        // Cada elemento se entrega una sola vez.
+        let delivered = (out.entries.len(), out.tags.len());
+        out.entries.sort_unstable();
+        out.entries.dedup();
+        out.tags.sort_unstable();
+        out.tags.dedup();
+        assert_eq!(delivered, (out.entries.len(), out.tags.len()), "repetidos");
+        out
     }
 
     #[test]
@@ -370,14 +459,70 @@ mod tests {
     }
 
     #[test]
-    fn damage_keeps_first_reason() {
-        let mut d = Damage::default();
-        assert!(d.is_empty());
-        d.add(5, || "a".into());
-        d.add(2, || "b".into());
-        d.add(5, || "c".into());
-        assert_eq!(d.first(), Some("a"));
-        assert_eq!(d.into_sorted(), vec![2, 5]);
+    fn overlaps_streams_groups_and_stops_at_the_first_error() {
+        // Un millón de zonas idénticas: cada una se entrega una vez, sin acumular el grupo.
+        let n = 1_000_000u32;
+        let mut entries: Vec<u32> = (0..n).collect();
+        let mut seen = 0u32;
+        overlaps(
+            &mut entries,
+            |_| (4096, 8192),
+            &mut Vec::new(),
+            |_| {
+                seen += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(seen, n);
+        // Si `hit` falla (modo estricto), el recorrido se detiene en ese elemento.
+        let mut entries: Vec<u32> = (0..n).collect();
+        let mut calls = 0u32;
+        let r = overlaps(
+            &mut entries,
+            |_| (4096, 8192),
+            &mut Vec::new(),
+            |_| {
+                calls += 1;
+                Err(IoError::Corrupt {
+                    format: "PRUEBA",
+                    detail: "solape".into(),
+                })
+            },
+        );
+        assert!(matches!(r, Err(IoError::Corrupt { .. })), "{r:?}");
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn damage_is_a_bitset_in_tolerant_mode() {
+        let mut budget = Budget::new("PRUEBA");
+        budget.add_tables(1024);
+        let mut d = Damage::new("PRUEBA", 130, true, &mut budget).unwrap();
+        assert_eq!(d.count(), 0);
+        d.add(5, || "a".into()).unwrap();
+        d.add(129, || "b".into()).unwrap();
+        d.add(2, || "c".into()).unwrap();
+        d.add(5, || "d".into()).unwrap();
+        assert_eq!(d.count(), 3);
+        assert!(d.contains(5) && d.contains(129) && !d.contains(6));
+        assert_eq!(d.iter().collect::<Vec<_>>(), vec![2, 5, 129]);
+        d.release(&mut budget);
+    }
+
+    #[test]
+    fn damage_fails_at_the_first_entry_in_strict_mode() {
+        let mut budget = Budget::new("PRUEBA");
+        // Sin reserva: en modo estricto no se guarda nada, ni siquiera para 2^40 entradas.
+        let mut d = Damage::new("PRUEBA", 1 << 40, false, &mut budget).unwrap();
+        match d.add(7, || "primer motivo".into()) {
+            Err(IoError::Corrupt { format, detail }) => {
+                assert_eq!((format, detail.as_str()), ("PRUEBA", "primer motivo"));
+            }
+            r => panic!("{r:?}"),
+        }
+        assert_eq!(d.count(), 0);
+        assert!(!d.contains(7));
     }
 
     #[test]
