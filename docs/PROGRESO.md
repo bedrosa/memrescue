@@ -1,0 +1,92 @@
+# Progreso de MemRescue
+
+Actualizar al final de cada etapa: qué se terminó, qué se verificó, siguiente tarea.
+
+---
+
+## Etapa 1 · Investigación de DMDE (fase 1): 2026-10-17, Terminada (parcial en algoritmos)
+
+- Análisis REA/Ghidra de `dmde.exe` 4.4.4.842 (SHA-256 `57a4febb…47adb4`, sin modificar).
+- 11 documentos + README + inventario de imports (ahora en `docs/investigacion/dmde-fase1/`).
+- Verificado en código: NTFS (boot, fixups, atributos, runs, índices, LZNT1, escaneo), GPT, ExtFS,
+  APFS, MD5, CRC-32, zlib, IOCTLs de Windows.
+- No terminado: 4 de 5 áreas de análisis quedaron incompletas (RAID/RAW, otros FS, E/S, arranque/scripts).
+
+## Etapa 2 · Migración y planificación: 2026-10-17, Terminada
+
+**Hecho**
+- Repositorio del proyecto poblado con la investigación de la fase 1.
+- Migrados 18 ficheros de investigación (documentos, datos auxiliares y 1 evidencia decompilada).
+  **Verificado**: SHA-256 idéntico origen/destino. Los datos extraídos del binario y la evidencia
+  decompilada se conservan solo en local (no se versionan, ADR-001).
+- Consultadas 13 páginas del manual/web oficial de DMDE → `investigacion/dmde-manual-oficial.md`.
+- Creados: `ARQUITECTURA.md`, `ROADMAP.md`, `DECISIONES.md`, `PRUEBAS.md`, `PARIDAD_DMDE_PRO.md`
+  (124 funcionalidades), `investigacion/README.md`, `README.md` raíz.
+
+**Verificado**
+- Integridad de la migración (hashes).
+- Funciones exclusivas de Professional según la web oficial (consulta 2026-10-17).
+
+**No hecho / pendiente**
+- Ninguna línea de código (por instrucción).
+- No se abrió Ghidra ni se ejecutó DMDE en esta etapa.
+- Decisiones tecnológicas ADR-003/004/005/007/008/010 en estado **Propuesta**.
+
+## Etapa 3 · M0 Fundaciones: 2026-10-17, Terminada
+
+**Decisiones del propietario**: Rust (motor), **WPF** (en lugar de WinUI 3), CLI, SQLite, C ABI + P/Invoke,
+.NET 10 LTS con SDK local en el proyecto y publicación autocontenida. Ver ADR-003, 005, 008, 010–013.
+
+**Entorno comprobado** (sin instalar nada global): Git 2.52, Rust 1.99.1 (MSVC), VS Build Tools 2026
+(MSVC 14.50), Python 3.14. No había SDK de .NET → SDK 10.0.402 instalado en `.tools\dotnet` con el script
+oficial firmado por Microsoft (autorizado por el propietario). WSL, sqlite3 y qemu-img no están instalados.
+
+**Hecho**
+- Git inicializado (rama `main`, sin commits todavía).
+- Motor Rust: `mr-common`, `mr-io`, `mr-store` (esquema SQLite v1), `mr-api` (tareas), `mr-ffi` (DLL, ABI 1).
+- `memrescue-cli` (version, image-info, hash, db-init, jobs).
+- Solución .NET `app/MemRescue.slnx`: `MemRescue` (WPF → `MemRescue.exe`), `MemRescue.Core.Interop`,
+  pruebas xUnit. Icono propio generado por `tools/make_icon.py`.
+- Generador determinista de imágenes MBR/GPT + validador independiente + pruebas negativas.
+- Scripts `scripts/build.ps1` y `scripts/test.ps1`. Documentos nuevos: `API_FFI.md`, `PLAN_CORPUS_NTFS.md`.
+
+**Verificado (ejecución real, 2026-10-17)**
+
+| Comprobación | Resultado |
+|---|---|
+| `scripts\build.ps1` (Rust + .NET Debug) | Correcta, 0 advertencias, 0 errores |
+| `cargo fmt --check`, `cargo clippy -D warnings` | OK |
+| Pruebas Rust | 34/34 superadas (+2 contra corpus) |
+| Pruebas .NET (xUnit, DLL real) | 17/17 superadas |
+| Corpus: determinismo (2 generaciones) | 3/3 imágenes idénticas byte a byte |
+| Corpus: validación independiente | 128 comprobaciones, 0 errores |
+| Corpus: pruebas negativas | 9/9 corrupciones detectadas |
+| `MemRescue.exe --selftest` (Debug) | Ventana abierta, motor 0.1.0 / ABI 1, SHA-256 de `gpt_basic.img` = manifiesto |
+| `MemRescue.exe` publicado autocontenido, sin .NET en el sistema | Arranca; SHA-256 de `gpt_4kn.img` = manifiesto |
+| Captura de la ventana (`--screenshot`) | Revisada: menús, propiedades, registro, barra de estado |
+| `scripts\test.ps1` completo | **10/10 pasos OK** |
+
+**Errores encontrados y corregidos durante M0**
+- Documentación XML incompleta (CS1573) y espera bloqueante en una prueba (xUnit1031): corregidos (las advertencias son errores).
+- Fichero Rust sin formato canónico detectado por `test.ps1`: corregido con `cargo fmt`.
+- Una mutación de la prueba negativa no alteraba nada (escribía `0xFF` sobre `0xFF`): corregida la prueba.
+- Acentos mal mostrados por PowerShell 5.1 en scripts sin BOM y en procesos hijos: scripts en UTF-8 con BOM y `-X utf8`.
+
+**Limitaciones conocidas**
+- `MemRescue.exe` de **depuración** necesita `DOTNET_ROOT` apuntando a `.tools\dotnet` (lo fija `scripts\env.ps1`);
+  el publicado autocontenido no.
+- El autodiagnóstico abre la imagen siempre con sectores de 512 B.
+- El validador del corpus es independiente del generador pero del mismo equipo; falta oráculo de terceros.
+- Ninguna funcionalidad de recuperación existe todavía (correcto para M0); ninguna fila de la matriz en "Paridad".
+
+**Criterios de finalización de M0**: compila sin errores ✔ · MemRescue.exe se inicia ✔ · la ventana WPF abre ✔ ·
+WPF ↔ Rust funciona ✔ · la CLI invoca el motor ✔ · pruebas automatizadas ✔ · imágenes validadas ✔ ·
+documentación actualizada ✔ · sin funciones ficticias ✔ (todo lo no implementado está deshabilitado con su hito).
+
+## Siguiente tarea
+
+1. **INV-05** (MBR/EBR y búsqueda exprés de particiones perdidas): investigación acotada reutilizando la
+   evidencia de la fase 1 (rango 0x608b00–0x613300 y validador GPT ya verificado), sin repetir análisis completos.
+2. Después, **M1** (capa de bloques completa, `ResilientReader` con dispositivo simulado, VHD/VHDX/VMDK).
+3. Decisión pendiente del propietario: autorizar WSL2 para el oráculo de terceros y el corpus NTFS
+   (`PLAN_CORPUS_NTFS.md` §4).

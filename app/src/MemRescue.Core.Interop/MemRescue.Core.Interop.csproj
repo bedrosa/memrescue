@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>MemRescue.Core.Interop</RootNamespace>
+    <!-- Requerido por el código que genera [LibraryImport]; el código escrito a mano no usa unsafe. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+  </PropertyGroup>
+
+  <Import Project="..\..\NativeCore.targets" />
+
+</Project>

@@ -1,0 +1,26 @@
+[package]
+name = "mr-ffi"
+description = "Interfaz C estable (memrescue_core.dll) del motor de MemRescue"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "memrescue_core"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+mr-common.workspace = true
+mr-api.workspace = true
+mr-io.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+# Único crate con `unsafe` permitido: la frontera FFI.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

@@ -1,0 +1,22 @@
+[package]
+name = "memrescue-cli"
+description = "Herramienta de línea de comandos del motor de MemRescue"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "memrescue-cli"
+path = "src/main.rs"
+
+[dependencies]
+mr-common.workspace = true
+mr-api.workspace = true
+mr-store.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

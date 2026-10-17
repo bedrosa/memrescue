@@ -1,0 +1,28 @@
+# Herramientas locales (SDK .NET portable, instaladores)
+/.tools/
+
+# Rust
+/target/
+
+# .NET
+bin/
+obj/
+*.user
+.vs/
+/artifacts/
+
+# Imágenes generadas (se regeneran de forma determinista)
+/tests/corpus/generated/
+
+# Bases de datos de trabajo locales
+*.mrdb
+*.mrdb-wal
+*.mrdb-shm
+
+# Material propietario de DMDE (sala limpia, ADR-001): se conserva en disco, no en el historial.
+/docs/investigacion/dmde-fase1/evidencias-decompiladas/
+/docs/investigacion/dmde-fase1/datos/
+
+# Python
+__pycache__/
+*.pyc

@@ -1,0 +1,17 @@
+[package]
+name = "mr-io"
+description = "Capa de bloques de MemRescue (solo lectura en M0)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+mr-common.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

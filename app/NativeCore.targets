@@ -1,0 +1,20 @@
+<Project>
+  <!--
+    Compila el motor Rust (mr-ffi) antes de compilar el proyecto .NET y copia memrescue_core.dll
+    a la carpeta de salida. Desactivable con -p:SkipCargoBuild=true (p. ej. si ya se compiló).
+  -->
+  <Target Name="BuildNativeCore" BeforeTargets="BeforeBuild" Condition="'$(SkipCargoBuild)' != 'true'">
+    <PropertyGroup>
+      <CargoProfileArg Condition="'$(RustProfile)' == 'release'">--release</CargoProfileArg>
+    </PropertyGroup>
+    <Exec Command="cargo build -p mr-ffi $(CargoProfileArg)" WorkingDirectory="$(RepoRoot)" />
+  </Target>
+
+  <ItemGroup>
+    <None Include="$(NativeCoreDll)" Link="memrescue_core.dll" CopyToOutputDirectory="PreserveNewest" Visible="false" />
+  </ItemGroup>
+
+  <Target Name="CheckNativeCore" BeforeTargets="CopyFilesToOutputDirectory">
+    <Error Condition="!Exists('$(NativeCoreDll)')" Text="No se encuentra $(NativeCoreDll). Compile el motor con: cargo build -p mr-ffi" />
+  </Target>
+</Project>

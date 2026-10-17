@@ -1,0 +1,194 @@
+<Window x:Class="MemRescue.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="MemRescue" Height="680" Width="1100" MinHeight="420" MinWidth="720"
+        Icon="Assets/MemRescue.ico"
+        WindowStartupLocation="CenterScreen"
+        FontSize="12">
+    <Window.CommandBindings>
+        <CommandBinding Command="Open" Executed="OpenImage_Executed" />
+    </Window.CommandBindings>
+    <Window.InputBindings>
+        <KeyBinding Key="O" Modifiers="Control" Command="Open" />
+    </Window.InputBindings>
+
+    <DockPanel>
+        <!--
+            Menús organizados como los de la herramienta de referencia (Disco / Herramientas / Ventanas /
+            Editor / Modo / Edición) con textos propios. Lo que aún no existe está deshabilitado e indica
+            el hito del roadmap en que se implementa; nada simula funcionar.
+        -->
+        <Menu DockPanel.Dock="Top" Padding="2">
+            <MenuItem Header="_Disco">
+                <MenuItem Header="_Abrir imagen de disco…" Command="Open" InputGestureText="Ctrl+O" />
+                <MenuItem Header="_Seleccionar disco físico…" IsEnabled="False" InputGestureText="(M9)" ToolTip="Pendiente: acceso a discos físicos (hito M9)" />
+                <MenuItem Header="Construir _RAID virtual…" IsEnabled="False" InputGestureText="(M5)" ToolTip="Pendiente: RAID virtual (hito M5)" />
+                <MenuItem Header="_Particiones…" IsEnabled="False" InputGestureText="(M2)" ToolTip="Pendiente: lectura de MBR/GPT y búsqueda de particiones (hito M2)" />
+                <MenuItem Header="_Bloquear volúmenes…" IsEnabled="False" InputGestureText="(M9)" ToolTip="Pendiente (hito M9)" />
+                <MenuItem Header="Parámetros de _E/S…" IsEnabled="False" InputGestureText="(M9)" ToolTip="Pendiente: política de errores de lectura en dispositivos (hito M9)" />
+                <Separator />
+                <MenuItem Header="Modo global de solo _lectura" IsCheckable="True" IsChecked="True" IsEnabled="False"
+                          ToolTip="Siempre activo: en esta versión MemRescue no puede escribir en ningún origen" />
+                <MenuItem Header="Deshacer / rehacer / aplicar cambios" IsEnabled="False" InputGestureText="(M11)" ToolTip="Pendiente: capa de cambios diferidos (hitos M11–M12)" />
+                <Separator />
+                <MenuItem Header="_Salir" Click="Exit_Click" InputGestureText="Alt+F4" />
+            </MenuItem>
+            <MenuItem Header="_Herramientas">
+                <MenuItem Header="Calcular _hashes de la imagen" Click="ShowHashTab_Click" />
+                <Separator />
+                <MenuItem Header="_Escaneo completo…" IsEnabled="False" InputGestureText="(M6)" ToolTip="Pendiente (hito M6)" />
+                <MenuItem Header="Todo lo encontrado / _FS virtual…" IsEnabled="False" InputGestureText="(M6)" ToolTip="Pendiente (hito M6)" />
+                <MenuItem Header="Buscar en carpetas por _nombre…" IsEnabled="False" InputGestureText="(M4)" ToolTip="Pendiente (hito M4)" />
+                <MenuItem Header="_Recuperar / crear lista de ficheros…" IsEnabled="False" InputGestureText="(M4)" ToolTip="Pendiente: motor de recuperación (hito M4)" />
+                <MenuItem Header="Búsqueda RAW por _firmas…" IsEnabled="False" InputGestureText="(M7)" ToolTip="Pendiente (hito M7)" />
+                <MenuItem Header="_Mapa de clusters" IsEnabled="False" InputGestureText="(M11)" ToolTip="Pendiente (hito M11)" />
+                <MenuItem Header="_Copiar sectores (imagen/clon)…" IsEnabled="False" InputGestureText="(M9)" ToolTip="Pendiente (hito M9)" />
+                <MenuItem Header="Herramientas _NTFS" IsEnabled="False" InputGestureText="(M12)" ToolTip="Pendiente: requiere escritura segura (hito M12)" />
+            </MenuItem>
+            <MenuItem Header="_Ventanas">
+                <MenuItem x:Name="LogMenuItem" Header="_Registro de actividad" IsCheckable="True" IsChecked="True" Click="ToggleLog_Click" />
+                <MenuItem Header="Árbol de _directorios" IsEnabled="False" InputGestureText="(M10)" ToolTip="Pendiente (hito M10)" />
+                <MenuItem Header="_Panel de ficheros" IsEnabled="False" InputGestureText="(M10)" ToolTip="Pendiente (hito M10)" />
+                <MenuItem Header="Panel de _búsqueda" IsEnabled="False" InputGestureText="(M10)" ToolTip="Pendiente (hito M10)" />
+            </MenuItem>
+            <MenuItem Header="_Editor">
+                <MenuItem Header="_Ir a sector…" IsEnabled="False" InputGestureText="(M11)" ToolTip="Pendiente: editor hexadecimal (hito M11)" />
+                <MenuItem Header="Ir a _desplazamiento…" IsEnabled="False" InputGestureText="(M11)" ToolTip="Pendiente (hito M11)" />
+            </MenuItem>
+            <MenuItem Header="_Modo">
+                <MenuItem Header="_Hexadecimal / texto" IsEnabled="False" InputGestureText="(M11)" ToolTip="Pendiente (hito M11)" />
+                <MenuItem Header="_Plantillas de estructuras…" IsEnabled="False" InputGestureText="(M11)" ToolTip="Pendiente (hito M11)" />
+            </MenuItem>
+            <MenuItem Header="Edi_ción">
+                <MenuItem Header="Modo _edición" IsEnabled="False" InputGestureText="(M12)" ToolTip="Pendiente: escritura segura (hito M12)" />
+            </MenuItem>
+            <MenuItem Header="A_yuda">
+                <MenuItem Header="_Acerca de MemRescue" Click="About_Click" />
+            </MenuItem>
+        </Menu>
+
+        <ToolBarTray DockPanel.Dock="Top" IsLocked="True">
+            <ToolBar>
+                <Button Command="Open" Content="Abrir imagen…" ToolTip="Abrir un fichero de imagen de disco en solo lectura (Ctrl+O)" />
+                <TextBlock Text="Sector:" VerticalAlignment="Center" Margin="6,0,4,0" />
+                <ComboBox x:Name="SectorSizeBox" Width="70" SelectedIndex="0" ToolTip="Tamaño de sector lógico con el que se interpreta la imagen">
+                    <ComboBoxItem Content="512" />
+                    <ComboBoxItem Content="4096" />
+                </ComboBox>
+                <Separator />
+                <Button Content="Particiones" IsEnabled="False" ToolTip="Pendiente (hito M2)" />
+                <Button Content="Escaneo completo" IsEnabled="False" ToolTip="Pendiente (hito M6)" />
+                <Button Content="Recuperar" IsEnabled="False" ToolTip="Pendiente (hito M4)" />
+            </ToolBar>
+        </ToolBarTray>
+
+        <StatusBar DockPanel.Dock="Bottom">
+            <StatusBarItem>
+                <TextBlock x:Name="EngineStatusText" Text="Motor: -" />
+            </StatusBarItem>
+            <Separator />
+            <StatusBarItem>
+                <TextBlock Text="Solo lectura" Foreground="{StaticResource BrandBrush}" FontWeight="SemiBold" />
+            </StatusBarItem>
+            <Separator />
+            <StatusBarItem>
+                <TextBlock x:Name="StatusText" Text="Listo" />
+            </StatusBarItem>
+        </StatusBar>
+
+        <Grid x:Name="RootGrid">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="*" MinHeight="200" />
+                <RowDefinition x:Name="LogSplitterRow" Height="Auto" />
+                <RowDefinition x:Name="LogRow" Height="130" MinHeight="0" />
+            </Grid.RowDefinitions>
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="270" MinWidth="160" />
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="*" />
+            </Grid.ColumnDefinitions>
+
+            <!-- Orígenes abiertos -->
+            <DockPanel Grid.Row="0" Grid.Column="0" Background="{StaticResource PanelBrush}">
+                <TextBlock DockPanel.Dock="Top" Text="Orígenes abiertos" Style="{StaticResource SectionHeader}" Margin="8,6,8,4" />
+                <ListBox x:Name="SourcesList" BorderThickness="0" Background="Transparent"
+                         SelectionChanged="SourcesList_SelectionChanged">
+                    <ListBox.ItemTemplate>
+                        <DataTemplate>
+                            <StackPanel Margin="2">
+                                <TextBlock Text="{Binding FileName}" FontWeight="SemiBold" />
+                                <TextBlock Text="{Binding Summary}" Foreground="{StaticResource MutedBrush}" FontSize="11" />
+                            </StackPanel>
+                        </DataTemplate>
+                    </ListBox.ItemTemplate>
+                </ListBox>
+            </DockPanel>
+
+            <GridSplitter Grid.Row="0" Grid.Column="1" Width="4" HorizontalAlignment="Stretch" Background="{StaticResource BorderBrush}" />
+
+            <TabControl x:Name="MainTabs" Grid.Row="0" Grid.Column="2" Margin="4">
+                <TabItem Header="Propiedades">
+                    <Grid Margin="10">
+                        <TextBlock x:Name="NoSourceText" Text="Abra una imagen de disco (Disco → Abrir imagen…, Ctrl+O). Se abre siempre en solo lectura."
+                                   Foreground="{StaticResource MutedBrush}" TextWrapping="Wrap" />
+                        <Grid x:Name="PropsGrid" Visibility="Collapsed">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                            </Grid.RowDefinitions>
+                            <TextBlock Grid.Row="0" Text="Ruta" Style="{StaticResource PropName}" />
+                            <TextBox Grid.Row="0" Grid.Column="1" x:Name="PropPath" Style="{StaticResource PropValue}" />
+                            <TextBlock Grid.Row="1" Text="Tamaño" Style="{StaticResource PropName}" />
+                            <TextBox Grid.Row="1" Grid.Column="1" x:Name="PropSize" Style="{StaticResource PropValue}" />
+                            <TextBlock Grid.Row="2" Text="Tamaño de sector" Style="{StaticResource PropName}" />
+                            <TextBox Grid.Row="2" Grid.Column="1" x:Name="PropSector" Style="{StaticResource PropValue}" />
+                            <TextBlock Grid.Row="3" Text="Sectores" Style="{StaticResource PropName}" />
+                            <TextBox Grid.Row="3" Grid.Column="1" x:Name="PropSectors" Style="{StaticResource PropValue}" />
+                            <TextBlock Grid.Row="4" Text="Bytes sobrantes" Style="{StaticResource PropName}" />
+                            <TextBox Grid.Row="4" Grid.Column="1" x:Name="PropTrailing" Style="{StaticResource PropValue}" />
+                            <TextBlock Grid.Row="5" Text="Acceso" Style="{StaticResource PropName}" />
+                            <TextBox Grid.Row="5" Grid.Column="1" Text="Solo lectura (fichero de imagen)" Style="{StaticResource PropValue}" />
+                        </Grid>
+                    </Grid>
+                </TabItem>
+
+                <TabItem x:Name="HashTab" Header="Hashes">
+                    <DockPanel Margin="10">
+                        <StackPanel DockPanel.Dock="Top">
+                            <TextBlock Text="Calcula hashes del origen seleccionado leyendo la imagen completa en solo lectura."
+                                       Foreground="{StaticResource MutedBrush}" Margin="0,0,0,8" TextWrapping="Wrap" />
+                            <WrapPanel Margin="0,0,0,8">
+                                <CheckBox x:Name="AlgCrc32" Content="CRC-32" Margin="0,0,14,0" />
+                                <CheckBox x:Name="AlgMd5" Content="MD5" Margin="0,0,14,0" />
+                                <CheckBox x:Name="AlgSha1" Content="SHA-1" Margin="0,0,14,0" />
+                                <CheckBox x:Name="AlgSha256" Content="SHA-256" IsChecked="True" Margin="0,0,14,0" />
+                            </WrapPanel>
+                            <CheckBox x:Name="RecordJob" Margin="0,0,0,8"
+                                      Content="Registrar el trabajo en la base de datos de trabajo (SQLite)" />
+                            <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                                <Button x:Name="HashStartButton" Content="Calcular" Click="HashStart_Click" />
+                                <Button x:Name="HashCancelButton" Content="Cancelar" Click="HashCancel_Click" IsEnabled="False" />
+                            </StackPanel>
+                            <ProgressBar x:Name="HashProgress" Height="16" Minimum="0" Maximum="1" />
+                            <TextBlock x:Name="HashProgressText" Margin="0,4,0,8" Foreground="{StaticResource MutedBrush}" />
+                        </StackPanel>
+                        <TextBox x:Name="HashResults" IsReadOnly="True" FontFamily="Consolas" TextWrapping="NoWrap"
+                                 HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto" />
+                    </DockPanel>
+                </TabItem>
+            </TabControl>
+
+            <GridSplitter x:Name="LogSplitter" Grid.Row="1" Grid.ColumnSpan="3" Height="4" HorizontalAlignment="Stretch"
+                          Background="{StaticResource BorderBrush}" />
+            <ListBox x:Name="LogList" Grid.Row="2" Grid.ColumnSpan="3" FontFamily="Consolas" FontSize="11" BorderThickness="0" />
+        </Grid>
+    </DockPanel>
+</Window>

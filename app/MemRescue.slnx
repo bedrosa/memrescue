@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/MemRescue.Core.Interop/MemRescue.Core.Interop.csproj" />
+    <Project Path="src/MemRescue/MemRescue.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/MemRescue.Core.Interop.Tests/MemRescue.Core.Interop.Tests.csproj" />
+  </Folder>
+</Solution>

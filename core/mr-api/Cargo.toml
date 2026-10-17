@@ -1,0 +1,19 @@
+[package]
+name = "mr-api"
+description = "API de alto nivel del motor de MemRescue: tareas, progreso y cancelación"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+mr-common.workspace = true
+mr-io.workspace = true
+mr-store.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

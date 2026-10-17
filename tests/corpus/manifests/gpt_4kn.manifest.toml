@@ -1,0 +1,28 @@
+# Generado por tests/generators/gen_partition_images.py: no editar a mano.
+generator_version = 1
+name = "gpt_4kn"
+file = "gpt_4kn.img"
+scheme = "gpt"
+sector_size = 4096
+total_sectors = 2048
+size_bytes = 8388608
+sha256 = "f3cd7fa7ada6797a357a01b67250ac5ec3e6373205ae9356a3419f8babdf26d5"
+disk_guid = "ac91c810-8d6d-5c15-93b1-02b69520b417"
+first_usable_lba = 6
+last_usable_lba = 2042
+entries_lba = 2
+backup_entries_lba = 2043
+backup_header_lba = 2047
+entry_count = 128
+entry_size = 128
+entries_crc32 = "60a42152"
+
+[[partitions]]
+label = "D1"
+start_lba = 256
+sectors = 1024
+end_lba = 1279
+gpt_type = "ebd0a0a2-b9e5-4433-87c0-68b6b72699c7"
+gpt_name = "MR-4KN"
+unique_guid = "cfe70c63-ffb8-5114-afb5-256e3aaaef09"
+marker = "MEMRESCUE-TEST|gpt_4kn|D1|LBA=256|"

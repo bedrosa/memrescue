@@ -1,0 +1,48 @@
+# Generado por tests/generators/gen_partition_images.py: no editar a mano.
+generator_version = 1
+name = "gpt_basic"
+file = "gpt_basic.img"
+scheme = "gpt"
+sector_size = 512
+total_sectors = 32768
+size_bytes = 16777216
+sha256 = "0592a94c5691170863986c382902d54fa71789953b13536f7ddfb3299fc4197b"
+disk_guid = "3735644a-4f8f-56fa-b75e-d808ec421dbb"
+first_usable_lba = 34
+last_usable_lba = 32734
+entries_lba = 2
+backup_entries_lba = 32735
+backup_header_lba = 32767
+entry_count = 128
+entry_size = 128
+entries_crc32 = "d473052d"
+
+[[partitions]]
+label = "D1"
+start_lba = 2048
+sectors = 8192
+end_lba = 10239
+gpt_type = "ebd0a0a2-b9e5-4433-87c0-68b6b72699c7"
+gpt_name = "MR-DATA1"
+unique_guid = "190904c5-f60c-5d50-9eba-42ccbf2747c2"
+marker = "MEMRESCUE-TEST|gpt_basic|D1|LBA=2048|"
+
+[[partitions]]
+label = "L1"
+start_lba = 10240
+sectors = 12288
+end_lba = 22527
+gpt_type = "0fc63daf-8483-4772-8e79-3d69d8477de4"
+gpt_name = "MR-LINUX"
+unique_guid = "1ce47d34-4495-5ec2-928e-6784a1dc65a4"
+marker = "MEMRESCUE-TEST|gpt_basic|L1|LBA=10240|"
+
+[[partitions]]
+label = "E1"
+start_lba = 22528
+sectors = 2048
+end_lba = 24575
+gpt_type = "c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
+gpt_name = "MR-ESP"
+unique_guid = "78fb8b9c-9b5e-5bf0-a278-d37bf0ab1c42"
+marker = "MEMRESCUE-TEST|gpt_basic|E1|LBA=22528|"

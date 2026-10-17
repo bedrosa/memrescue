@@ -1,0 +1,218 @@
+# Matriz de paridad con DMDE Professional
+
+Referencia: DMDE 4.4.4.842 Professional. Fecha de creación: 2026-10-17.
+
+## Leyenda
+
+**Verificación de la referencia** (qué sabemos de DMDE):
+- **M**: documentado en el manual o la web oficial (`investigacion/dmde-manual-oficial.md`).
+- **B**: observado en el binario (cadenas, mensajes de UI, IOCTL, constantes).
+- **D**: lógica verificada en código decompilado (`investigacion/dmde-fase1/05`).
+- **Pro**: exclusiva de la edición Professional según la web oficial.
+- **?**: necesita investigación (ver `ROADMAP.md`, tareas INV).
+
+**Estado MemRescue**: `No iniciado` → `Diseñado` → `Implementado` → `Probado` → **`Paridad`**.
+`Paridad` exige prueba reproducible (ADR-002). Tras M0 solo hay infraestructura: ninguna función de
+recuperación está implementada (ver resumen al final).
+
+Referencias abreviadas a documentos de investigación: `F1-05` = `investigacion/dmde-fase1/05-algoritmos-verificados.md`, etc.; `MAN` = `investigacion/dmde-manual-oficial.md`.
+
+---
+
+## 1. Acceso a dispositivos y E/S
+
+| ID | Funcionalidad | Descripción | Ref. DMDE | Evidencias | Verif. | Diseño MemRescue | Estado | Pruebas necesarias | Diferencias pendientes |
+|---|---|---|---|---|---|---|---|---|---|
+| IO-01 | Enumerar discos físicos | Lista de discos con modelo, tamaño, bus | Selector de dispositivos | F1-06 (SetupAPI, IOCTL_STORAGE_QUERY_PROPERTY), MAN | M B D | `mr-io-win` enumeración | No iniciado | Mock de enumeración; prueba manual en VM | Columnas exactas de DMDE no documentadas (INV-12) |
+| IO-02 | Enumerar volúmenes lógicos | Volúmenes y letras | Selector, "Show Volume Letters" | F1-06 | M B | `mr-io-win` | No iniciado | VM con VHD montado | - |
+| IO-03 | Abrir disco en solo lectura | `\\.\PhysicalDriveN` | Base | F1-06 | B D | `BlockDevice` Win | No iniciado | Prueba en VM con disco virtual | - |
+| IO-04 | Geometría y tamaño | Sector lógico/físico, tamaño total | Base | F1-06 (GET_LENGTH_INFO, GEOMETRY) | D | `mr-io-win` | No iniciado | VHD de 512 y 4Kn | Detección de capacidad "no accesible" (HPA/DCO) ? |
+| IO-05 | Interfaz IO FILE / SCSI / ATA | Selección de vía de lectura | Parámetros E/S | MAN, F1-06 (SCSI/ATA pass-through) | M D | Estrategias intercambiables | No iniciado | Simulador + VM | CDBs/comandos exactos no verificados (INV-06) |
+| IO-06 | Reintentos CRC y seek | Reintentos configurables, sector a sector tras error | Parámetros E/S | MAN, F1-06 | M B | `ResilientReader` | No iniciado | Dispositivo simulado con errores | - |
+| IO-07 | Salto sobre sectores malos + lectura hacia atrás | Reduce carga en zonas dañadas | Parámetros E/S | MAN, F1-06 | M B | `ResilientReader` | No iniciado | Simulador: mapa de errores esperado | Algoritmo exacto de retroceso ? (INV-06) |
+| IO-08 | Rellenos de sectores malos/saltados | Patrón de 4 bytes LE | Parámetros E/S | MAN | M B | `ResilientReader` | No iniciado | Comparar bytes de salida | - |
+| IO-09 | Omitir errores por código / "ignorar todo" | Lista de códigos | Parámetros E/S | MAN | M B | Política de errores | No iniciado | Simulador | - |
+| IO-10 | Timeouts, reset de handle, reanudar al reconectar | Robustez ante desconexiones | Parámetros E/S | MAN, F1-06 | M B | `mr-io-win` + política | No iniciado | Simulador de desconexión | - |
+| IO-11 | Script de manejo de E/S **(Pro)** | Lenguaje para decidir ante errores | Parámetros E/S | MAN, F1-09 | M B Pro | Lenguaje propio o Rhai/Lua embebido | No iniciado | Pruebas del intérprete | Semántica completa ? (INV-07) |
+| IO-12 | Informe SMART (ATA) y salud NVMe | Atributos y umbrales | Parámetros E/S | MAN, F1-06 (SMART IOCTL) | M B D | `mr-io-win` | No iniciado | Datos SMART grabados (fixtures) | - |
+| IO-13 | Bloquear/desmontar volúmenes | Antes de escribir/copiar | Disk → Lock Volumes | F1-06 (FSCTL_LOCK/DISMOUNT) | M D | `mr-io-win` | No iniciado | VM | - |
+| IO-14 | Acceso DASD extendido | Leer todo el volumen | Base | F1-06 (FSCTL_ALLOW_EXTENDED_DASD_IO) | D | `mr-io-win` | No iniciado | VM | - |
+
+## 2. Imágenes y dispositivos virtuales
+
+| ID | Funcionalidad | Descripción | Ref. DMDE | Evidencias | Verif. | Diseño MemRescue | Estado | Pruebas necesarias | Diferencias pendientes |
+|---|---|---|---|---|---|---|---|---|---|
+| IM-01 | Imagen sector a sector | IMG/BIN/RAW | Open Image | MAN, F1-02 | M B | `mr-io::ImageFile` (M0) → `mr-image` | **Implementado parcial** (M0: apertura solo lectura, tamaño, sectores, lectura posicional) | Hecho: unitarias + corpus (3 imágenes). Falta: lectura de estructuras (M2) | Sin interpretación de contenido aún |
+| IM-02 | Imagen dividida | Partes + descriptor | Copy Sectors (split) | MAN | M B | `mr-image` | No iniciado | Generador de partes | Descriptor propio (no `raidinfo.ini`) |
+| IM-03 | VHD (fijo/dinámico/diferencial) | Lectura | Imágenes | MAN, F1-06 | M B | `mr-image` | No iniciado | VHD creados con herramientas Windows | Diferencial vía RAID "DVHD" ? |
+| IM-04 | VHDX | Lectura | Imágenes | MAN, F1-06 | M B | `mr-image` | No iniciado | VHDX de Hyper-V/diskpart | - |
+| IM-05 | VMDK | Lectura | Imágenes | MAN | M B | `mr-image` | No iniciado | VMDK de qemu-img | Variantes (sparse/stream) a acotar |
+| IM-06 | E01/EWF **(Pro)** | Lectura con compresión | Imágenes | MAN | M Pro | `mr-image` (spec libewf) | No iniciado | E01 generados con herramienta libre | - |
+| IM-07 | Capa de cambios diferidos | Deshacer/rehacer/aplicar/rollback | Disk menu | MAN, F1-04 | M B | `mr-changes` | No iniciado | Pruebas de propiedades | - |
+| IM-08 | Modo global de solo lectura | Bloqueo de escritura | Disk menu | MAN | M B | ADR-006 | No iniciado | Prueba de que nada escribe | - |
+
+## 3. Particiones
+
+| ID | Funcionalidad | Descripción | Ref. DMDE | Evidencias | Verif. | Diseño MemRescue | Estado | Pruebas necesarias | Diferencias pendientes |
+|---|---|---|---|---|---|---|---|---|---|
+| PT-01 | Leer MBR/EBR | Primarias y lógicas | Partitions | MAN, F1-07 | M B | `mr-part` | No iniciado | Imágenes con sfdisk/diskpart | Validador DMDE no decompilado (INV-05) |
+| PT-02 | Leer GPT + copia | Cabecera, entradas, CRC | Partitions | F1-05 §5.2 | M D | `mr-part` | No iniciado | GPT sano, dañado, desplazado | - |
+| PT-03 | Tolerancia GPT | Rebasar LBA si la imagen está desplazada | - | F1-05 §5.2 | D | `mr-part` | No iniciado | Imagen recortada al inicio | - |
+| PT-04 | Apple Partition Map | Lectura | - | F1-07 | B | `mr-part` | No iniciado | Imagen APM | Prioridad baja |
+| PT-05 | Búsqueda exprés de particiones perdidas | Al abrir dispositivo | Partitions "found" | MAN | M B | `mr-part::search` | No iniciado | Tabla borrada con FS intactos | Algoritmo ? (INV-05) |
+| PT-06 | Indicadores T/E/B/C/F/f/x y activa | Estado de estructuras | Partitions | MAN | M | UI + `mr-part` | No iniciado | Instantáneas de UI | - |
+| PT-07 | Insertar (undelete), quitar, crear RAW | Edición de tabla | Partitions (avanzado) | MAN | M B | `mr-part` + `mr-changes` | No iniciado | Sobre imágenes únicamente | Escritura física bloqueada (ADR-006) |
+| PT-08 | Restaurar boot sector desde copia | NTFS/FAT/exFAT | Partitions | MAN | M B | `mr-part` | No iniciado | Boot dañado + copia sana | - |
+| PT-09 | MBR/GPT On/Off, activa | Firmas y flag | Partitions | MAN | M B | `mr-part` | No iniciado | Imágenes | - |
+| PT-10 | Guardar/cargar particionado, deshacer | Copia de seguridad de tablas | Partitions | MAN | M B | `mr-part` | No iniciado | Ida y vuelta | Formato propio |
+| PT-11 | Escribir boot sectors / código MBR | Disco arrancable DOS | Partitions | MAN | M B | - | No iniciado | - | **Fuera de alcance inicial** (requiere código de arranque propio) |
+
+## 4. Sistemas de archivos (lectura)
+
+| ID | Funcionalidad | Descripción | Ref. DMDE | Evidencias | Verif. | Diseño MemRescue | Estado | Pruebas necesarias | Diferencias pendientes |
+|---|---|---|---|---|---|---|---|---|---|
+| FS-01 | NTFS: boot, MFT, fixups, atributos, runs | Lectura completa | Base | F1-05 §5.1, §5.3 | M D | `mr-fs-ntfs` | No iniciado | Imágenes NTFS de Windows; oráculo: otra herramienta independiente | - |
+| FS-02 | NTFS: índices y directorios | INDX/$I30 | Base | F1-05 §5.3 | D | `mr-fs-ntfs` | No iniciado | Directorios grandes | - |
+| FS-03 | NTFS: comprimidos (LZNT1), sparse, residentes | Datos | Base | F1-05 §5.3 | M D | `mr-fs-ntfs` | No iniciado | Ficheros con `compact`/`fsutil sparse` | - |
+| FS-04 | NTFS: ADS **(Pro)** | Flujos alternativos | Recuperación | MAN, F1-04 | M B Pro | `mr-fs-ntfs` | No iniciado | Ficheros con ADS | - |
+| FS-05 | NTFS: EFS (raw, .efs/.efk/.efb) | Sin descifrar | Recuperación | MAN, F1-02 | M B | `mr-fs-ntfs` + `mr-recover` | No iniciado | Ficheros EFS en VM | Formato `.efb` es propio de DMDE: usar API de Windows `ReadEncryptedFileRaw` |
+| FS-06 | NTFS: $LogFile (journal, beta) | Información adicional | Reconstrucción | MAN, F1-05 | M D | `mr-fs-ntfs` | No iniciado | Imágenes con journal | DMDE no hace replay completo |
+| FS-07 | FAT12/16/32 | Boot, FAT1/FAT2, directorios, LFN | Base | MAN, F1-07 | M B | `mr-fs-fat` | No iniciado | mkfs.fat / format | Lógica DMDE no verificada (INV-04) |
+| FS-08 | exFAT | Lectura | Base | MAN, F1-07 | M B | `mr-fs-exfat` | No iniciado | Imágenes exFAT | INV-04 |
+| FS-09 | Ext2/3/4 | Inodos, extents, journal, 64-bit, codificaciones | Base | MAN, F1-05 §5.5 | M D (superbloque) | `mr-fs-ext` | No iniciado | mkfs.ext2/3/4 | Resto INV-04 |
+| FS-10 | HFS+/HFSX | Catálogo, extents, resource fork | Base | MAN, F1-07 | M B | `mr-fs-hfsplus` | No iniciado | Imágenes HFS+ | INV-04 |
+| FS-11 | APFS | Contenedor, omap, volúmenes | Base | MAN, F1-05 §5.6 | M D (superbloque) | `mr-fs-apfs` | No iniciado | Imágenes APFS (generación a investigar) | Cifrado APFS fuera de alcance ? |
+| FS-12 | ReFS (hasta v3.14) | Lectura | Base | MAN, changelog | M B | `mr-fs-refs` | No iniciado | Imágenes ReFS (Windows Server/Pro for Workstations) | Especificación pública escasa: alto riesgo |
+| FS-13 | Btrfs (subvolúmenes) | Lectura | Base | MAN, changelog | M B | `mr-fs-btrfs` | No iniciado | mkfs.btrfs | INV-04 |
+| FS-14 | ISO9660 | Lectura | - | F1-07 (`CD001`) | B | `mr-fs-iso` | No iniciado | Imágenes ISO | No anunciado oficialmente |
+| FS-15 | Nombres nacionales / páginas de código | Transliteración, OEM | Base | MAN, F1-09 | M B | `mr-common` | No iniciado | Nombres no ASCII | - |
+
+## 5. Escaneo y reconstrucción
+
+| ID | Funcionalidad | Descripción | Ref. DMDE | Evidencias | Verif. | Diseño MemRescue | Estado | Pruebas necesarias | Diferencias pendientes |
+|---|---|---|---|---|---|---|---|---|---|
+| SC-01 | Full Scan multi-FS | Escaneo del dispositivo/rango | Tools → Full Scan | MAN, F1-04 | M B | `mr-scan` | No iniciado | Imágenes con particiones borradas | - |
+| SC-02 | Escaneo "a saltos" (grueso→fino) | Resultados grandes primero | Full Scan | MAN, F1-05 §5.4 | M D (NTFS) | `mr-scan` | No iniciado | Medir tiempo a primer resultado | - |
+| SC-03 | Pausa/reanudación y logs | Guardar/cargar/autoguardado | Full Scan | MAN, F1-09 | M B | SQLite (ADR-008) | No iniciado | Interrumpir y reanudar | Formato propio |
+| SC-04 | Candidatos/versiones de volumen con calidad | %, Check, Min. Size, indicadores | Full Scan | MAN | M B | `mr-scan` | No iniciado | Imágenes con volúmenes redimensionados | Métrica exacta de DMDE ? (INV-03) |
+| SC-05 | Escáner NTFS (FILE/INDX, agrupación) | Fragmentos MFT/INDX | Full Scan | F1-05 §5.4 | D | `mr-fs-ntfs::scan` | No iniciado | MFT parcialmente sobrescrita | Puntuación ? (INV-03) |
+| SC-06 | Escáneres FAT/exFAT/Ext/HFS/ReFS/APFS/Btrfs | Fragmentos por FS | Full Scan | MAN, F1-07 | M B | `mr-fs-*::scan` | No iniciado | Imágenes dañadas por FS | INV-04 |
+| SC-07 | Reconstrucción FS virtual: modos rápido/defecto/completo/personalizado | Árbol reconstruido | All Found/Virtual FS | MAN | M B | `mr-vfs` | No iniciado | Comparar árboles esperados | - |
+| SC-08 | Más/Menos resultados | Ajuste de extras | Reconstrucción | MAN | M B | `mr-vfs` | No iniciado | Monotonía (más ⊇ menos) | - |
+| SC-09 | Opciones NTFS avanzadas | Filtro MFT, INDX auto/completo, journal, desplazados, extras, técnicos | Reconstrucción | MAN | M B | `mr-vfs` + `mr-fs-ntfs` | No iniciado | Una prueba por opción | - |
+| SC-10 | Opciones FAT (FAT1/FAT2/ninguna, no usar sectores malos) | - | Reconstrucción | MAN | M B | `mr-fs-fat` | No iniciado | FAT1 dañada | - |
+| SC-11 | Grupos de fragmentos (mejores/relacionados/ajenos…) | Clasificación | Reconstrucción | MAN | M B | `mr-scan` | No iniciado | Dos volúmenes superpuestos | Criterios ? |
+| SC-12 | Mapa de clusters + informe | Qué fichero ocupa cada cluster | Tools | MAN | M B | `mr-vfs` | No iniciado | Verificar asignaciones | - |
+| SC-13 | Búsqueda por nombre en carpetas | Búsqueda en árbol | Tools | MAN | M B | `mr-vfs` | No iniciado | Máscaras | - |
+
+## 6. RAW por firmas
+
+| ID | Funcionalidad | Descripción | Ref. DMDE | Evidencias | Verif. | Diseño MemRescue | Estado | Pruebas necesarias | Diferencias pendientes |
+|---|---|---|---|---|---|---|---|---|---|
+| RW-01 | Búsqueda RAW integrada en Full Scan | Resultados en carpeta RAW | Full Scan | MAN, F1-08 | M B | `mr-raw` | No iniciado | Imagen con ficheros conocidos sin FS | Lógica DMDE no verificada (INV-02) |
+| RW-02 | Firmas con comodín, máscara de bits, offset variable ≤ 4096 | Definición | Full Scan | MAN | M B | ADR-009 | No iniciado | Pruebas unitarias del matcher | - |
+| RW-03 | Firma EOF, límites de tamaño, contenedores, "fiable" | Fin de fichero | Full Scan | MAN, F1-08 | M B | `mr-raw` | No iniciado | Ficheros truncados/concatenados | - |
+| RW-04 | Calculadores de tamaño por formato | JPEG, ZIP, OLE, MP4, PDF… | Implícito | F1-08 (tabla de tipos) | B | `mr-raw::formats` | No iniciado | Corpus por formato | Qué formatos calcula DMDE ? (INV-02) |
+| RW-05 | Filtrado RAW con mapa de clusters | Ocultar lo ya hallado por FS | Full Scan | MAN | M B | `mr-raw` + `mr-vfs` | No iniciado | Imagen mixta | - |
+| RW-06 | Generar firma desde muestras + probar | Asistente | Full Scan | MAN, F1-04 | M B | `mr-raw` | No iniciado | Muestras sintéticas | - |
+| RW-07 | Marcadores de estado RAW (+EOF, sin EOF, tamaño estimado) | Panel | File panel | MAN | M | UI | No iniciado | - | - |
+| RW-08 | Recuperación de fragmentados | Más allá del primer fragmento | - | MAN (DMDE solo recupera el 1.er fragmento en RAW) | M | Investigación propia | No iniciado | Ficheros fragmentados | **Mejora posible** sobre DMDE, no requisito de paridad |
+
+## 7. Recuperación y exportación
+
+| ID | Funcionalidad | Descripción | Ref. DMDE | Evidencias | Verif. | Diseño MemRescue | Estado | Pruebas necesarias | Diferencias pendientes |
+|---|---|---|---|---|---|---|---|---|---|
+| RC-01 | Recuperar ficheros/directorios masivamente | Sin límite de nº | Recover (bulk) | MAN, F1-08 | M B | `mr-recover` | No iniciado | Árbol de 100k ficheros | Lógica DMDE no verificada (INV-01) |
+| RC-02 | Categorías (normal/borrado/encontrado/RAW…) | Selección | Recover | MAN, F1-04 | M B | `mr-recover` | No iniciado | Una prueba por categoría | - |
+| RC-03 | Filtros (máscaras, exclusión, tamaño, fecha, ID, solo dirs con ficheros) | - | Recover | MAN | M B | `mr-recover` | No iniciado | Tabla de casos | - |
+| RC-04 | Destino en otro disco físico | Protección | Recover | MAN | M B | `mr-recover` | No iniciado | Mismo disco → rechazo | - |
+| RC-05 | Conflictos de nombre (renombrar, auto, omitir, fusionar, umbral) | - | Recover | MAN | M B | `mr-recover` | No iniciado | Casos | - |
+| RC-06 | Errores (omitir, ignorar, ocultar, mover a carpeta de malos) + manejadores | - | Recover | MAN | M B | `mr-recover` | No iniciado | Simulador con errores | - |
+| RC-07 | Rutas largas, Unicode, transliteración | - | Recover | MAN | M B | `mr-recover` | No iniciado | Rutas > 260 | Nombres sustitutos DOS fuera de alcance |
+| RC-08 | Dividir ficheros grandes | Destinos FAT | Recover | MAN | M B | `mr-recover` | No iniciado | 5 GiB → FAT32 | - |
+| RC-09 | Restaurar fechas, permisos, propietario | - | Recover | F1-04 | B | `mr-recover` | No iniciado | Comparar metadatos | - |
+| RC-10 | Informe de recuperación con CRC-32/MD5/SHA-1/SHA-256 **(Pro)** | Forense | Recover | MAN, F1-02 (MD5/CRC D) | M B D Pro | `mr-report` (hashes en `mr-common`) | No iniciado (M0: primitivas CRC-32/MD5/SHA-1/SHA-256 implementadas y probadas con vectores conocidos) | Hashes conocidos | Falta el informe en sí (M4) |
+| RC-11 | Lista de ficheros TXT/CSV | - | Recover | MAN | M B | `mr-report` | No iniciado | Formato | - |
+| RC-12 | Lista HTML **(Pro)** | - | Recover | MAN | M B Pro | `mr-report` (plantilla propia) | No iniciado | Validar HTML | - |
+| RC-13 | Lista de sectores / clusters | Para clonado parcial | Recover | MAN | M B | `mr-report` | No iniciado | Rangos correctos | - |
+| RC-14 | Vista previa de ficheros | Imágenes/texto | File panel | MAN, F1-02 (GDI+) | M B | UI | No iniciado | - | - |
+
+## 8. RAID virtual
+
+| ID | Funcionalidad | Descripción | Ref. DMDE | Evidencias | Verif. | Diseño MemRescue | Estado | Pruebas necesarias | Diferencias pendientes |
+|---|---|---|---|---|---|---|---|---|---|
+| RD-01 | RAID 0 | Stripe | Construct RAID | MAN, F1-08 | M B | `mr-raid` | No iniciado | Arrays sintéticos (mdadm o generador propio) | Lógica DMDE no verificada (INV-03b) |
+| RD-02 | RAID 1 (solo lectura) | Espejo | Construct RAID | MAN | M B | `mr-raid` | No iniciado | Idem | - |
+| RD-03 | RAID 4 | Paridad dedicada | Construct RAID | MAN | M B | `mr-raid` | No iniciado | Reconstruir con un disco NULL | - |
+| RD-04 | RAID 5 (4 rotaciones + paridad retrasada) | - | Construct RAID | MAN | M B | `mr-raid` | No iniciado | Cada rotación con mdadm/generador | Definición exacta de "delay" ? |
+| RD-05 | RAID 6 (solo lectura, un NULL) | Doble paridad | Construct RAID | MAN | M B | `mr-raid` (P+Q, GF(2^8)) | No iniciado | Idem | - |
+| RD-06 | Rotación personalizada (orden, −1 XOR, −2 sin uso) | - | Striping | MAN | M | `mr-raid` | No iniciado | Tablas de rotación | - |
+| RD-07 | JBOD/spanned (lectura/escritura) | Concatenación | Construct RAID | MAN | M B | `mr-raid` | No iniciado | - | Escritura bloqueada al principio |
+| RD-08 | Offset y tamaño por disco, disco NULL, read-ahead | - | Construct RAID | MAN | M B | `mr-raid` | No iniciado | - | - |
+| RD-09 | Cálculo automático de parámetros | Estadístico con restricciones | RAID Auto Calculate | MAN, F1-08, `FUN_00671ef0` (no usar) | M B | `mr-raid::detect` (diseño propio) | No iniciado | Arrays con parámetros ocultos | Métrica ? (INV-03b) |
+| RD-10 | Guardar/cargar configuración | - | RAID | MAN | M B | TOML | No iniciado | Ida y vuelta | - |
+| RD-11 | VHD diferenciales encadenados | "DVHD" | RAID | F1-08 | B | `mr-image` | No iniciado | Cadena de VHD | ? |
+
+## 9. Clonado e imagen
+
+| ID | Funcionalidad | Descripción | Ref. DMDE | Evidencias | Verif. | Diseño MemRescue | Estado | Pruebas necesarias | Diferencias pendientes |
+|---|---|---|---|---|---|---|---|---|---|
+| CL-01 | Copiar sectores (dispositivo/partición/fichero/selección) | - | Copy Sectors | MAN, F1-08 | M B | `mr-clone` | No iniciado | Imagen → imagen bit a bit | - |
+| CL-02 | Copia inversa | - | Copy Sectors | MAN | M B | `mr-clone` | No iniciado | - | - |
+| CL-03 | Doble hilo | Lectura/escritura en paralelo | Copy Sectors | MAN | M B | `mr-clone` | No iniciado | - | - |
+| CL-04 | Log + reanudar **(Pro)** | Multipasada | Copy Sectors | MAN | M B Pro | `mr-clone` + mapa | No iniciado | Interrupción y reanudación | - |
+| CL-05 | Reintentar sectores malos desde log **(Pro)** | - | Copy Sectors | MAN | M B Pro | `mr-clone` | No iniciado | Simulador | - |
+| CL-06 | Mapfile ddrescue (exportar; importar como mejora) | Interoperabilidad | Copy Sectors | MAN, F1-08 | M B | `mr-clone` | No iniciado | Validar con ddrescuelog | - |
+| CL-07 | Dividir imagen en partes | - | Copy Sectors | MAN | M B | `mr-image` | No iniciado | - | - |
+| CL-08 | Bloquear origen durante la copia | - | Copy Sectors | MAN | M B | `mr-io-win` | No iniciado | VM | - |
+| CL-09 | Exportar rangos malos/saltados | Para mapear ficheros dañados | Copy Sectors | MAN | M B | `mr-clone` + `mr-report` | No iniciado | - | - |
+| CL-10 | Rellenar sectores | Patrón | Tools → Fill Sectors | MAN, F1-04 | M B | `mr-hex` | No iniciado | Solo imágenes | - |
+| CL-11 | Clonado a disco físico | Escritura | Copy Sectors | MAN | M | - | No iniciado | - | **Bloqueado** hasta hito de escritura segura |
+
+## 10. Editor hexadecimal y herramientas
+
+| ID | Funcionalidad | Descripción | Ref. DMDE | Evidencias | Verif. | Diseño MemRescue | Estado | Pruebas necesarias | Diferencias pendientes |
+|---|---|---|---|---|---|---|---|---|---|
+| HX-01 | Vista hex/texto con codificaciones | - | Editor/Mode | MAN, F1-04 | M B | `mr-hex` + control UI | No iniciado | Instantáneas | - |
+| HX-02 | Vistas de estructura integradas (MBR, GPT, boot, FAT dir, MFT, INDX…) | - | Mode | MAN, F1-04 | M B | Plantillas propias | No iniciado | Cada estructura | Lista completa de vistas (INV-09) |
+| HX-03 | Plantillas personalizadas | Lenguaje de plantillas | Mode | MAN, F1-09 | M B | Lenguaje propio documentado | No iniciado | Intérprete | No compatible con `template.txt` de DMDE |
+| HX-04 | Navegación (ir a sector/cluster/registro/offset, objetos FS) | - | Editor | MAN, F1-04 | M B | `mr-hex` | No iniciado | - | - |
+| HX-05 | Modo edición + colores (modificado, no usado, error E/S, error lógico) | - | Edit | MAN | M | `mr-hex` + `mr-changes` | No iniciado | - | - |
+| HX-06 | Buscar cadena / sector especial | - | Tools → Search | MAN, F1-04 | M B | `mr-hex` | No iniciado | - | - |
+| HX-07 | Copiar/pegar bloques, exportar a texto | - | Edit | F1-04 | B | `mr-hex` | No iniciado | - | - |
+| NT-01 | Herramientas NTFS sin driver: copiar dentro, crear dir, borrar, reparar INDX | Escritura FS | Tools → NTFS Tools | MAN, F1-04 | M B | `mr-fs-ntfs::write` | No iniciado | Solo imágenes + chkdsk en VM | Alto riesgo: último hito |
+| NT-02 | Crear lista de atributos NTFS | Avanzado | Undocumented | F1-04 | B | - | No iniciado | - | Baja prioridad |
+
+## 11. Aplicación y experiencia de usuario
+
+| ID | Funcionalidad | Descripción | Ref. DMDE | Evidencias | Verif. | Diseño MemRescue | Estado | Pruebas necesarias | Diferencias pendientes |
+|---|---|---|---|---|---|---|---|---|---|
+| UX-01 | Flujo selector → particiones → volumen → árbol → recuperar | Flujo principal | Manual "Work with Program" | MAN | M | ARQUITECTURA §5 | No iniciado | Pruebas de UI guiadas | Disposición exacta de DMDE no documentada (INV-12) |
+| UX-02 | Menús Disco/Herramientas/Ventanas/Editor/Modo/Edición | Organización | Menu | MAN, F1-04 | M B | Misma organización lógica, textos propios | No iniciado | Revisión de cobertura | Submenús Windows/Editor/Mode/Edit ? (INV-12) |
+| UX-03 | Panel de ficheros con marcadores de estado | Borrado/encontrado/RAW/fragmento | File panel | MAN | M | UI con iconos propios | No iniciado | - | - |
+| UX-04 | Disposiciones de ventana (árbol, panel, editor) | - | Windows | F1-04 | B | UI | No iniciado | - | - |
+| UX-05 | Atajos de teclado familiares | Ctrl+E, Ctrl+W, F2, Insert/Espacio… | Varios | MAN, F1-02 (lista de atajos) | M B | Mapa de atajos configurable | No iniciado | - | Lista completa ? |
+| UX-06 | Idiomas | Localización | Language | MAN, F1-09 | M B | Recursos `.resx` propios (WPF) | No iniciado | - | ES/EN primero |
+| UX-07 | Tema oscuro, alto DPI | - | "Dark Mode (Unofficial)" | F1-04 | B | WPF: PerMonitorV2 (hecho en M0) + temas claro/oscuro propios | No iniciado (DPI: configurado) | Captura con `--screenshot` | Tema oscuro pendiente |
+| UX-08 | Pistas para usuarios noveles | Ayudas contextuales | - | F1-04 | B | UI | No iniciado | - | - |
+| UX-09 | Portable sin instalación | - | Base | MAN | M | Publicación WPF autocontenida (ADR-011) | **Implementado** (M0) | Autodiagnóstico del exe publicado sin .NET instalado: superado 2026-10-17 | Falta empaquetado (zip/firma) y configuración junto al exe |
+| UX-10 | Activación/licencias | - | - | - | - | **No aplica** (no se replica) | - | - | - |
+
+## Resumen
+
+| Bloque | Funcionalidades | Con lógica verificada en DMDE (D) | Implementadas | En paridad |
+|---|---|---|---|---|
+| E/S | 14 | 7 | 0 | 0 |
+| Imágenes | 8 | 0 | 1 (parcial: IM-01) | 0 |
+| Particiones | 11 | 2 | 0 | 0 |
+| FS | 15 | 6 | 0 | 0 |
+| Escaneo | 13 | 2 | 0 | 0 |
+| RAW | 8 | 0 | 0 | 0 |
+| Recuperación | 14 | 1 | 0 | 0 |
+| RAID | 11 | 0 | 0 | 0 |
+| Clonado | 11 | 0 | 0 | 0 |
+| Editor/herramientas | 9 | 0 | 0 | 0 |
+| Aplicación | 10 | 0 | 1 (UX-09) | 0 |
+| **Total** | **124** | **18** | **2 (1 parcial)** | **0** |
+
+Última actualización: 2026-10-17, tras M0. Ninguna funcionalidad alcanza todavía "Paridad".

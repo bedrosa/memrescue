@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <UseWPF>true</UseWPF>
+    <AssemblyName>MemRescue</AssemblyName>
+    <RootNamespace>MemRescue</RootNamespace>
+    <ApplicationIcon>Assets\MemRescue.ico</ApplicationIcon>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Resource Include="Assets\MemRescue.ico" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\MemRescue.Core.Interop\MemRescue.Core.Interop.csproj" />
+  </ItemGroup>
+
+</Project>

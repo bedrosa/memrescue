@@ -1,0 +1,53 @@
+# Generado por tests/generators/gen_partition_images.py: no editar a mano.
+generator_version = 1
+name = "mbr_basic"
+file = "mbr_basic.img"
+scheme = "mbr"
+sector_size = 512
+total_sectors = 32768
+size_bytes = 16777216
+sha256 = "95b3a659574ae5f17007c7d62c9d6f24361945494afd0dabf8db7fa52629964d"
+disk_signature = "4d520001"
+extended_start_lba = 14336
+extended_sectors = 18432
+ebr_lbas = [14336, 20480]
+
+[[partitions]]
+label = "P1"
+start_lba = 2048
+sectors = 8192
+end_lba = 10239
+mbr_type = 7
+active = true
+logical = false
+marker = "MEMRESCUE-TEST|mbr_basic|P1|LBA=2048|"
+
+[[partitions]]
+label = "P2"
+start_lba = 10240
+sectors = 4096
+end_lba = 14335
+mbr_type = 12
+active = false
+logical = false
+marker = "MEMRESCUE-TEST|mbr_basic|P2|LBA=10240|"
+
+[[partitions]]
+label = "L1"
+start_lba = 16384
+sectors = 4096
+end_lba = 20479
+mbr_type = 131
+active = false
+logical = true
+marker = "MEMRESCUE-TEST|mbr_basic|L1|LBA=16384|"
+
+[[partitions]]
+label = "L2"
+start_lba = 22528
+sectors = 8192
+end_lba = 30719
+mbr_type = 7
+active = false
+logical = true
+marker = "MEMRESCUE-TEST|mbr_basic|L2|LBA=22528|"

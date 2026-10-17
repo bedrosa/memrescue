@@ -1,0 +1,104 @@
+# Interfaz entre el motor (Rust) y la interfaz (C#): ABI 1
+
+Fuente de verdad: [core/mr-ffi/include/memrescue_core.h](../core/mr-ffi/include/memrescue_core.h).
+Implementación: [core/mr-ffi/src/lib.rs](../core/mr-ffi/src/lib.rs).
+Cliente .NET: [app/src/MemRescue.Core.Interop/](../app/src/MemRescue.Core.Interop/).
+
+## Arquitectura
+
+```
+MemRescue.exe (WPF, C#)
+   └─ MemRescue.Core.Interop.dll  ── P/Invoke ([LibraryImport]) ──▶  memrescue_core.dll (Rust, cdylib)
+                                                                       └─ mr-api → mr-io / mr-store / mr-common
+memrescue-cli.exe (Rust) ──────────────── llamada directa ──────────▶  mr-api
+```
+
+- La DLL es la **única** dependencia binaria de la GUI con el motor. La GUI no conoce tipos Rust.
+- La CLI usa `mr-api` directamente (sin FFI); las pruebas comprueban que ambas vías dan los mismos resultados.
+- Versionado: `mr_abi_version()` devuelve 1. La GUI lo comprueba al arrancar (`Engine.EnsureCompatible`) y se
+  niega a funcionar con una DLL incompatible. Cualquier cambio incompatible en firmas, estructuras o
+  significados incrementa la versión de ABI; añadir funciones nuevas no.
+
+## Convenciones
+
+| Aspecto | Regla |
+|---|---|
+| Convención de llamada | `extern "C"` (Win64: la única existente en x64) |
+| Retorno | `int32_t mr_status`: 0 = `MR_OK`; ver tabla de códigos |
+| Cadenas de entrada | UTF-8, puntero + longitud en bytes; no requieren terminador. Puntero nulo solo con longitud 0 |
+| Cadenas de salida | El llamador aporta `(buf, cap, out_len)`. Si cabe, el motor escribe UTF-8 + `\0` y `*out_len` = longitud sin `\0`. Si no, `MR_ERR_BUFFER_TOO_SMALL` y `*out_len` = longitud necesaria (el cliente reintenta con `out_len + 1`) |
+| Estructuras | `#[repr(C)]`, campos de ancho fijo, relleno explícito (`reserved`). Tamaños comprobados por pruebas en ambos lados: `mr_image_info` = 32 B, `mr_task_status` = 24 B |
+| Enteros | `uint64_t` para tamaños y LBA; `uint32_t` para enumeraciones y máscaras |
+| Booleanos | No se usan en la ABI (evita discrepancias de tamaño) |
+
+## Propiedad de la memoria
+
+1. **El motor nunca devuelve memoria que el llamador deba liberar.** Toda salida se escribe en búferes o
+   estructuras del llamador. No existe `mr_free`.
+2. Los punteros de entrada solo se leen durante la llamada; el motor no los conserva.
+3. Las **tareas** son recursos del motor identificados por un handle `uint64_t` opaco (nunca 0). El
+   handle se guarda en un registro interno, **no es un puntero**: un handle inválido, liberado o
+   inventado devuelve `MR_ERR_INVALID_HANDLE` en lugar de corromper memoria.
+4. El cliente libera cada tarea con `mr_task_free` (en C#, `HashTask.Dispose`, idempotente). Liberar una
+   tarea en curso la cancela; su hilo termina por sí solo.
+
+## Errores
+
+| Código | Nombre | Significado |
+|---|---|---|
+| 0 | `MR_OK` | Correcto |
+| 1 | `MR_ERR_INVALID_ARGUMENT` | Puntero nulo, UTF-8 inválido, máscara o algoritmo no válido |
+| 2 | `MR_ERR_IO` | Error de E/S (fichero inexistente, tamaño de sector no válido, lectura) |
+| 3 | `MR_ERR_PATH_REJECTED` | Ruta de dispositivo (`\\.\…`, `\\?\GLOBALROOT…`) rechazada: acceso a discos deshabilitado |
+| 4 | `MR_ERR_STORE` | Error de la base de datos de trabajo SQLite |
+| 5 | `MR_ERR_CANCELLED` | La tarea se canceló |
+| 6 | `MR_ERR_NOT_FINISHED` | Se pidió el resultado de una tarea en curso |
+| 7 | `MR_ERR_INVALID_HANDLE` | Handle de tarea desconocido o ya liberado |
+| 8 | `MR_ERR_BUFFER_TOO_SMALL` | Búfer de salida insuficiente (`*out_len` indica lo necesario) |
+| 9 | `MR_ERR_TASK_FAILED` | La tarea terminó con error (mensaje en `mr_last_error`) |
+| 99 | `MR_ERR_PANIC` | Error interno capturado; el proceso **no** se cae |
+
+- `mr_last_error` devuelve el mensaje del **último error del hilo que llama** (almacenamiento local de
+  hilo). El cliente debe leerlo inmediatamente después del fallo y en el mismo hilo; `Engine.Check` en
+  C# lo hace de forma síncrona antes de cualquier `await`.
+- Cada función exportada envuelve su cuerpo en `catch_unwind`: un pánico de Rust nunca cruza la frontera.
+
+## Operaciones asíncronas
+
+Modelo **sondeo + cancelación cooperativa**, sin callbacks (evita que hilos de Rust entren en código .NET
+y problemas de *marshalling* de delegados):
+
+```
+mr_hash_start(...) → handle
+loop: mr_task_status_get(handle) → {state, done, total}     // la GUI sondea cada ~100 ms
+      [opcional] mr_task_cancel(handle)                     // marca de cancelación
+state ≠ RUNNING → mr_hash_result(handle, alg) / mr_last_error
+mr_task_free(handle)
+```
+
+- Estados: 1 en curso, 2 completada, 3 fallida, 4 cancelada.
+- En C#, `HashTask.WaitAsync(IProgress<TaskProgress>, CancellationToken)` encapsula el bucle: el token
+  solicita la cancelación al motor y espera a que el motor la confirme (no abandona la tarea).
+- Persistencia opcional: si se pasa una ruta de base de datos de trabajo, el motor registra el trabajo
+  (fuente, estado, progreso, resultado) en SQLite. Ver [ARQUITECTURA.md](ARQUITECTURA.md) §4.
+
+## Funciones (ABI 1)
+
+| Función | Descripción |
+|---|---|
+| `mr_abi_version()` | Versión de la ABI |
+| `mr_engine_version(buf, cap, out_len)` | Versión del motor |
+| `mr_last_error(buf, cap, out_len)` | Mensaje del último error del hilo |
+| `mr_image_info_get(path, len, sector_size, out)` | Tamaño, sectores y bytes sobrantes de una imagen (solo lectura) |
+| `mr_hash_start(path, len, sector_size, mask, store, store_len, out_task)` | Inicia el cálculo de hashes (CRC-32=1, MD5=2, SHA-1=4, SHA-256=8) |
+| `mr_hash_result(task, alg, buf, cap, out_len)` | Resumen hexadecimal de un algoritmo |
+| `mr_task_status_get(task, out)` | Estado y progreso |
+| `mr_task_cancel(task)` | Solicita la cancelación |
+| `mr_task_free(task)` | Libera el handle (cancela si sigue en marcha) |
+
+## Pruebas que garantizan el contrato
+
+- Rust (`core/mr-ffi/src/tests.rs`): tamaños de estructuras, protocolo de búfer pequeño, rutas de
+  dispositivo, UTF-8 inválido y punteros nulos, handles inválidos, flujo completo de hash, máscaras inválidas.
+- C# (`app/tests/MemRescue.Core.Interop.Tests`): los mismos contratos vistos desde .NET contra la DLL real,
+  rutas con caracteres no ASCII, cancelación, base de datos de trabajo, y el corpus sintético.
