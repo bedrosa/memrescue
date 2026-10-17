@@ -22,6 +22,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import zlib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -76,6 +77,48 @@ def is_binary(data: bytes) -> bool:
         return True
 
 
+def png_content(png: bytes) -> tuple:
+    """Cabecera IHDR y píxeles descomprimidos de un PNG (independiente de la biblioteca zlib usada)."""
+    if png[:8] != b"\x89PNG\r\n\x1a\n":
+        raise ValueError("no es un PNG")
+    pos, ihdr, idat = 8, b"", b""
+    while pos + 8 <= len(png):
+        n = int.from_bytes(png[pos:pos + 4], "big")
+        kind, data = png[pos + 4:pos + 8], png[pos + 8:pos + 8 + n]
+        if kind == b"IHDR":
+            ihdr = data
+        elif kind == b"IDAT":
+            idat += data
+        pos += 12 + n
+    return ihdr, zlib.decompress(idat)
+
+
+def ico_content(ico: bytes) -> tuple:
+    """Contenido semántico de un ICO con imágenes PNG: cabecera, entradas del directorio sin tamaño ni
+    desplazamiento (dependen de la compresión) y, de cada imagen, su IHDR y sus píxeles."""
+    count = int.from_bytes(ico[4:6], "little")
+    entries = []
+    for i in range(count):
+        e = ico[6 + 16 * i: 22 + 16 * i]
+        size = int.from_bytes(e[8:12], "little")
+        offset = int.from_bytes(e[12:16], "little")
+        entries.append((e[:8], png_content(ico[offset:offset + size])))
+    return ico[:6], tuple(entries)
+
+
+def same_asset(rel: str, committed: bytes, regenerated: bytes) -> bool:
+    """Igualdad byte a byte; para iconos PNG, igualdad de estructura y píxeles (la compresión deflate
+    puede variar entre implementaciones de zlib, p. ej. zlib y zlib-ng, sin cambiar la imagen)."""
+    if committed == regenerated:
+        return True
+    if rel.lower().endswith(".ico"):
+        try:
+            return ico_content(committed) == ico_content(regenerated)
+        except (ValueError, zlib.error, IndexError):
+            return False
+    return False
+
+
 def main() -> int:
     problems: list[str] = []
     files = tracked_files()
@@ -113,9 +156,10 @@ def main() -> int:
             if r.returncode != 0 or not os.path.isfile(out):
                 problems.append(f"{rel}: no se pudo regenerar ({r.stderr.strip()[:200]})")
                 continue
-            a = hashlib.sha256(path.read_bytes()).hexdigest()
-            b = hashlib.sha256(Path(out).read_bytes()).hexdigest()
-            if a != b:
+            committed, regenerated = path.read_bytes(), Path(out).read_bytes()
+            if not same_asset(rel, committed, regenerated):
+                a = hashlib.sha256(committed).hexdigest()
+                b = hashlib.sha256(regenerated).hexdigest()
                 problems.append(f"{rel}: no coincide con su generador ({a[:16]} != {b[:16]})")
 
     for p in problems:
