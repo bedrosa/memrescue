@@ -63,11 +63,12 @@ Hecho en la iteración 2 (detalle en `PROGRESO.md`, etapa 5):
 Pendiente en M1 (no se avanza a M2 sin revisión del propietario):
 - ✔ `NullDevice` (ceros, asignación dispersa) y `PatternDevice` (patrón constante).
 - ✔ Omitir errores por código y modo «ignorar todo» (IO-09): sin reintentos para los códigos elegidos, sectores siempre `Unreadable`.
+- ✔ Tablas de asignación parcialmente dañadas en VHD/VHDX/VMDK (issue #4, ADR-020): modo estricto por
+  defecto y modo tolerante solo por activación explícita (API, ABI `MR_OPEN_TOLERANT`, CLI `--tolerant`,
+  confirmación y aviso en la interfaz); los bloques descartados se entregan como ilegibles.
 - VHD/VHDX diferenciales, VHDX con registro pendiente, VMDK streamOptimized / multiextensión / flat
   (exigen abrir otros ficheros con confirmación explícita del usuario o descomprimir).
 - Patrones de relleno configurables desde la interfaz; colores por estado dentro del volcado.
-- Decidir si una tabla de asignación parcialmente dañada debe abrirse marcando los bloques afectados como
-  ilegibles (hoy se rechaza la imagen entera: opción conservadora).
 
 - **Paridad objetivo**: IM-01, IM-02, IM-03, IM-04, IM-05, IO-06…IO-09 (simulados).
 

@@ -206,7 +206,9 @@ fn probe_and_unsupported_containers() {
     assert_eq!(info.format, 1);
     assert!(describe(h).contains("forzado"));
     mr_source_close(h);
-    assert_eq!(open(ps, 512, 4), Err(MR_ERR_INVALID_ARGUMENT));
+    // El bit 4 es MR_OPEN_TOLERANT: la cabecera dañada sigue siendo crítica en modo tolerante.
+    assert_eq!(open(ps, 512, MR_OPEN_TOLERANT), Err(MR_ERR_CORRUPT));
+    assert_eq!(open(ps, 512, 8), Err(MR_ERR_INVALID_ARGUMENT));
 
     // QCOW: detectado pero sin lector → formato no soportado.
     let q = dir.path().join("x.qcow2");
@@ -749,4 +751,128 @@ fn verify_ex_validates_its_options() {
         MR_ERR_INVALID_ARGUMENT
     );
     mr_source_close(src);
+}
+
+// ---------- Modo tolerante de contenedores (MR_OPEN_TOLERANT, ADR-020) ----------
+
+/// Suma de control del VHD: complemento a uno de la suma de los bytes, sin el propio campo.
+fn vhd_seal(b: &mut [u8], field: usize) {
+    let sum = b
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !(field..field + 4).contains(i))
+        .fold(0u32, |a, (_, &x)| a.wrapping_add(u32::from(x)));
+    b[field..field + 4].copy_from_slice(&(!sum).to_be_bytes());
+}
+
+/// VHD dinámico de 4 bloques de 4 KiB (0, 1 y 2 asignados) con la entrada de la BAT del bloque 1
+/// fuera del fichero. Cada byte de datos del bloque `b` vale `0x10 + b`.
+fn damaged_dynamic_vhd() -> Vec<u8> {
+    let size = 4 * 4096u64;
+    let mut footer = vec![0u8; 512];
+    footer[..8].copy_from_slice(b"conectix");
+    footer[8..12].copy_from_slice(&2u32.to_be_bytes());
+    footer[12..16].copy_from_slice(&0x0001_0000u32.to_be_bytes());
+    footer[16..24].copy_from_slice(&512u64.to_be_bytes());
+    footer[40..48].copy_from_slice(&size.to_be_bytes());
+    footer[48..56].copy_from_slice(&size.to_be_bytes());
+    footer[60..64].copy_from_slice(&3u32.to_be_bytes());
+    vhd_seal(&mut footer, 64);
+    let mut header = vec![0u8; 1024];
+    header[..8].copy_from_slice(b"cxsparse");
+    header[8..16].copy_from_slice(&u64::MAX.to_be_bytes());
+    header[16..24].copy_from_slice(&1536u64.to_be_bytes());
+    header[24..28].copy_from_slice(&0x0001_0000u32.to_be_bytes());
+    header[28..32].copy_from_slice(&4u32.to_be_bytes());
+    header[32..36].copy_from_slice(&4096u32.to_be_bytes());
+    vhd_seal(&mut header, 36);
+    let mut bat = vec![0xFFu8; 512];
+    let mut body = Vec::new();
+    for b in 0..3usize {
+        let sector = ((2048 + body.len()) / 512) as u32;
+        let entry = if b == 1 { 0x00FF_0000 } else { sector };
+        bat[b * 4..b * 4 + 4].copy_from_slice(&entry.to_be_bytes());
+        let mut bitmap = vec![0u8; 512];
+        bitmap[0] = 0xFF;
+        body.extend_from_slice(&bitmap);
+        body.extend(std::iter::repeat_n(0x10 + b as u8, 4096));
+    }
+    let mut img = footer.clone();
+    img.extend_from_slice(&header);
+    img.extend_from_slice(&bat);
+    img.extend_from_slice(&body);
+    img.extend_from_slice(&footer);
+    img
+}
+
+#[test]
+fn tolerant_flag_opens_damaged_containers_with_untrusted_blocks() {
+    assert_eq!(MR_OPEN_TOLERANT, 4);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.vhd");
+    let bytes = damaged_dynamic_vhd();
+    std::fs::write(&path, &bytes).unwrap();
+    let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+    let p = path.to_str().unwrap();
+
+    // Sin el bit: estricto, dañado.
+    assert_eq!(open(p, 0, 0), Err(MR_ERR_CORRUPT));
+    assert!(last_error().contains("VHD"));
+    // Bits desconocidos: siguen rechazándose.
+    assert_eq!(open(p, 0, 8), Err(MR_ERR_INVALID_ARGUMENT));
+
+    let h = open(p, 0, MR_OPEN_TOLERANT).unwrap();
+    let d = describe(h);
+    assert!(d.contains("modo tolerante: 1 bloque descartado"), "{d}");
+    // Lectura con estado: los sectores 8 a 15 (bloque 1) son ilegibles con relleno.
+    let mut buf = vec![0u8; 32 * 512];
+    let mut states = vec![0xEEu8; 32];
+    let mut n = 0usize;
+    let rc = unsafe {
+        mr_source_read_mapped(
+            h,
+            0,
+            32,
+            0,
+            buf.as_mut_ptr(),
+            buf.len(),
+            states.as_mut_ptr(),
+            states.len(),
+            &mut n,
+        )
+    };
+    assert_eq!(rc, MR_OK);
+    for (l, &st) in states.iter().enumerate() {
+        let sector = &buf[l * 512..(l + 1) * 512];
+        match l {
+            8..16 => {
+                assert_eq!(st, 2, "LBA {l}");
+                assert!(sector.chunks(4).all(|c| c == b"BAD!"));
+            }
+            24..32 => {
+                assert_eq!(st, 4, "LBA {l}");
+                assert!(sector.iter().all(|&b| b == 0));
+            }
+            _ => {
+                assert_eq!(st, 0, "LBA {l}");
+                assert!(sector.iter().all(|&b| b == 0x10 + (l / 8) as u8));
+            }
+        }
+    }
+    // Lectura estricta del bloque descartado: error de E/S, nunca relleno.
+    let mut one = vec![0u8; 512];
+    let rc = unsafe { mr_source_read(h, 8, 1, one.as_mut_ptr(), one.len(), &mut n) };
+    assert_eq!(rc, MR_ERR_IO);
+    assert_eq!(mr_source_close(h), MR_OK);
+
+    // Con RAW forzado el bit no tiene efecto.
+    let h = open(p, 512, MR_OPEN_TOLERANT | MR_OPEN_FORCE_RAW).unwrap();
+    assert!(!describe(h).contains("tolerante"));
+    assert_eq!(mr_source_close(h), MR_OK);
+
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().modified().unwrap(),
+        modified
+    );
 }

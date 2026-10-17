@@ -34,6 +34,7 @@ vez por ejecución en un directorio temporal propio (`%TEMP%\memrescue-uitests-*
 | `Menus_pendientes_deshabilitados_e_ir_a_sector_habilitado` | Disco → «Particiones…» deshabilitado; Editor → «Ir a sector…» habilitado con una imagen abierta e «Ir a cluster / registro…» deshabilitado; la aplicación se cierra limpiamente después. |
 | `Sector_de_4096_bytes` | `gpt_4kn.img` con `--sector-size 4096`: «sector de 4096 B»; ▶ → LBA 1 en `0x1000` con `EFI PART`; la página tiene 256 líneas de volcado (4096 B). |
 | `Particion_MBR_en_LBA_2048` | `mbr_basic.img`: la LBA 2048 empieza por el marcador `MEMRESCUE-TEST|mbr_basic|P1|LBA=…`. |
+| `Contenedor_danado_pide_confirmacion_para_el_modo_tolerante` | VHD dinámico con una entrada de la BAT fuera del fichero: la apertura estricta falla y aparece el diálogo «Modo tolerante» (con «MODO TOLERANTE» y «1 bloque descartado»); «No» → ningún origen abierto; «Sí» → visor en la LBA 0, aviso `TolerantBannerText` visible, la LBA 8 muestra `BAD!` y el aviso de no fiables; el fichero no cambia. |
 | `Las_imagenes_no_se_modifican` | SHA-256, fecha de modificación y tamaño de las tres imágenes idénticos antes y después de abrirlas y navegar por ellas en tres instancias; cada instancia termina con código 0. |
 
 Para localizar controles se usan los `x:Name` existentes (`LbaBox`, `HexView`, `SectorInfoText`,

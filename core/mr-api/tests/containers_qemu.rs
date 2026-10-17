@@ -65,6 +65,7 @@ fn file_sha256(p: &Path) -> String {
         mr_api::OpenOptions {
             sector_size: 512,
             force_raw: true,
+            ..Default::default()
         },
     )
     .unwrap();

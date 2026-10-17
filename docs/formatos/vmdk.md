@@ -74,12 +74,32 @@ extensión es el propio fichero. Si el nombre parece una ruta se trata como refe
 - Descriptor: `descriptorSize` > 0, ≤ 1 MiB y dentro del fichero; texto hasta el primer NUL con
   conversión UTF-8 tolerante; líneas ≤ 4096 bytes; sin caracteres de control (salvo tabulador);
   claves principales no repetidas; extensiones bien formadas; tamaño de la extensión = `capacity`.
-- GD: tamaño ≤ `MAX_TABLE_BYTES` (256 MiB) **antes** de reservar memoria, dentro del fichero;
-  cada GT referenciada (2 KiB) dentro del fichero.
-- Granos: se validan al usarse (lectura y `allocation`): la parte del grano que cubre el disco
-  virtual debe estar dentro del fichero; la entrada 1 sin el bit «zeroed-grain» → `Corrupt`.
+- GD: tamaño ≤ `MAX_TABLE_BYTES` (256 MiB) **antes** de reservar memoria, dentro del fichero y sin
+  solapar el descriptor; cada GT referenciada (2 KiB) dentro del fichero y sin solapar la cabecera,
+  el descriptor, el GD ni otra GT.
+- Granos: se validan **al abrir** (todas las GT presentes se cargan): la parte del grano que cubre el
+  disco virtual debe estar dentro del fichero y no solapar la cabecera, el descriptor, el GD, una GT
+  ni otro grano (entradas duplicadas incluidas); la entrada 1 sin el bit «zeroed-grain» es inválida.
+  En modo estricto cualquier entrada inválida da `Corrupt` en la apertura; en modo tolerante se
+  descarta (ver «Modo tolerante»).
 - Toda la aritmética de desplazamientos es comprobada (`checked_*`); errores de E/S →
   `IoError::Read` (un fichero acortado tras abrirse da `UnexpectedEof`, nunca datos inventados).
+
+## Modo tolerante (ADR-020)
+
+`VmdkImage::open_with(file, true)` (o `OpenOptions::tolerant`). Correspondencia inequívoca: una GT
+(entrada de GD ≠ 0) cabe en el fichero y no solapa la cabecera, el descriptor, el GD ni otra GT; un grano
+(entrada de GT ≠ 0) cabe en el fichero (parte útil), no solapa esas estructuras, ninguna GT ni otro
+grano, y la entrada 1 solo es válida con el indicador «zeroed-grain». Una entrada de GD inválida
+descarta los granos de su GT; una de GT, solo su grano; si un grano solapa una GT se descartan los dos
+(y con la GT, todos sus granos); en cualquier solape se descartan **todos** los implicados. Un grano
+descartado se lee con `IoError::Read` y `allocation` lo informa como `Data`. `describe()` añade «; modo
+tolerante: N granos descartados (no fiables)». Cabecera, descriptor y ubicación del GD siguen siendo
+críticos (`Corrupt` en ambos modos). Pruebas (`vmdk.rs`, 2): grano fuera del fichero, sobre el
+descriptor y el GD (que también cubren las GT), duplicado, solapado, entrada 1 sin indicador, GT fuera
+del fichero, sobre el descriptor, duplicada y grano sobre una GT, con comparación sector a sector e
+inmutabilidad; estructuras críticas en ambos modos. Con qemu-img:
+`monolithic_sparse_with_duplicated_grain_in_tolerant_mode`.
 
 ## GD redundante
 
@@ -97,13 +117,16 @@ error, con caracteres de control escapados y truncados a 260 caracteres.
 ## Memoria y rendimiento
 
 - El GD se carga entero al abrir (≤ 256 MiB y ≤ tamaño del fichero).
-- Las GT se leen bajo demanda con una caché de una GT (2 KiB) protegida por `Mutex`.
+- Las GT presentes se cargan y validan al abrir (2 KiB cada una, en total ≤ `MAX_TABLE_BYTES`; si no,
+  `UnsupportedFeature`): un disco de 2 TiB con granos de 64 KiB ocupa 128 MiB. La detección de solapes
+  usa además 8 bytes por grano asignado durante la apertura.
 - `allocation()` salta de golpe los tramos de 512 granos cuya GT no existe, así que un disco
   enorme casi vacío se describe en pocas iteraciones.
 
 ## API
 
-- `VmdkImage::open(File) -> mr_io::Result<VmdkImage>`
+- `VmdkImage::open(File) -> mr_io::Result<VmdkImage>` (estricto) y `VmdkImage::open_with(File, tolerant)`;
+  `is_tolerant()`, `discarded_blocks()` (granos descartados).
 - `BlockDevice`: `size()` = capacity × 512, `sector_size()` = 512, `read_at` con límites
   comprobados (`OutOfBounds`), `allocation(lba, count)` con tramos ordenados y fusionados
   (`Data` para granos asignados, `Sparse` para entradas 0, GT ausentes o granos a cero), validando
@@ -152,7 +175,8 @@ Integración contra `qemu-img` (`MR_QEMU_IMG` o
 
 - Solo monolithicSparse. No se interpretan streamOptimized, discos multi-extensión, FLAT/VMFS,
   SESparse ni cadenas de instantáneas (padres).
-- No se usa el GD redundante para recuperar un GD principal dañado.
+- No se usa el GD redundante para recuperar un GD principal dañado, y sus GT no se consideran al
+  buscar solapes (no se leen).
 - `qemu-img convert` no genera entradas GTE «zeroed-grain» (las zonas de ceros quedan sin
   asignar), por lo que esas entradas solo se prueban con imágenes sintéticas.
 - `uncleanShutdown` solo se informa; no se intenta reparar nada (solo lectura).

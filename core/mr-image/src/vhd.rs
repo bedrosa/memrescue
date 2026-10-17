@@ -11,7 +11,14 @@
 //!   `max_table_entries` entradas u32 (sector del bloque o `0xFFFFFFFF` si no está asignado) y,
 //!   por cada bloque asignado, un mapa de bits de sectores seguido de los datos del bloque.
 //! - Diferencial: necesita el disco padre; nunca se abre (`IoError::ExternalReference`).
+//!
+//! Modo tolerante ([`VhdImage::open_with`], ADR-020): las entradas de la BAT cuyo bloque queda
+//! fuera de la zona de datos, solapa la copia del pie, la cabecera dinámica, la BAT u otro bloque
+//! (incluidas las entradas duplicadas) se descartan: sus bloques se leen con error y se informan
+//! como datos no fiables. El pie, la cabecera dinámica y la ubicación de la BAT siguen siendo
+//! críticos (`Corrupt` en ambos modos).
 
+use crate::tolerant::{self, Damage, Zone};
 use mr_io::{Allocation, AllocationRun, BlockDevice, IoError, Result};
 use std::fs::File;
 use std::sync::{Arc, Mutex};
@@ -25,6 +32,9 @@ const DYN_COOKIE: &[u8; 8] = b"cxsparse";
 const DYN_HEADER_LEN: usize = 1024;
 /// Entrada de BAT de un bloque no asignado.
 const UNALLOCATED: u32 = 0xFFFF_FFFF;
+/// Marca interna de un bloque descartado en modo tolerante. El sector 0 del fichero es siempre la
+/// copia del pie en un disco dinámico, así que ninguna entrada válida puede valer 0.
+const DISCARDED: u32 = 0;
 const MIN_BLOCK_SIZE: u64 = 512;
 const MAX_BLOCK_SIZE: u64 = 256 * 1024 * 1024;
 
@@ -218,8 +228,11 @@ struct Dynamic {
     block_size: u64,
     /// Bytes del mapa de bits de sectores al inicio de cada bloque (múltiplo de 512).
     bitmap_bytes: u64,
-    /// Entradas de la BAT necesarias para cubrir el tamaño virtual.
+    /// Entradas de la BAT necesarias para cubrir el tamaño virtual ([`DISCARDED`] = bloque
+    /// descartado en modo tolerante).
     bat: Vec<u32>,
+    /// Bloques descartados en modo tolerante.
+    discarded: u64,
     /// Último mapa de bits leído (índice de bloque, contenido).
     cache: Mutex<Option<(u64, Arc<Vec<u8>>)>>,
 }
@@ -235,6 +248,7 @@ pub struct VhdImage {
     size: u64,
     layout: Layout,
     footer_source: FooterSource,
+    tolerant: bool,
 }
 
 /// Estado del sector `s` en el mapa de bits (bit más significativo = primer sector del byte).
@@ -281,8 +295,15 @@ fn push_run(runs: &mut Vec<AllocationRun>, lba: u64, n: u64, kind: Allocation) {
 }
 
 impl VhdImage {
-    /// Interpreta un VHD ya admitido por la política de rutas y abierto en solo lectura.
+    /// Interpreta un VHD ya admitido por la política de rutas y abierto en solo lectura, en modo
+    /// estricto.
     pub fn open(file: File) -> Result<VhdImage> {
+        Self::open_with(file, false)
+    }
+
+    /// Como [`Self::open`]; con `tolerant`, las entradas de la BAT inválidas o ambiguas no impiden
+    /// abrir la imagen: sus bloques se descartan (ver la documentación del módulo).
+    pub fn open_with(file: File, tolerant: bool) -> Result<VhdImage> {
         let file_size = file.metadata()?.len();
         if file_size < OLD_FOOTER_LEN as u64 {
             return Err(corrupt(format!(
@@ -362,7 +383,9 @@ impl VhdImage {
                 }
                 Layout::Fixed
             }
-            DISK_DYNAMIC => Layout::Dynamic(Self::open_dynamic(&file, &footer, data_end)?),
+            DISK_DYNAMIC => {
+                Layout::Dynamic(Self::open_dynamic(&file, &footer, data_end, tolerant)?)
+            }
             DISK_DIFFERENCING => return Err(Self::differencing_error(&file, &footer, data_end)),
             t @ (0 | 1 | 5 | 6) => {
                 return Err(unsupported(format!(
@@ -377,6 +400,7 @@ impl VhdImage {
             size,
             layout,
             footer_source,
+            tolerant,
         })
     }
 
@@ -407,7 +431,12 @@ impl VhdImage {
         }
     }
 
-    fn open_dynamic(file: &File, footer: &Footer, data_end: u64) -> Result<Dynamic> {
+    fn open_dynamic(
+        file: &File,
+        footer: &Footer,
+        data_end: u64,
+        tolerant: bool,
+    ) -> Result<Dynamic> {
         let h = Self::read_dyn_header(file, footer, data_end)?;
         let size = footer.current_size;
 
@@ -455,7 +484,7 @@ impl VhdImage {
             .map_err(|_| unsupported("BAT demasiado grande para esta plataforma"))?;
         let mut raw = vec![0u8; needed_bytes];
         read_meta(file, h.table_offset, &mut raw)?;
-        let bat: Vec<u32> = raw
+        let mut bat: Vec<u32> = raw
             .as_chunks::<4>()
             .0
             .iter()
@@ -465,30 +494,56 @@ impl VhdImage {
         // Mapa de bits: un bit por sector, redondeado a múltiplo de 512 bytes.
         let bitmap_bytes = (block_size / SECTOR).div_ceil(8).div_ceil(SECTOR) * SECTOR;
 
+        // Correspondencia inequívoca de cada bloque asignado: mapa de bits + parte útil dentro de la
+        // zona de datos, sin solapar la copia del pie, la cabecera dinámica, la BAT ni otro bloque.
+        let span = |i: u64| -> (u64, u64) {
+            let start = u64::from(bat[i as usize]) * SECTOR;
+            // El último bloque puede cubrir más que el tamaño virtual: solo se exige la parte útil.
+            let useful = block_size.min(size - i * block_size);
+            (start, start.saturating_add(bitmap_bytes + useful))
+        };
+        let mut damage = Damage::default();
+        let mut candidates = Vec::new();
         for (i, &entry) in bat.iter().enumerate() {
             if entry == UNALLOCATED {
                 continue;
             }
             let i = i as u64;
-            let start = u64::from(entry) * SECTOR;
-            // El último bloque puede cubrir más que el tamaño virtual: solo se exige la parte útil.
-            let useful = block_size.min(size - i * block_size);
-            let span = bitmap_bytes + useful;
-            let bad = start < FOOTER_LEN as u64
-                || start.checked_add(span).is_none_or(|e| e > data_end)
-                || overlaps(start, span, footer.data_offset, DYN_HEADER_LEN as u64)
-                || overlaps(start, span, h.table_offset, bat_bytes);
-            if bad {
-                return Err(corrupt(format!(
-                    "el bloque {i} (sector {entry:#x} del fichero) queda fuera del fichero o solapa sus estructuras"
-                )));
+            let (_, end) = span(i);
+            if end > data_end {
+                damage.add(i, || {
+                    format!("el bloque {i} (sector {entry:#x} del fichero) queda fuera del fichero")
+                });
+            } else {
+                candidates.push(i);
             }
+        }
+        let zones = [
+            Zone::fixed(0, FOOTER_LEN as u64),
+            Zone::fixed(footer.data_offset, DYN_HEADER_LEN as u64),
+            Zone::fixed(h.table_offset, bat_bytes),
+        ];
+        for i in tolerant::overlaps(candidates, span, &zones).entries {
+            let entry = bat[i as usize];
+            damage.add(i, || {
+                format!(
+                    "el bloque {i} (sector {entry:#x} del fichero) solapa las estructuras del contenedor u otro bloque"
+                )
+            });
+        }
+        if !damage.is_empty() && !tolerant {
+            return Err(corrupt(damage.first().unwrap_or_default()));
+        }
+        let bad = damage.into_sorted();
+        for &i in &bad {
+            bat[i as usize] = DISCARDED;
         }
 
         Ok(Dynamic {
             block_size,
             bitmap_bytes,
             bat,
+            discarded: bad.len() as u64,
             cache: Mutex::new(None),
         })
     }
@@ -506,7 +561,27 @@ impl VhdImage {
             FooterSource::End511 => s.push_str(" (pie antiguo de 511 bytes)"),
             FooterSource::Copy => s.push_str(" (pie final dañado: se usa la copia del byte 0)"),
         }
+        if self.tolerant {
+            s.push_str(&tolerant::describe_suffix(
+                self.discarded_blocks(),
+                "bloque",
+                "bloques",
+            ));
+        }
         s
+    }
+
+    /// `true` si se abrió en modo tolerante.
+    pub fn is_tolerant(&self) -> bool {
+        self.tolerant
+    }
+
+    /// Bloques descartados en modo tolerante (0 en modo estricto o en un VHD fijo).
+    pub fn discarded_blocks(&self) -> u64 {
+        match &self.layout {
+            Layout::Fixed => 0,
+            Layout::Dynamic(d) => d.discarded,
+        }
     }
 
     /// Mapa de bits del bloque `block` (asignado, en `base` del fichero), con caché de una entrada.
@@ -561,6 +636,8 @@ impl VhdImage {
             let entry = d.bat.get(block as usize).copied().unwrap_or(UNALLOCATED);
             if entry == UNALLOCATED {
                 chunk.fill(0);
+            } else if entry == DISCARDED {
+                return Err(tolerant::discarded_read(FORMAT, "bloque", block, voff, n));
             } else {
                 let base = u64::from(entry) * SECTOR;
                 let data = base + d.bitmap_bytes;
@@ -636,6 +713,9 @@ impl BlockDevice for VhdImage {
             let entry = d.bat.get(block as usize).copied().unwrap_or(UNALLOCATED);
             if entry == UNALLOCATED {
                 push_run(&mut runs, s, stop - s, Allocation::Sparse);
+            } else if entry == DISCARDED {
+                // Hay que «leerlo» para descubrir que no es fiable: nunca se presenta como disperso.
+                push_run(&mut runs, s, stop - s, Allocation::Data);
             } else {
                 let len = usize::try_from((stop - s) * SECTOR).unwrap_or(usize::MAX);
                 let map = self.bitmap(d, block, u64::from(entry) * SECTOR, s * SECTOR, len)?;
@@ -1116,6 +1196,148 @@ mod tests {
         ));
     }
 
+    // ---- modo tolerante (ADR-020) ----
+
+    fn open_mode(bytes: &[u8], tolerant: bool) -> (tempfile::NamedTempFile, Result<VhdImage>) {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(bytes).unwrap();
+        tmp.flush().unwrap();
+        let r = VhdImage::open_with(File::open(tmp.path()).unwrap(), tolerant);
+        (tmp, r)
+    }
+
+    /// Entrada `i` de la BAT de las imágenes de `dynamic_image` (BAT en el byte 1536).
+    fn bat_entry(img: &[u8], i: usize) -> u32 {
+        be32(img, 1536 + 4 * i)
+    }
+
+    fn set_bat_entry(img: &mut [u8], i: usize, v: u32) {
+        img[1536 + 4 * i..1540 + 4 * i].copy_from_slice(&v.to_be_bytes());
+    }
+
+    #[test]
+    fn tolerant_mode_discards_only_invalid_or_ambiguous_blocks() {
+        let (good, expect) = sample();
+        // La referencia es la lectura estricta de la imagen sin dañar.
+        let (_t, reference) = open_mode(&good, false);
+        assert_eq!(read_all(&reference.unwrap()), expect);
+        let n = good.len() as u64;
+        let s2 = bat_entry(&good, 2);
+        // (caso, entradas alteradas, tramos de sectores dañados). 8 sectores por bloque.
+        type Case = (&'static str, Vec<(usize, u32)>, Vec<(u64, u64)>);
+        let cases: Vec<Case> = vec![
+            ("fuera del fichero", vec![(3, 0x00FF_0000)], vec![(24, 8)]),
+            (
+                "sobre el pie final",
+                vec![(4, ((n - 1024) / 512) as u32)],
+                vec![(32, 2)],
+            ),
+            ("sobre la copia del pie", vec![(4, 0)], vec![(32, 2)]),
+            ("sobre la cabecera dinámica", vec![(0, 1)], vec![(0, 8)]),
+            ("sobre la BAT", vec![(0, 3)], vec![(0, 8)]),
+            ("duplicada", vec![(3, s2)], vec![(16, 8), (24, 8)]),
+            (
+                "solapada con otro bloque",
+                vec![(3, s2 + 4)],
+                vec![(16, 8), (24, 8)],
+            ),
+            (
+                "varias a la vez",
+                vec![(0, 1), (4, 0x00FF_0000)],
+                vec![(0, 8), (32, 2)],
+            ),
+        ];
+        for (what, edits, bad) in cases {
+            let mut bytes = good.clone();
+            for &(i, v) in &edits {
+                set_bat_entry(&mut bytes, i, v);
+            }
+            assert_corrupt(open_mode(&bytes, false).1, what);
+            let (t, img) = open_mode(&bytes, true);
+            let before = crate::tolerant::check::Snapshot::of(t.path());
+            let img = img.unwrap_or_else(|e| panic!("{what}: {e}"));
+            let blocks = bad.len() as u64;
+            assert_eq!(img.discarded_blocks(), blocks, "{what}");
+            assert!(img.is_tolerant());
+            let d = img.describe();
+            assert!(
+                d.ends_with(&crate::tolerant::describe_suffix(
+                    blocks, "bloque", "bloques"
+                )),
+                "{what}: {d}"
+            );
+            crate::tolerant::check::tolerant_read_matches(&img, &expect, &bad, what);
+            drop(img);
+            assert_eq!(
+                crate::tolerant::check::Snapshot::of(t.path()),
+                before,
+                "{what}"
+            );
+        }
+    }
+
+    #[test]
+    fn tolerant_mode_without_damage_matches_strict() {
+        let (good, expect) = sample();
+        let (_t, img) = open_mode(&good, true);
+        let img = img.unwrap();
+        assert_eq!(img.discarded_blocks(), 0);
+        assert_eq!(
+            img.describe(),
+            "VHD dinámico, bloques de 4 KiB; modo tolerante: 0 bloques descartados (no fiables)"
+        );
+        crate::tolerant::check::tolerant_read_matches(&img, &expect, &[], "sin daños");
+        let (_t, strict) = open_mode(&good, false);
+        let strict = strict.unwrap();
+        assert!(!strict.is_tolerant());
+        assert_eq!(strict.describe(), "VHD dinámico, bloques de 4 KiB");
+        assert_eq!(
+            strict.allocation(0, 34).unwrap(),
+            img.allocation(0, 34).unwrap()
+        );
+        // Un VHD fijo no tiene tablas de asignación: nada que descartar.
+        let data = pattern(9, 8 * 512);
+        let mut file = data.clone();
+        file.extend_from_slice(&footer(DISK_FIXED, data.len() as u64, u64::MAX));
+        let (_t, fixed) = open_mode(&file, true);
+        let fixed = fixed.unwrap();
+        assert_eq!(fixed.discarded_blocks(), 0);
+        assert!(fixed.describe().starts_with("VHD fijo; modo tolerante"));
+        assert_eq!(read_all(&fixed), data);
+    }
+
+    #[test]
+    fn critical_structures_are_corrupt_in_both_modes() {
+        let (good, _) = sample();
+        let mut cases: Vec<(&str, Vec<u8>)> = Vec::new();
+        let mut b = good.clone();
+        b[512 + 200] ^= 1;
+        cases.push(("suma de la cabecera dinámica", b));
+        let mut b = good.clone();
+        let n = b.len();
+        b[70] ^= 0xFF;
+        b[n - 512 + 70] ^= 0xFF;
+        cases.push(("ambos pies", b));
+        let n = good.len() as u64;
+        cases.push((
+            "BAT fuera del fichero",
+            with_header(good.clone(), n + 4096, 5, BS),
+        ));
+        cases.push((
+            "BAT sobre la cabecera",
+            with_header(good.clone(), 1024, 5, BS),
+        ));
+        cases.push(("tamaño de bloque", with_header(good.clone(), 1536, 5, 3000)));
+        cases.push(("BAT insuficiente", with_header(good, 1536, 2, BS)));
+        for (what, bytes) in cases {
+            for tolerant in [false, true] {
+                let (t, r) = open_mode(&bytes, tolerant);
+                assert_corrupt(r, &format!("{what} (tolerante: {tolerant})"));
+                assert_eq!(std::fs::read(t.path()).unwrap(), bytes);
+            }
+        }
+    }
+
     #[test]
     fn random_corruption_never_panics() {
         let (bytes, _) = sample();
@@ -1138,11 +1360,13 @@ mod tests {
                 let n = b.len();
                 seal(&mut b[n - 512..], F_CHECKSUM);
             }
-            if let (_t, Ok(img)) = open_bytes(&b) {
-                let _ = img.allocation(0, img.sector_count().max(1));
-                if img.size() <= 1 << 20 {
-                    let mut v = vec![0u8; img.size() as usize];
-                    let _ = img.read_at(0, &mut v);
+            for tolerant in [false, true] {
+                if let (_t, Ok(img)) = open_mode(&b, tolerant) {
+                    let _ = img.allocation(0, img.sector_count().max(1));
+                    if img.size() <= 1 << 20 {
+                        let mut v = vec![0u8; img.size() as usize];
+                        let _ = img.read_at(0, &mut v);
+                    }
                 }
             }
         }

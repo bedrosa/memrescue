@@ -45,8 +45,10 @@ La implementación es original y se basa solo en ese documento. Todos los entero
   - BAT completa (`max table entries × 4` bytes) dentro del fichero, sin solapar la copia del pie ni
     la cabecera dinámica, y ≤ `mr_image::MAX_TABLE_BYTES` (256 MiB). Las comprobaciones de tamaño se
     hacen **antes** de reservar memoria; solo se leen las entradas que cubren el tamaño virtual.
-  - Cada bloque asignado (mapa de bits + parte útil de los datos) dentro del fichero, sin solapar la
-    copia del pie, la cabecera dinámica ni la BAT.
+  - Cada bloque asignado (mapa de bits + parte útil de los datos) dentro de la zona de datos (antes
+    del pie final), sin solapar la copia del pie, la cabecera dinámica, la BAT **ni otro bloque**
+    (entradas duplicadas incluidas). En modo estricto cualquier entrada que no lo cumpla da `Corrupt`;
+    en modo tolerante se descarta (ver «Modo tolerante»).
 - Toda la aritmética de desplazamientos usa `checked_*`/`saturating_*`; ningún dato corrupto provoca
   pánicos (hay una prueba de corrupción aleatoria).
 - `read_at` comprueba límites con aritmética comprobada (`OutOfBounds`); `allocation` valida el rango
@@ -75,6 +77,19 @@ La implementación es original y se basa solo en ese documento. Todos los entero
   `ExternalReference` con el motivo. No se interpretan los localizadores ni se accede a otros ficheros.
 - Campos que no se usan: geometría CHS, marca de tiempo, creador, *saved state*, *features*.
 
+## Modo tolerante (ADR-020)
+
+`VhdImage::open_with(file, true)` (o `OpenOptions::tolerant`). Correspondencia inequívoca de una entrada
+de la BAT: el bloque (mapa de bits + parte útil) cabe entero en la zona de datos y no solapa la copia
+del pie, la cabecera dinámica, la BAT completa (`max table entries × 4`) ni el bloque de otra entrada.
+El VHD no tiene campo de estado: el valor `0xFFFFFFFF` es «sin asignar» y cualquier otro es un sector;
+el sector 0 (copia del pie) nunca es válido. Si dos bloques se solapan (o dos entradas son iguales) se
+descartan **los dos**. Un bloque descartado se lee con `IoError::Read` (rango virtual) y `allocation` lo
+informa como `Data` aunque su mapa de bits tuviera sectores a 0 (el mapa forma parte del bloque
+descartado). `describe()` añade «; modo tolerante: N bloques descartados (no fiables)». Un VHD fijo no
+tiene tablas: nada que descartar. Pie, cabecera dinámica, tamaño de bloque y ubicación de la BAT siguen
+siendo críticos (`Corrupt` en ambos modos).
+
 ## Límites
 
 - Bloques entre 512 B y 256 MiB (mapa de bits ≤ 64 KiB por bloque).
@@ -93,6 +108,15 @@ cabecera dinámica dañada o fuera del fichero, BAT fuera del fichero / con desb
 tamaños de bloque absurdos, `max_table_entries` enorme (sin reservar memoria), bloque fuera del
 fichero, ficheros truncados (antes y después de abrir), diferencial → `ExternalReference`, y 300
 corrupciones aleatorias deterministas sin pánicos.
+
+Modo tolerante (`vhd.rs`, 3 pruebas): entradas fuera del fichero, sobre el pie final, sobre la copia
+del pie, sobre la cabecera dinámica, sobre la BAT, duplicadas, solapadas con otro bloque y varias a la vez:
+`Corrupt` en estricto; en tolerante, comparación sector a sector contenido ↔ estado con
+`mr_io::resilient` (bloques sanos idénticos a la imagen sin dañar, dañados `Unreadable` con `BAD!`),
+lectura estricta y lectura que aborta fallan, `allocation` = `Data`, número de bloques en `describe()`
+e inmutabilidad (hash, tamaño y fecha); sin daños = estricto; estructuras críticas dañadas → `Corrupt`
+en ambos modos. Con qemu-img: `qemu_dynamic_with_damaged_bat_entry_in_tolerant_mode` daña la entrada
+de un bloque con datos y compara el resto con la conversión de referencia.
 
 Integración contra **qemu-img 11.1.2** como referencia independiente
 (`core/mr-image/tests/vhd_qemu.rs`, marcadas `#[ignore]`; se ejecutan con
@@ -125,8 +149,8 @@ warnings` y `cargo fmt --all -- --check` sin avisos.
 ## Limitaciones conocidas
 
 - No se leen discos diferenciales (ni cadenas de padres); solo se informa del padre.
-- La validación es estricta en `open`: una sola entrada de BAT fuera del fichero impide abrir la
-  imagen entera (no hay modo tolerante que marque solo ese bloque como ilegible).
+- En modo estricto (por defecto) una sola entrada de BAT inválida impide abrir la imagen; el modo
+  tolerante (explícito) descarta solo los bloques afectados.
 - No se usan los localizadores de padre ni el campo *saved state*.
 - No se ha probado con VHD reales de Virtual PC / Hyper-V / Disk2vhd, solo con imágenes sintéticas
   y generadas por qemu-img (que escribe mapas de bits completos; el caso de mapa parcial solo se

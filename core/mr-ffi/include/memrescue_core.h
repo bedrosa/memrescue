@@ -22,7 +22,8 @@
  * estados (mr_verify_untrusted_range sustituye a mr_verify_bad_range), códigos 12–14,
  * sector_size = 0 (nativo) y campo format en mr_image_info.
  * Añadido sin cambiar la ABI 3: verificación extendida con política de omisión de errores
- * (mr_source_verify_start_ex, mr_verify_options, mr_verify_error_summary, mr_verify_error_code).
+ * (mr_source_verify_start_ex, mr_verify_options, mr_verify_error_summary, mr_verify_error_code)
+ * y bit MR_OPEN_TOLERANT en las opciones de mr_source_open (modo tolerante de contenedores).
  */
 #ifndef MEMRESCUE_CORE_H
 #define MEMRESCUE_CORE_H
@@ -83,6 +84,12 @@ typedef int32_t mr_status;
 #define MR_OPEN_DEFAULT      0u
 #define MR_OPEN_FORCE_RAW    1u   /* interpretar como RAW aunque parezca un contenedor */
 #define MR_OPEN_SPLIT        2u   /* abrir la imagen dividida que empieza en path (x.001 / x.000) */
+#define MR_OPEN_TOLERANT     4u   /* VHD/VHDX/VMDK con tablas de asignación dañadas: los bloques con
+                                     entradas inválidas o ambiguas se descartan (lectura con error,
+                                     estado MR_SECTOR_UNREADABLE en las lecturas tolerantes) y
+                                     mr_source_describe indica «modo tolerante» y cuántos se
+                                     descartaron. Sin este bit se rechazan con MR_ERR_CORRUPT.
+                                     Sin efecto en RAW e imágenes divididas. */
 
 /* Estado de cada sector (mr_source_read_mapped, mr_verify_untrusted_range). */
 #define MR_SECTOR_READ        0u  /* leído al primer intento */

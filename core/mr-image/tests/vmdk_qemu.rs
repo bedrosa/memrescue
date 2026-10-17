@@ -352,3 +352,112 @@ fn child_with_backing_file_is_external_reference() {
         other => panic!("se esperaba ExternalReference: {other:?}"),
     }
 }
+
+/// Lectura tolerante completa comparada **sector a sector** con la referencia de qemu-img: los
+/// sectores de `bad` son `Unreadable` con el patrón de relleno; los demás, idénticos a la
+/// referencia. La lectura estricta completa falla.
+fn assert_tolerant_matches(dev: &dyn BlockDevice, reference: &[u8], bad: (u64, u64)) {
+    use mr_io::resilient::{read_range, OnError, ReadPolicy};
+    use mr_io::SectorState;
+    let policy = ReadPolicy {
+        on_error: OnError::FillAndContinue,
+        ..ReadPolicy::default()
+    };
+    let total = dev.sector_count();
+    let mut data = Vec::new();
+    let mut states = Vec::new();
+    read_range(
+        dev,
+        0,
+        total,
+        &policy,
+        |_, d, s| {
+            data.extend_from_slice(d);
+            states.extend_from_slice(s);
+            Ok(())
+        },
+        |_, _| true,
+    )
+    .unwrap();
+    for lba in 0..total {
+        let i = lba as usize;
+        let got = &data[i * 512..(i + 1) * 512];
+        if lba >= bad.0 && lba < bad.0 + bad.1 {
+            assert_eq!(states[i], SectorState::Unreadable, "LBA {lba}");
+            assert!(got.chunks(4).all(|c| c == b"BAD!"), "LBA {lba}");
+        } else {
+            assert!(states[i].is_trustworthy(), "LBA {lba}");
+            assert!(got == &reference[i * 512..(i + 1) * 512], "LBA {lba}");
+        }
+    }
+    let mut all = vec![0u8; dev.size() as usize];
+    assert!(dev.read_at(0, &mut all).is_err());
+}
+
+#[test]
+#[ignore = "requiere qemu-img; lo ejecuta scripts/test.ps1"]
+fn monolithic_sparse_with_duplicated_grain_in_tolerant_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut raw = make_raw(8 * MIB, 0x7011_e2a7);
+    // Los dos primeros granos (64 KiB por defecto) con datos.
+    for (i, b) in raw[..128 * 1024].iter_mut().enumerate() {
+        *b = (i % 251) as u8 | 1;
+    }
+    let raw_path = dir.path().join("t.raw");
+    std::fs::write(&raw_path, &raw).unwrap();
+    let vmdk = dir.path().join("t.vmdk");
+    qemu(&[
+        "convert",
+        "-f",
+        "raw",
+        "-O",
+        "vmdk",
+        "-o",
+        "subformat=monolithicSparse",
+        s(&raw_path),
+        s(&vmdk),
+    ]);
+    let reference = dir.path().join("t.ref.raw");
+    qemu(&[
+        "convert",
+        "-f",
+        "vmdk",
+        "-O",
+        "raw",
+        s(&vmdk),
+        s(&reference),
+    ]);
+    let reference = std::fs::read(&reference).unwrap();
+    // La entrada del grano 1 pasa a ser la del grano 0: ambos quedan ambiguos.
+    let mut bytes = std::fs::read(&vmdk).unwrap();
+    let le = |b: &[u8], o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+    let grain_sectors = u64::from_le_bytes(bytes[20..28].try_into().unwrap());
+    let gd = u64::from_le_bytes(bytes[56..64].try_into().unwrap()) as usize * 512;
+    let gt = le(&bytes, gd) as usize * 512;
+    let (g0, g1) = (le(&bytes, gt), le(&bytes, gt + 4));
+    assert!(g0 > 1 && g1 > 1, "los granos 0 y 1 deben tener datos");
+    bytes[gt + 4..gt + 8].copy_from_slice(&g0.to_le_bytes());
+    std::fs::write(&vmdk, &bytes).unwrap();
+    let sha_before = sha256_file(&vmdk);
+
+    assert!(matches!(
+        VmdkImage::open(File::open(&vmdk).unwrap()),
+        Err(IoError::Corrupt { .. })
+    ));
+    let img = VmdkImage::open_with(File::open(&vmdk).unwrap(), true).unwrap();
+    assert_eq!(img.discarded_blocks(), 2);
+    assert!(img
+        .describe()
+        .contains("modo tolerante: 2 granos descartados"));
+    assert_tolerant_matches(&img, &reference, (0, 2 * grain_sectors));
+    assert_eq!(
+        img.allocation(0, 2 * grain_sectors).unwrap(),
+        vec![(0, 2 * grain_sectors, Allocation::Data)]
+    );
+    drop(img);
+    assert_eq!(
+        sha256_file(&vmdk),
+        sha_before,
+        "el VMDK se modificó al leerlo"
+    );
+}

@@ -30,8 +30,12 @@ internal sealed partial class AppSession : IDisposable
         Window = window;
     }
 
-    /// <summary>Lanza MemRescue con la imagen indicada y espera a que el visor muestre la LBA 0.</summary>
-    public static AppSession Launch(string image, uint? sectorSize = null)
+    /// <summary>
+    /// Lanza MemRescue con la imagen indicada y espera a que el visor muestre la LBA 0 (o solo a la
+    /// ventana principal si <paramref name="waitForViewer"/> es <c>false</c>, p. ej. cuando la apertura
+    /// pide una confirmación).
+    /// </summary>
+    public static AppSession Launch(string image, uint? sectorSize = null, bool waitForViewer = true)
     {
         var psi = new ProcessStartInfo(RepoPaths.MemRescueExe) { UseShellExecute = false };
         psi.ArgumentList.Add("--open");
@@ -57,6 +61,10 @@ internal sealed partial class AppSession : IDisposable
                 return w is not null && w.Current.Name == "MemRescue" ? w : null;
             }, "la ventana «MemRescue»", StartupTimeout);
             var session = new AppSession(process, window);
+            if (!waitForViewer)
+            {
+                return session;
+            }
             // La imagen se abre al terminar de renderizarse la ventana: se espera a que aparezca el visor.
             session.WaitUntil(() => session.HexText.Contains("── LBA 0 ·", StringComparison.Ordinal), "el visor con la LBA 0 de la imagen", StartupTimeout);
             return session;
@@ -188,6 +196,32 @@ internal sealed partial class AppSession : IDisposable
         {
             p.Collapse();
         }
+    }
+
+    // ---------- Cuadros de diálogo ----------
+
+    /// <summary>Espera el cuadro de mensaje con el título indicado (hijo de la ventana o del escritorio).</summary>
+    public AutomationElement WaitForDialog(string title)
+    {
+        var cond = new AndCondition(
+            new PropertyCondition(AutomationElement.ProcessIdProperty, _process.Id),
+            new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Window),
+            new PropertyCondition(AutomationElement.NameProperty, title));
+        return WaitFor(() => Window.FindFirst(TreeScope.Children, cond) ?? AutomationElement.RootElement.FindFirst(TreeScope.Children, cond),
+            $"el cuadro de diálogo «{title}»");
+    }
+
+    /// <summary>Textos estáticos de un cuadro de diálogo, unidos por saltos de línea.</summary>
+    public static string DialogText(AutomationElement dialog) =>
+        string.Join("\n", dialog.FindAll(TreeScope.Descendants, new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Text))
+            .Cast<AutomationElement>().Select(e => e.Current.Name));
+
+    /// <summary>Pulsa un botón de un cuadro de mensaje estándar (6 = Sí, 7 = No).</summary>
+    public static void ClickDialogButton(AutomationElement dialog, string automationId)
+    {
+        var button = WaitFor(() => dialog.FindFirst(TreeScope.Descendants,
+            new PropertyCondition(AutomationElement.AutomationIdProperty, automationId)), $"el botón «{automationId}» del diálogo");
+        ((InvokePattern)button.GetCurrentPattern(InvokePattern.Pattern)).Invoke();
     }
 
     // ---------- Cierre ----------

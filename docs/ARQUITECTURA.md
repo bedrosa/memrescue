@@ -138,7 +138,7 @@ ni se simulan).
 | `mr-ffi` | `core/mr-ffi` | `memrescue_core.dll`, ABI 3 ([API_FFI.md](API_FFI.md)) | 16 unitarias |
 | `memrescue-cli` | `cli/` | `version`, `probe`, `image-info`, `split-list`, `sectors` (con estado por sector), `verify` (`--jump`, `--read-back`), `hash`, `db-init`, `jobs`; opciones `--force-raw`, `--split`, `--range` | 8 extremo a extremo + 3 contra corpus |
 | `MemRescue.Core.Interop` | `app/src/MemRescue.Core.Interop` | `Engine`, `Source` (`OpenRange`, `ReadSectorsMapped`, `Description`), `HashTask`, `VerifyTask`, `SectorState`, `HexDump` | 52 xUnit |
-| `MemRescue` (WPF) | `app/src/MemRescue` | Menús del flujo de referencia; orígenes (contenedores, divididas con confirmación, rangos como dispositivo); visor con estado por sector, aviso de no fiables y barra de posición; propiedades; hashes; legibilidad con salto/lectura hacia atrás; registro; `--open`, `--selftest`, `--screenshot` | 9 pruebas UI Automation + autodiagnóstico 512 y 4096 B |
+| `MemRescue` (WPF) | `app/src/MemRescue` | Menús del flujo de referencia; orígenes (contenedores, divididas con confirmación, rangos como dispositivo); visor con estado por sector, aviso de no fiables y barra de posición; propiedades; hashes; legibilidad con salto/lectura hacia atrás; registro; `--open`, `--selftest`, `--screenshot` | 10 pruebas UI Automation + autodiagnóstico 512 y 4096 B |
 | Generador y validador | `tests/generators` | Imágenes MBR/GPT deterministas + validador independiente + pruebas negativas | 128 comprobaciones + 9 corrupciones |
 
 No existe todavía: interpretación de particiones, sistemas de archivos, escaneo, recuperación, RAID,

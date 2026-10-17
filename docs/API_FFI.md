@@ -96,7 +96,7 @@ mr_task_free(handle)
 | `mr_last_error(buf, cap, out_len)` | Mensaje del último error del hilo |
 | `mr_image_probe(path, len, out_format)` | Formato detectado por firmas: 1 RAW, 2 VHD, 3 VHDX, 4 VMDK, 5 VMDK descriptor, 6 EWF, 7 QCOW, 8 VDI, 9 DMG |
 | `mr_image_info_get(path, len, sector_size, out)` | Tamaño, sectores, bytes sobrantes y formato (abre el contenedor si hay lector) |
-| `mr_source_open(path, len, sector_size, flags, out_source)` | Abre un origen en solo lectura. `sector_size` 0 = nativo del formato (512 en RAW); si difiere del nativo, mismos bytes con otra división en sectores. `flags`: 1 = forzar RAW, 2 = imagen dividida |
+| `mr_source_open(path, len, sector_size, flags, out_source)` | Abre un origen en solo lectura. `sector_size` 0 = nativo del formato (512 en RAW); si difiere del nativo, mismos bytes con otra división en sectores. `flags`: 1 = forzar RAW, 2 = imagen dividida, 4 = modo tolerante (`MR_OPEN_TOLERANT`, ver abajo); otros bits → `MR_ERR_INVALID_ARGUMENT` |
 | `mr_source_info(source, out)` | Datos del origen (`format` = formato con el que se interpreta) |
 | `mr_source_describe(source, buf, cap, out_len)` | Descripción legible: variante del contenedor, segmentos, rango |
 | `mr_source_read(source, lba, count, buf, cap, out_len)` | Lectura **estricta** de `count` sectores (máx. 64 MiB); falla ante cualquier error |
@@ -120,6 +120,17 @@ Códigos añadidos en ABI 2: 10 y 11; en ABI 3: 12, 13 y 14. Las tres funciones 
 de errores (IO-09) se añadieron sin cambiar la versión: no modifican firmas ni estructuras existentes. Límites:
 cadenas de entrada ≤ 64 KiB (`MR_MAX_STRING_BYTES`), lecturas ≤ 64 MiB (`MR_MAX_READ_BYTES`).
 
+## Modo tolerante de contenedores (`MR_OPEN_TOLERANT`, ADR-020)
+
+Ampliación compatible de la ABI 3 (nuevo bit de `flags`; las estructuras y la versión no cambian). Sin el
+bit, un VHD, VHDX o VMDK con entradas de asignación inválidas o ambiguas falla con `MR_ERR_CORRUPT`. Con
+él, esas entradas solo descartan su bloque o grano: `mr_source_read` y los hashes fallan sobre ellos
+(`MR_ERR_IO`), `mr_source_read_mapped` y la verificación los entregan como `MR_SECTOR_UNREADABLE` con el
+patrón de relleno, y `mr_source_describe` termina en «modo tolerante: N bloques descartados (no
+fiables)» («granos» en VMDK). Las estructuras críticas dañadas siguen dando `MR_ERR_CORRUPT`. Sin efecto
+en RAW (también con `MR_OPEN_FORCE_RAW`) ni en imágenes divididas. En C#:
+`Engine.OpenSource(path, ..., tolerant: true)`.
+
 ## Garantía sobre datos sustituidos (ABI 3)
 
 - Los sectores ilegibles o saltados se entregan con un patrón de relleno (`BAD!` / `SKIP`) **y** su estado.
@@ -136,13 +147,15 @@ después de liberarlos.
 
 ## Pruebas que garantizan el contrato
 
-- Rust (`core/mr-ffi/src/tests.rs`, 18 pruebas): tamaños de estructuras, verificación extendida con
+- Rust (`core/mr-ffi/src/tests.rs`, 19 pruebas): tamaños de estructuras, verificación extendida con
   códigos de error simulados (origen `FaultyDevice` registrado con `mr_api::source_from_device`) y
   validación de `mr_verify_options`, protocolo de búfer pequeño, rutas
   de dispositivo, UTF-8 inválido, punteros nulos y cadenas desmesuradas, handles inválidos o de otro
   tipo, orígenes en los 4 tamaños de sector, cierre con tarea en curso, verificación con salto y lectura
-  hacia atrás, códigos 10/12/13/14, lectura con estados, rangos anidados, imágenes divididas.
+  hacia atrás, códigos 10/12/13/14, lectura con estados, rangos anidados, imágenes divididas, modo tolerante
+  (`MR_OPEN_TOLERANT`: estricto → 12, tolerante → descripción, sectores ilegibles con relleno, lectura
+  estricta → 2, sin efecto con RAW forzado, inmutabilidad).
 - C# (`app/tests/MemRescue.Core.Interop.Tests`): los mismos contratos desde .NET contra la DLL
   real (política de errores y `ErrorCodeList` en `VerifyPolicyTests`, incluidos VHD fijo construido según la especificación, descriptor VMDK malicioso, rangos, estados y
-  divididas), finalizadores, rutas no ASCII, cancelación, base de datos de trabajo, inmutabilidad del origen y el
+  divididas y modo tolerante con un VHD dinámico dañado), finalizadores, rutas no ASCII, cancelación, base de datos de trabajo, inmutabilidad del origen y el
   corpus sintético (lectura de marcadores en LBA exactas y cabeceras GPT).

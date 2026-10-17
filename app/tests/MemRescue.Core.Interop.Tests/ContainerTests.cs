@@ -129,6 +129,98 @@ public sealed class ContainerTests : IDisposable
         Assert.Contains("relleno", SectorState.Unreadable.Label());
     }
 
+    /// <summary>Suma de control del VHD: complemento a uno de la suma de los bytes, sin el propio campo.</summary>
+    private static void SealVhd(byte[] b, int field)
+    {
+        uint sum = 0;
+        for (var i = 0; i < b.Length; i++)
+        {
+            if (i < field || i >= field + 4)
+            {
+                sum += b[i];
+            }
+        }
+        BinaryPrimitives.WriteUInt32BigEndian(b.AsSpan(field), ~sum);
+    }
+
+    /// <summary>
+    /// VHD dinámico según la especificación pública: 4 bloques de 4 KiB (0, 1 y 2 asignados) con la
+    /// entrada de la BAT del bloque 1 fuera del fichero. Cada byte del bloque b vale 0x10 + b.
+    /// </summary>
+    internal static byte[] DamagedDynamicVhd()
+    {
+        const int bs = 4096;
+        var footer = new byte[512];
+        "conectix"u8.CopyTo(footer);
+        BinaryPrimitives.WriteUInt32BigEndian(footer.AsSpan(8), 2);
+        BinaryPrimitives.WriteUInt32BigEndian(footer.AsSpan(12), 0x0001_0000);
+        BinaryPrimitives.WriteUInt64BigEndian(footer.AsSpan(16), 512);
+        BinaryPrimitives.WriteUInt64BigEndian(footer.AsSpan(40), 4 * bs);
+        BinaryPrimitives.WriteUInt64BigEndian(footer.AsSpan(48), 4 * bs);
+        BinaryPrimitives.WriteUInt32BigEndian(footer.AsSpan(60), 3);
+        SealVhd(footer, 64);
+        var header = new byte[1024];
+        "cxsparse"u8.CopyTo(header);
+        BinaryPrimitives.WriteUInt64BigEndian(header.AsSpan(8), ulong.MaxValue);
+        BinaryPrimitives.WriteUInt64BigEndian(header.AsSpan(16), 1536);
+        BinaryPrimitives.WriteUInt32BigEndian(header.AsSpan(24), 0x0001_0000);
+        BinaryPrimitives.WriteUInt32BigEndian(header.AsSpan(28), 4);
+        BinaryPrimitives.WriteUInt32BigEndian(header.AsSpan(32), bs);
+        SealVhd(header, 36);
+        var bat = Enumerable.Repeat((byte)0xFF, 512).ToArray();
+        var body = new List<byte>();
+        for (var b = 0; b < 3; b++)
+        {
+            var sector = (uint)((2048 + body.Count) / 512);
+            BinaryPrimitives.WriteUInt32BigEndian(bat.AsSpan(b * 4), b == 1 ? 0x00FF_0000u : sector);
+            var bitmap = new byte[512];
+            bitmap[0] = 0xFF;
+            body.AddRange(bitmap);
+            body.AddRange(Enumerable.Repeat((byte)(0x10 + b), bs));
+        }
+        return [.. footer, .. header, .. bat, .. body, .. footer];
+    }
+
+    [Fact]
+    public async Task TolerantModeIsExplicitAndDiscardedBlocksAreUntrusted()
+    {
+        var p = Write("t.vhd", DamagedDynamicVhd());
+        var before = SHA256.HashData(File.ReadAllBytes(p));
+        var modified = File.GetLastWriteTimeUtc(p);
+        // Por defecto, estricto: dañado.
+        Assert.Equal(EngineStatus.Corrupt, Assert.Throws<EngineException>(() => Engine.OpenSource(p)).Status);
+        using (var src = Engine.OpenSource(p, tolerant: true))
+        {
+            Assert.Contains("modo tolerante: 1 bloque descartado", src.Description);
+            var m = src.ReadSectorsMapped(0, 32, retries: 0);
+            for (var l = 0; l < 32; l++)
+            {
+                var sector = m.Data.AsSpan(l * 512, 512).ToArray();
+                if (l is >= 8 and < 16)
+                {
+                    Assert.Equal(SectorState.Unreadable, m.States[l]);
+                    Assert.Equal("BAD!"u8.ToArray(), sector[..4]);
+                }
+                else
+                {
+                    Assert.True(m.States[l].IsTrustworthy());
+                    Assert.All(sector, b => Assert.Equal(l >= 24 ? 0 : 0x10 + l / 8, b));
+                }
+            }
+            // Lectura estricta y hash: fallan; la verificación cuenta los 8 sectores no fiables.
+            Assert.Equal(EngineStatus.Io, Assert.Throws<EngineException>(() => src.ReadSectors(8, 1)).Status);
+            using var h = src.StartHash(HashAlgorithms.Sha256);
+            Assert.Equal(EngineTaskState.Failed, await h.WaitAsync());
+            using var v = src.StartVerify();
+            Assert.Equal(EngineTaskState.Completed, await v.WaitAsync());
+            var r = v.GetReport();
+            Assert.Equal(8ul, r.SectorsUnreadable);
+            Assert.Equal(new UntrustedRange(8, 8, SectorState.Unreadable), Assert.Single(r.UntrustedRanges));
+        }
+        Assert.Equal(before, SHA256.HashData(File.ReadAllBytes(p)));
+        Assert.Equal(modified, File.GetLastWriteTimeUtc(p));
+    }
+
     [Fact]
     public async Task SplitImageIsListedThenOpenedOnlyWhenRequested()
     {

@@ -151,12 +151,13 @@ pub fn open_source(path: impl AsRef<Path>, sector_size: u32) -> Result<Source> {
         path,
         OpenOptions {
             sector_size,
-            force_raw: false,
+            ..OpenOptions::default()
         },
     )
 }
 
-/// Abre una imagen con opciones explícitas (p. ej. forzar RAW).
+/// Abre una imagen con opciones explícitas (p. ej. forzar RAW o el modo tolerante de los
+/// contenedores, cuya descripción indica entonces cuántos bloques se descartaron).
 pub fn open_with(path: impl AsRef<Path>, opts: OpenOptions) -> Result<Source> {
     Ok(Arc::new(mr_image::open_image(path.as_ref(), opts)?.into()))
 }

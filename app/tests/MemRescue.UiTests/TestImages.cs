@@ -81,6 +81,9 @@ public sealed class TestImages : IDisposable
     /// <summary>gpt_basic.img envuelto en un VHD fijo.</summary>
     public string GptBasicVhd => Path.Combine(Directory, "gpt_basic.vhd");
 
+    /// <summary>VHD dinámico con la entrada de la BAT del bloque 1 fuera del fichero (modo tolerante).</summary>
+    public string DamagedVhd => Path.Combine(Directory, "bat_danada.vhd");
+
     public TestImages()
     {
         Directory = Path.Combine(Path.GetTempPath(), $"memrescue-uitests-{Environment.ProcessId}-{Guid.NewGuid():N}");
@@ -111,6 +114,59 @@ public sealed class TestImages : IDisposable
             throw new InvalidOperationException($"Falló el generador de imágenes (código {proc.ExitCode}):\n{stdout.Result}\n{stderr.Result}");
         }
         File.WriteAllBytes(GptBasicVhd, [.. File.ReadAllBytes(GptBasic), .. FixedVhdFooter(new FileInfo(GptBasic).Length)]);
+        File.WriteAllBytes(DamagedVhd, DamagedDynamicVhd());
+    }
+
+    /// <summary>Suma de control del VHD: complemento a uno de la suma de los bytes, sin el propio campo.</summary>
+    private static void SealVhd(byte[] b, int field)
+    {
+        uint sum = 0;
+        for (var i = 0; i < b.Length; i++)
+        {
+            if (i < field || i >= field + 4)
+            {
+                sum += b[i];
+            }
+        }
+        BinaryPrimitives.WriteUInt32BigEndian(b.AsSpan(field), ~sum);
+    }
+
+    /// <summary>
+    /// VHD dinámico según la especificación pública: 4 bloques de 4 KiB (0, 1 y 2 asignados) con la
+    /// entrada de la BAT del bloque 1 fuera del fichero. Cada byte del bloque b vale 0x10 + b.
+    /// </summary>
+    private static byte[] DamagedDynamicVhd()
+    {
+        const int bs = 4096;
+        var footer = new byte[512];
+        "conectix"u8.CopyTo(footer);
+        BinaryPrimitives.WriteUInt32BigEndian(footer.AsSpan(8), 2);
+        BinaryPrimitives.WriteUInt32BigEndian(footer.AsSpan(12), 0x0001_0000);
+        BinaryPrimitives.WriteUInt64BigEndian(footer.AsSpan(16), 512);
+        BinaryPrimitives.WriteUInt64BigEndian(footer.AsSpan(40), 4 * bs);
+        BinaryPrimitives.WriteUInt64BigEndian(footer.AsSpan(48), 4 * bs);
+        BinaryPrimitives.WriteUInt32BigEndian(footer.AsSpan(60), 3);
+        SealVhd(footer, 64);
+        var header = new byte[1024];
+        "cxsparse"u8.CopyTo(header);
+        BinaryPrimitives.WriteUInt64BigEndian(header.AsSpan(8), ulong.MaxValue);
+        BinaryPrimitives.WriteUInt64BigEndian(header.AsSpan(16), 1536);
+        BinaryPrimitives.WriteUInt32BigEndian(header.AsSpan(24), 0x0001_0000);
+        BinaryPrimitives.WriteUInt32BigEndian(header.AsSpan(28), 4);
+        BinaryPrimitives.WriteUInt32BigEndian(header.AsSpan(32), bs);
+        SealVhd(header, 36);
+        var bat = Enumerable.Repeat((byte)0xFF, 512).ToArray();
+        var body = new List<byte>();
+        for (var b = 0; b < 3; b++)
+        {
+            var sector = (uint)((2048 + body.Count) / 512);
+            BinaryPrimitives.WriteUInt32BigEndian(bat.AsSpan(b * 4), b == 1 ? 0x00FF_0000u : sector);
+            var bitmap = new byte[512];
+            bitmap[0] = 0xFF;
+            body.AddRange(bitmap);
+            body.AddRange(Enumerable.Repeat((byte)(0x10 + b), bs));
+        }
+        return [.. footer, .. header, .. bat, .. body, .. footer];
     }
 
     /// <summary>Pie de un VHD fijo según la especificación pública (512 bytes, big-endian).</summary>

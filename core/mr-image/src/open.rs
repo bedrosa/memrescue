@@ -8,6 +8,9 @@
 //!   `IoError::UnsupportedFormat`, salvo que el usuario fuerce la lectura como RAW.
 //! - Si se pide un tamaño de sector distinto del nativo del contenedor, se presenta a través de
 //!   [`Reblocked`] (mismos bytes, otra división en sectores).
+//! - Los contenedores se abren en modo estricto salvo que se pida [`OpenOptions::tolerant`]
+//!   (ADR-020): entonces las entradas de asignación inválidas o ambiguas descartan solo su bloque o
+//!   grano y la descripción lo indica con el número de bloques descartados.
 
 use crate::split::{discover, SplitImage};
 use crate::vhd::VhdImage;
@@ -31,6 +34,10 @@ pub struct OpenOptions {
     pub sector_size: u32,
     /// Leer el fichero como volcado sector a sector aunque parezca un contenedor.
     pub force_raw: bool,
+    /// Modo tolerante para contenedores VHD, VHDX y VMDK con estructuras de asignación
+    /// parcialmente dañadas (ADR-020). Desactivado por defecto: sin él, una entrada inválida
+    /// rechaza la imagen con `IoError::Corrupt`. No tiene efecto en RAW ni en imágenes divididas.
+    pub tolerant: bool,
 }
 
 /// Origen abierto y sus metadatos.
@@ -48,6 +55,9 @@ pub struct OpenedImage {
     pub segments: Vec<PathBuf>,
     /// Tamaño de sector nativo del formato.
     pub native_sector_size: u32,
+    /// Bloques (o granos) descartados si el contenedor se abrió en modo tolerante; `None` si se
+    /// abrió en modo estricto o el origen no es un contenedor.
+    pub discarded_blocks: Option<u64>,
 }
 
 /// Abre un fichero de imagen identificando su formato.
@@ -79,24 +89,26 @@ pub fn open_image(path: &Path, opts: OpenOptions) -> Result<OpenedImage> {
             path: canon,
             segments: Vec::new(),
             native_sector_size: ss,
+            discarded_blocks: None,
         });
     }
-    let (device, description): (Arc<dyn BlockDevice>, String) = match detected {
+    let tolerant = opts.tolerant;
+    let (device, description, discarded): (Arc<dyn BlockDevice>, String, u64) = match detected {
         ImageFormat::Vhd => {
-            let d = VhdImage::open(file)?;
-            let s = d.describe();
-            (Arc::new(d), s)
+            let d = VhdImage::open_with(file, tolerant)?;
+            let (s, n) = (d.describe(), d.discarded_blocks());
+            (Arc::new(d), s, n)
         }
         ImageFormat::Vhdx => {
-            let d = VhdxImage::open(file)?;
-            let s = d.describe();
-            (Arc::new(d), s)
+            let d = VhdxImage::open_with(file, tolerant)?;
+            let (s, n) = (d.describe(), d.discarded_blocks());
+            (Arc::new(d), s, n)
         }
         // El lector VMDK también interpreta (sin seguirlos) los descriptores de texto separados.
         ImageFormat::Vmdk | ImageFormat::VmdkDescriptor => {
-            let d = VmdkImage::open(file)?;
-            let s = d.describe();
-            (Arc::new(d), s)
+            let d = VmdkImage::open_with(file, tolerant)?;
+            let (s, n) = (d.describe(), d.discarded_blocks());
+            (Arc::new(d), s, n)
         }
         other => return Err(IoError::UnsupportedFormat(other)),
     };
@@ -110,6 +122,7 @@ pub fn open_image(path: &Path, opts: OpenOptions) -> Result<OpenedImage> {
         path: canon,
         segments: Vec::new(),
         native_sector_size: native,
+        discarded_blocks: tolerant.then_some(discarded),
     })
 }
 
@@ -140,6 +153,7 @@ pub fn open_split(first: &Path, opts: OpenOptions) -> Result<OpenedImage> {
         description,
         segments,
         native_sector_size: ss,
+        discarded_blocks: None,
     })
 }
 

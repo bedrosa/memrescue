@@ -31,6 +31,9 @@ USO:
 ORIGEN (opcional):
   --sector-size N    tamaño de sector lógico (por defecto, el nativo del formato; 512 en RAW)
   --force-raw        leer como volcado sector a sector aunque parezca un contenedor
+  --tolerant         modo tolerante para VHD/VHDX/VMDK con tablas de asignación dañadas: los
+                     bloques con entradas inválidas o ambiguas se descartan y se tratan como
+                     ilegibles (patrón de relleno, nunca datos); sin esta opción se rechazan
   --split            abrir la imagen dividida que empieza en <imagen.001> (ver split-list)
   --range INI:NUM    trabajar solo con NUM sectores desde el LBA INI (partición o rango)
 
@@ -55,6 +58,7 @@ struct Args {
     count: u64,
     retries: u32,
     force_raw: bool,
+    tolerant: bool,
     split: bool,
     range: Option<(u64, u64)>,
     jump: u64,
@@ -113,6 +117,7 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
         count: 1,
         retries: 1,
         force_raw: false,
+        tolerant: false,
         split: false,
         range: None,
         jump: 0,
@@ -134,6 +139,7 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
             }
             "--ignore-errors" => a.ignore_errors = true,
             "--force-raw" => a.force_raw = true,
+            "--tolerant" => a.tolerant = true,
             "--split" => a.split = true,
             "--range" => {
                 let v = it.next().ok_or("falta el valor de --range")?;
@@ -183,12 +189,20 @@ fn open_src(a: &Args, p: &str) -> Result<Source, mr_api::ApiError> {
     let opts = OpenOptions {
         sector_size: a.sector_size,
         force_raw: a.force_raw,
+        tolerant: a.tolerant,
     };
     let src = if a.split {
         mr_api::open_split_source(p, opts)?
     } else {
         mr_api::open_with(p, opts)?
     };
+    // Modo tolerante (petición explícita): aviso visible en la salida de errores.
+    if a.tolerant && src.info().description.contains("modo tolerante") {
+        eprintln!(
+            "AVISO: contenedor abierto en modo tolerante ({}). Los bloques descartados se tratan              como ilegibles: su contenido es un patrón de relleno, nunca datos.",
+            src.info().description
+        );
+    }
     match a.range {
         Some((start, count)) => mr_api::open_range(&src, start, count),
         None => Ok(src),

@@ -87,6 +87,10 @@ el corpus GPT/MBR convertido a 5 variantes de contenedor y leído con la detecci
 `dotnet test` ejecuta 52 pruebas de interop y **9 de interfaz** con UI Automation (`PRUEBAS_UI.md`).
 Documentación de cada formato y de sus pruebas en `formatos/`.
 
+Modo tolerante de contenedores (issue #4, ADR-020): pruebas unitarias por formato con comparación sector
+a sector contenido ↔ estado, 2 pruebas más contra qemu-img (11 ignoradas en total), y pruebas de API,
+FFI, CLI (`cli/tests/tolerant.rs`), C# e interfaz (11 pruebas de UI Automation).
+
 **Integración continua** (`.github/workflows/ci.yml`, detalle en `CONTRIBUTING.md`): las mismas
 comprobaciones se ejecutan en GitHub Actions en cada rama `feat/` o `fix/` y en cada PR, más la auditoría
 de higiene del repositorio (`tools/check_repo_hygiene.py`: rutas personales, correos, credenciales,
