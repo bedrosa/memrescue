@@ -4,6 +4,7 @@ members = [
     "core/mr-common",
     "core/mr-io",
     "core/mr-store",
+    "core/mr-image",
     "core/mr-api",
     "core/mr-ffi",
     "cli",
@@ -21,6 +22,7 @@ rust-version = "1.89"
 mr-common = { path = "core/mr-common" }
 mr-io = { path = "core/mr-io" }
 mr-store = { path = "core/mr-store" }
+mr-image = { path = "core/mr-image" }
 mr-api = { path = "core/mr-api" }
 thiserror = "2"
 crc32fast = "1"

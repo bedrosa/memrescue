@@ -80,7 +80,11 @@ fn fail(code: i32, msg: impl Into<String>) -> i32 {
 fn io_error_code(e: &IoError) -> i32 {
     match e {
         IoError::DevicePathRejected(_) => MR_ERR_PATH_REJECTED,
-        IoError::UnsupportedFormat(_) => MR_ERR_UNSUPPORTED_FORMAT,
+        // Provisional hasta la ABI 3 (integración de M1 iteración 2).
+        IoError::UnsupportedFormat(_)
+        | IoError::UnsupportedFeature { .. }
+        | IoError::ExternalReference { .. } => MR_ERR_UNSUPPORTED_FORMAT,
+        IoError::Corrupt { .. } => MR_ERR_IO,
         IoError::InvalidRange { .. }
         | IoError::OutOfBounds { .. }
         | IoError::RequestTooLarge { .. } => MR_ERR_OUT_OF_RANGE,

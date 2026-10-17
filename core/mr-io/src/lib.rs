@@ -15,11 +15,56 @@ mod image;
 mod mem;
 pub mod path_policy;
 pub mod resilient;
+pub mod view;
 
 pub use fault::FaultyDevice;
 pub use format::{probe_format, ImageFormat};
 pub use image::ImageFile;
 pub use mem::MemDevice;
+
+/// Estado de validez de cada sector entregado por una lectura. Toda exportación o recuperación debe
+/// conservarlo para no confundir datos sustituidos con datos reales.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum SectorState {
+    /// Leído correctamente al primer intento.
+    Read = 0,
+    /// Leído correctamente tras uno o más reintentos.
+    Recovered = 1,
+    /// Ilegible: el contenido entregado es un **patrón de relleno**, no datos.
+    Unreadable = 2,
+    /// No se intentó leer (salto sobre zona dañada): el contenido es un **patrón de relleno**.
+    Skipped = 3,
+    /// No asignado en el contenedor (región dispersa): ceros legítimos por definición del formato.
+    Sparse = 4,
+}
+
+impl SectorState {
+    pub const ALL: [SectorState; 5] = [
+        SectorState::Read,
+        SectorState::Recovered,
+        SectorState::Unreadable,
+        SectorState::Skipped,
+        SectorState::Sparse,
+    ];
+
+    /// `true` si el contenido representa fielmente el origen (leído, recuperado o disperso).
+    pub fn is_trustworthy(self) -> bool {
+        !matches!(self, SectorState::Unreadable | SectorState::Skipped)
+    }
+}
+
+/// Asignación de un rango de sectores según el formato del origen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Allocation {
+    /// Hay datos almacenados (deben leerse).
+    Data,
+    /// No asignado / cero por definición del formato (no hay nada que leer).
+    Sparse,
+}
+
+/// Tramo contiguo `(lba_inicial, nº de sectores, asignación)`.
+pub type AllocationRun = (u64, u64, Allocation);
 
 use std::io;
 use thiserror::Error;
@@ -55,6 +100,24 @@ pub enum IoError {
     UnsupportedFormat(ImageFormat),
     #[error("operación cancelada")]
     Cancelled,
+    /// Estructura del contenedor dañada o incoherente.
+    #[error("{format}: estructura dañada o incoherente: {detail}")]
+    Corrupt {
+        format: &'static str,
+        detail: String,
+    },
+    /// Variante o característica del formato que todavía no se admite.
+    #[error("{format}: característica no soportada: {detail}")]
+    UnsupportedFeature {
+        format: &'static str,
+        detail: String,
+    },
+    /// El contenedor necesita otro fichero (padre, extensión…) que no se abre automáticamente.
+    #[error("{format}: requiere el fichero externo «{reference}», que no se abre automáticamente")]
+    ExternalReference {
+        format: &'static str,
+        reference: String,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, IoError>;
@@ -76,6 +139,16 @@ pub trait BlockDevice: Send + Sync {
     /// Bytes finales que no completan un sector.
     fn trailing_bytes(&self) -> u64 {
         self.size() % u64::from(self.sector_size())
+    }
+
+    /// Mapa de asignación de `count` sectores desde `lba`, en tramos contiguos ordenados que cubren
+    /// exactamente el rango. Por defecto todo es `Data`; los contenedores dispersos lo redefinen.
+    fn allocation(&self, lba: u64, count: u64) -> Result<Vec<AllocationRun>> {
+        let total = self.sector_count();
+        if count == 0 || lba.checked_add(count).is_none_or(|e| e > total) {
+            return Err(IoError::InvalidRange { lba, count, total });
+        }
+        Ok(vec![(lba, count, Allocation::Data)])
     }
 
     /// Lee `count` sectores completos desde `lba` con validación estricta del rango.

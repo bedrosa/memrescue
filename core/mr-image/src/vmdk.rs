@@ -1,0 +1,1 @@
+//! VMDK monolithicSparse. Implementación pendiente.
