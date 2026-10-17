@@ -101,6 +101,17 @@ fichero ausente, dañado o desmesurado, ubicación sustituible y paleta con cont
 (13 pruebas de UI Automation, 2 nuevas en `FillPatternUiTests`). Las preferencias de las pruebas viven
 siempre en directorios temporales (`MEMRESCUE_SETTINGS_DIR`); nunca se toca el perfil del usuario.
 
+Metadatos de asignación ilegibles (issue #39): `FaultyDevice::with_allocation_error` simula un
+dispositivo cuya consulta `allocation` falla en un tramo. Las pruebas de mr-io comprueban sector a
+sector (`assert_honest`) que con `FillAndContinue` el bloque afectado se lee como `Data` y, si la
+lectura falla, queda `Unreadable` con relleno (nunca `Sparse`), que el resto del mapa es exacto, que
+dentro de un salto queda `Skipped` sin leerse, que reintentos y omisión por código se aplican a esa
+lectura y que con `Fail` el error sigue abortando. En mr-image, un VHD dinámico sintético se trunca en
+mitad del mapa de bits de un bloque después de abrirlo: `allocation` informa ese bloque como `Data`, la
+verificación termina con el bloque `Unreadable` y los demás estados correctos, y la lectura estricta
+aborta con la posición exacta. VHDX y VMDK no necesitan prueba equivalente: su `allocation` no lee del
+fichero (mapas cargados al abrir).
+
 **Integración continua** (`.github/workflows/ci.yml`, detalle en `CONTRIBUTING.md`): las mismas
 comprobaciones se ejecutan en GitHub Actions en cada rama `feat/` o `fix/` y en cada PR, más la auditoría
 de higiene del repositorio (`tools/check_repo_hygiene.py`: rutas personales, correos, credenciales,

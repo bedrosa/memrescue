@@ -7,7 +7,9 @@
 //!
 //! Estrategia:
 //! 1. Se consulta [`BlockDevice::allocation`] por bloque: los sectores dispersos no se leen; se
-//!    entregan ceros con estado `Sparse`.
+//!    entregan ceros con estado `Sparse`. Si la consulta falla (metadatos ilegibles) con
+//!    [`OnError::FillAndContinue`], el bloque se trata como `Data` y se intenta leer: nunca se
+//!    supone disperso.
 //! 2. Los sectores con datos se leen por bloques; si un bloque falla, se relee **sector a sector**
 //!    con reintentos (`Read` si el primer intento individual funciona, `Recovered` si hizo falta
 //!    reintentar).
@@ -307,13 +309,8 @@ fn fill(buf: &mut [u8], pattern: [u8; 4]) {
     }
 }
 
-/// Mapa de asignación validado: tramos contiguos que cubren exactamente `[lba, lba + n)`.
-fn allocation_checked(
-    dev: &(impl BlockDevice + ?Sized),
-    lba: u64,
-    n: u64,
-) -> Result<Vec<AllocationRun>> {
-    let runs = dev.allocation(lba, n)?;
+/// Comprueba que los tramos de asignación son contiguos y cubren exactamente `[lba, lba + n)`.
+fn check_allocation(runs: Vec<AllocationRun>, lba: u64, n: u64) -> Result<Vec<AllocationRun>> {
     let mut next = lba;
     for &(a, c, _) in &runs {
         if a != next || c == 0 {
@@ -466,10 +463,33 @@ where
         self.policy.on_error == OnError::FillAndContinue && self.policy.jump_sectors > 0
     }
 
+    /// Mapa de asignación validado de `[lba, lba + n)`.
+    ///
+    /// Si el dispositivo no puede consultarlo (p. ej. un mapa de bits de bloque ilegible) y la
+    /// política es [`OnError::FillAndContinue`], el tramo entero se trata como `Data`: se intenta
+    /// leer y, si la lectura falla, queda `Unreadable` (o `Skipped` dentro de un salto) con su
+    /// relleno, nunca `Sparse`. La consulta no se reintenta ni pasa por `skip_error_codes`: los
+    /// reintentos y la omisión de errores se aplican a la lectura posterior de esos sectores. Con
+    /// [`OnError::Fail`] el error se propaga. Un mapa incoherente (tramos que no cubren el rango)
+    /// es un fallo del dispositivo y aborta siempre.
+    fn allocation(&self, lba: u64, n: u64) -> Result<Vec<AllocationRun>> {
+        let runs = match self.dev.allocation(lba, n) {
+            Ok(runs) => runs,
+            Err(e)
+                if self.policy.on_error == OnError::FillAndContinue
+                    && !matches!(e, IoError::Cancelled) =>
+            {
+                return Ok(vec![(lba, n, Allocation::Data)]);
+            }
+            Err(e) => return Err(e),
+        };
+        check_allocation(runs, lba, n)
+    }
+
     /// Procesa `[lba, lba + n)`. Devuelve `Some(s)` si el sector `s` quedó ilegible y hay que
     /// saltar a continuación (lo posterior a `s` en este bloque se descarta y lo trata el salto).
     fn block(&mut self, lba: u64, n: u64) -> Result<Option<u64>> {
-        for (a, c, kind) in allocation_checked(self.dev, lba, n)? {
+        for (a, c, kind) in self.allocation(lba, n)? {
             match kind {
                 Allocation::Sparse => {
                     self.out.append(a, c, SectorState::Sparse, [0; 4])?;
@@ -543,7 +563,7 @@ where
             buf: vec![0u8; n as usize * self.ss],
             sparse: vec![false; n as usize],
         };
-        for (a, c, kind) in allocation_checked(self.dev, base, n)? {
+        for (a, c, kind) in self.allocation(base, n)? {
             if kind == Allocation::Sparse {
                 for l in a..a + c {
                     rb.sparse[(l - base) as usize] = true;
@@ -590,7 +610,7 @@ where
                 return Err(IoError::Cancelled);
             }
             let n = self.chunk.min(skip_end - p);
-            for (a, c, kind) in allocation_checked(self.dev, p, n)? {
+            for (a, c, kind) in self.allocation(p, n)? {
                 match kind {
                     Allocation::Sparse => {
                         self.out.append(a, c, SectorState::Sparse, [0; 4])?;
@@ -1375,6 +1395,123 @@ mod tests {
         assert!(d.sectors_touched(25..30).is_empty());
         // El 27 es ilegible pero disperso: nunca se lee, así que no puede fallar.
         assert_eq!(d.reads_of(27), 0);
+    }
+
+    #[test]
+    fn allocation_error_is_read_as_data_in_fill_mode() {
+        // La consulta falla para cualquier bloque que toque 16–19: el bloque 16–23 se trata como
+        // `Data` (los dispersos 21–22 se leen y son `Read`, con los datos reales del origen) y el
+        // resto del mapa es exacto.
+        let d = faulty(64)
+            .with_allocation_error(16, 4)
+            .with_sparse(21, 2)
+            .with_sparse(40, 4)
+            .with_bad([18]);
+        let p = fill_policy(8, 0, false);
+        let g = collect(&d, 0, 64, &p);
+        assert_honest(&g, 0, 512, &p);
+        assert_eq!(
+            runs(&g),
+            vec![
+                (0, 18, Read),
+                (18, 1, Unreadable),
+                (19, 21, Read),
+                (40, 4, Sparse),
+                (44, 20, Read)
+            ]
+        );
+        assert!(d.reads_of(21) > 0);
+        assert!(d.sectors_touched(40..44).is_empty());
+        // Si además la lectura falla, el tramo queda `Unreadable` con relleno, nunca `Sparse`.
+        let d = faulty(32)
+            .with_allocation_error(8, 8)
+            .with_sparse(10, 2)
+            .with_bad(8..16);
+        let g = collect(&d, 0, 32, &p);
+        assert_honest(&g, 0, 512, &p);
+        assert_eq!(
+            runs(&g),
+            vec![(0, 8, Read), (8, 8, Unreadable), (16, 16, Read)]
+        );
+    }
+
+    #[test]
+    fn allocation_error_aborts_in_strict_mode() {
+        let d = faulty(64).with_allocation_error(16, 4);
+        for chunk in [8, 2048] {
+            let p = ReadPolicy {
+                chunk_sectors: chunk,
+                ..ReadPolicy::default()
+            };
+            match collect(&d, 0, 64, &p).r {
+                Err(IoError::Read { offset, .. }) => assert_eq!(offset, 16 * 512),
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn allocation_error_inside_a_jump_is_skipped_or_read_back() {
+        // Salto 21–35 tras el ilegible 20; la consulta falla en 25–29 (con dispersos 26–27).
+        let dev = || {
+            faulty(100)
+                .with_bad([20])
+                .with_allocation_error(25, 5)
+                .with_sparse(26, 2)
+        };
+        let d = dev();
+        let p = fill_policy(1, 15, false);
+        let g = collect(&d, 0, 100, &p);
+        assert_honest(&g, 0, 512, &p);
+        assert_eq!(
+            runs(&g),
+            vec![
+                (0, 20, Read),
+                (20, 1, Unreadable),
+                (21, 15, Skipped),
+                (36, 64, Read)
+            ]
+        );
+        assert!(d.sectors_touched(21..36).is_empty());
+        // Con lectura hacia atrás, la consulta de toda la ventana falla: se lee entera.
+        let d = dev();
+        let p = fill_policy(1, 15, true);
+        let g = collect(&d, 0, 100, &p);
+        assert_honest(&g, 0, 512, &p);
+        assert_eq!(
+            runs(&g),
+            vec![(0, 20, Read), (20, 1, Unreadable), (21, 79, Read)]
+        );
+    }
+
+    #[test]
+    fn allocation_error_keeps_the_read_error_policy() {
+        // Los reintentos y la omisión por código se aplican a la lectura de los sectores del
+        // tramo cuya asignación no se pudo consultar.
+        let d = faulty(32)
+            .with_allocation_error(8, 8)
+            .with_bad_code([10], CRC)
+            .with_bad([12]);
+        let p = ReadPolicy {
+            retries: 3,
+            skip_error_codes: vec![CRC],
+            ..fill_policy(8, 0, false)
+        };
+        let g = collect(&d, 0, 32, &p);
+        assert_honest(&g, 0, 512, &p);
+        let r = g.r.as_ref().unwrap();
+        assert_eq!(
+            r.map.runs(),
+            &[
+                (0, 10, Read),
+                (10, 1, Unreadable),
+                (11, 1, Read),
+                (12, 1, Unreadable),
+                (13, 19, Read)
+            ]
+        );
+        assert_eq!((d.reads_of(10), d.reads_of(12)), (2, 1 + 1 + 3));
+        assert_eq!((r.omitted_errors, codes(r)), (1, vec![(CRC, 1)]));
     }
 
     /// Dispositivo virtual de `n` sectores de 512 bytes sin datos en memoria (sector `l` = `l as u8`).

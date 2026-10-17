@@ -73,6 +73,23 @@ Los dos patrones son de 4 bytes y se repiten en todo el sector en el orden escri
 2. **Asignación**: antes de cada bloque se llama a `dev.allocation(lba, n)`. Si los tramos
    devueltos no cubren exactamente el rango se devuelve `IoError::Corrupt` (no se adivina).
    Los tramos `Sparse` no se leen: se entregan ceros con estado `Sparse`.
+   **Error al consultar la asignación** (issue #39; p. ej. el mapa de bits de un bloque VHD está
+   en un sector defectuoso del soporte):
+   - `FillAndContinue`: no aborta. El bloque entero se trata como `Data` (conservador): se intenta
+     leer con la fase 3 y, si falla, sus sectores quedan `Unreadable` con `bad_fill`; nunca se
+     suponen `Sparse` ni se presentan como datos sin haberlos leído. Lo mismo dentro de un salto
+     (`Skipped` con `skip_fill`) y en la lectura hacia atrás (se intenta leer toda la ventana).
+     Si la lectura funciona, el sector es `Read` con los bytes que entrega el dispositivo, aunque
+     el contenedor lo considerase no escrito (ceros). El mapa del resto del rango no cambia.
+   - `Fail` (hashes): el error se propaga con su posición, como antes.
+   - Política de errores: la consulta de asignación **no** se reintenta ni se evalúa contra
+     `skip_error_codes`/`ignore_all_errors`. Reintentos y omisión se aplican, igual que en
+     cualquier otro tramo `Data`, a la lectura de los sectores afectados; su código de error
+     queda en `error_codes` si siguen ilegibles. Así el comportamiento es uno solo, y un fallo de
+     metadatos cuesta como mucho una consulta por bloque más los intentos normales de lectura.
+   - Un mapa **incoherente** (tramos que no cubren el rango) sigue abortando en ambos modos: es
+     un fallo de la implementación del dispositivo, no del soporte.
+   - `Cancelled` devuelto por la consulta se propaga siempre.
 3. **Datos**: lectura por bloques de `chunk` sectores (acotado a `MAX_READ_REQUEST`). Si el bloque
    falla, se relee sector a sector: éxito al primer intento individual → `Read`; éxito tras
    reintento → `Recovered`; fallo tras `1 + retries` intentos →
@@ -146,6 +163,12 @@ Independientes del tamaño del rango y del salto:
 - Contenedores en modo tolerante (ADR-020): los bloques o granos con entradas de asignación inválidas o
   ambiguas fallan en `read_at` con `IoError::Read` y se informan como `Data` en `allocation`, así que este
   lector los entrega como `Unreadable` con `bad_fill`; nunca aparecen como `Read` ni como `Sparse`.
+- VHD dinámico: `allocation` lee del fichero el mapa de bits de cada bloque asignado. Si esa lectura
+  falla, el bloque se informa como `Data` en lugar de hacer fallar toda la consulta; `read_at` de esos
+  sectores vuelve a necesitar el mapa y falla con `IoError::Read` y el desplazamiento virtual exacto,
+  así que con `FillAndContinue` el bloque queda `Unreadable` y con `Fail` la operación aborta. VHDX y
+  VMDK construyen su mapa de asignación en memoria al abrir (BAT y tablas de granos) y su
+  `allocation` no lee del fichero, así que no pueden fallar por esta causa.
 
 - `mr_api::verify` devuelve el `ReadReport` con el mapa.
 - `mr-ffi` (ABI 3): `mr_source_read_mapped` (rellenos por defecto) y `mr_source_read_mapped_ex` con
@@ -174,7 +197,8 @@ Independientes del tamaño del rango y del salto:
 
 Dispositivos: `MemDevice` (sector `l` relleno con `l as u8`), `FaultyDevice` (ilegibles,
 intermitentes, regiones dispersas, contador de lecturas por sector y un código de error del sistema
-por sector con `with_bad_code` / `with_flaky_code`, mediante `io::Error::from_raw_os_error`) y un dispositivo virtual de
+por sector con `with_bad_code` / `with_flaky_code`, mediante `io::Error::from_raw_os_error`, y
+regiones cuya consulta de asignación falla con `with_allocation_error`) y un dispositivo virtual de
 2 GiB sin datos en memoria. Una comprobación común (`assert_honest`) verifica sector a sector que el
 contenido corresponde al estado y que mapa, recuentos y `all_trustworthy()` coinciden con lo entregado.
 
@@ -195,6 +219,10 @@ contenido corresponde al estado y que mapa, recuentos y `all_trustworthy()` coin
 | `huge_jump_uses_bounded_memory` | salto de ~4 M sectores con entregas ≤ `chunk` |
 | `cancellation_and_invalid_ranges` | cancelación (también dentro de un salto), rangos inválidos, error del `sink` |
 | `incoherent_allocation_is_rejected` | asignación incoherente → `Corrupt` |
+| `allocation_error_is_read_as_data_in_fill_mode` | consulta de asignación fallida: el bloque se lee como `Data` (sus dispersos también), el ilegible queda `Unreadable`, el resto del mapa exacto; si la lectura también falla, `Unreadable` y nunca `Sparse` |
+| `allocation_error_aborts_in_strict_mode` | con `Fail`, el error de asignación aborta con su posición |
+| `allocation_error_inside_a_jump_is_skipped_or_read_back` | dentro de un salto, `Skipped` sin leer; con lectura hacia atrás, la ventana se lee entera |
+| `allocation_error_keeps_the_read_error_policy` | reintentos y omisión por código se aplican a la lectura del tramo afectado |
 | `validity_map_*` (4) | fusión, huecos, pánico por desorden/desbordamiento, truncado con recuentos exactos |
 | `read_sectors_mapped_for_every_common_sector_size` | visor: estados por sector, errores y límite |
 | `skip_codes_avoid_retries_only_for_listed_codes` | códigos de la lista sin reintentos (2 lecturas), otros códigos y sin código con reintentos; recuentos y tabla de códigos |
@@ -205,7 +233,8 @@ contenido corresponde al estado y que mapa, recuentos y `all_trustworthy()` coin
 | `policy_omits_by_code_or_all` | `ReadPolicy::omits` y `IoError::os_error_code` |
 | `fill_patterns_are_parsed_and_validated` | formato ASCII/hex, textos rechazados, regla de admisión (ceros, uniformes, iguales) |
 | `custom_fills_are_delivered_with_their_state` | patrones propios con salto: cada relleno solo con su estado, dispersos intactos |
-| `fault::tests` (4) | superposición de dispersos, solapes rechazados, contador por sector, códigos por sector |
+| `fault::tests` (5) | superposición de dispersos, solapes rechazados, contador por sector, códigos por sector, errores de asignación simulados |
+| `mr-image`: `vhd::tests::unreadable_bitmap_reports_data_and_verify_marks_it_unreadable` | VHD truncado en mitad del mapa de bits de un bloque tras abrirlo: `allocation` lo informa como `Data`, la verificación con relleno termina con ese bloque `Unreadable` y el resto exacto (incluidos dispersos y bloques posteriores), y en modo estricto aborta con la posición |
 
-Resultado: `cargo test --workspace` correcto (mr-io: 68 pruebas, de ellas 28 de este módulo y 4 de
+Resultado: `cargo test --workspace` correcto (mr-io: 73 pruebas, de ellas 32 de este módulo y 5 de
 `fault`), `cargo clippy --workspace --all-targets -- -D warnings` sin avisos, `cargo fmt --all` aplicado.

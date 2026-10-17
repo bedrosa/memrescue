@@ -25,6 +25,8 @@ pub struct FaultyDevice<D: BlockDevice> {
     flaky: Mutex<BTreeMap<u64, (u32, Option<i32>)>>,
     /// Regiones dispersas simuladas: inicio → fin (exclusivo), sin solapes.
     sparse: BTreeMap<u64, u64>,
+    /// Regiones cuya consulta de asignación falla: inicio → fin (exclusivo).
+    alloc_errors: BTreeMap<u64, u64>,
     reads: Mutex<u64>,
     /// Número de lecturas que han tocado cada sector (incluidas las fallidas).
     sector_reads: Mutex<HashMap<u64, u64>>,
@@ -37,6 +39,7 @@ impl<D: BlockDevice> FaultyDevice<D> {
             bad: BTreeMap::new(),
             flaky: Mutex::new(BTreeMap::new()),
             sparse: BTreeMap::new(),
+            alloc_errors: BTreeMap::new(),
             reads: Mutex::new(0),
             sector_reads: Mutex::new(HashMap::new()),
         }
@@ -90,6 +93,17 @@ impl<D: BlockDevice> FaultyDevice<D> {
             .is_some_and(|(_, &e)| e > lba);
         assert!(!overlaps, "regiones dispersas solapadas en LBA {lba}");
         self.sparse.insert(lba, end);
+        self
+    }
+
+    /// Hace fallar [`BlockDevice::allocation`] (error de lectura sin código del sistema) en toda
+    /// consulta que toque alguno de los `count` sectores desde `lba`, como un mapa de bits de
+    /// bloque ilegible. Las lecturas de esos sectores no se ven afectadas (para eso, `with_bad`).
+    pub fn with_allocation_error(mut self, lba: u64, count: u64) -> Self {
+        if count > 0 {
+            let end = lba.checked_add(count).expect("región desbordada");
+            self.alloc_errors.insert(lba, end);
+        }
         self
     }
 
@@ -147,6 +161,15 @@ impl<D: BlockDevice> BlockDevice for FaultyDevice<D> {
 
     fn allocation(&self, lba: u64, count: u64) -> Result<Vec<AllocationRun>> {
         let base = self.inner.allocation(lba, count)?;
+        let end = lba + count;
+        if let Some((&s, _)) = self.alloc_errors.iter().find(|(&s, &e)| s < end && e > lba) {
+            let ss = u64::from(self.sector_size());
+            return Err(IoError::Read {
+                offset: s.max(lba) * ss,
+                len: self.sector_size() as usize,
+                source: io::Error::other("mapa de asignación ilegible (simulado)"),
+            });
+        }
         if self.sparse.is_empty() {
             return Ok(base);
         }
@@ -253,6 +276,30 @@ mod tests {
             dev().allocation(0, 100).unwrap(),
             vec![(0, 100, Allocation::Data)]
         );
+    }
+
+    #[test]
+    fn allocation_errors_fail_only_queries_that_touch_them() {
+        let d = dev().with_allocation_error(20, 5).with_sparse(30, 5);
+        assert!(matches!(
+            d.allocation(0, 100),
+            Err(IoError::Read { offset: 10240, .. })
+        ));
+        assert!(matches!(
+            d.allocation(22, 1),
+            Err(IoError::Read { offset: 11264, .. })
+        ));
+        assert_eq!(
+            d.allocation(25, 10).unwrap(),
+            vec![(25, 5, Allocation::Data), (30, 5, Allocation::Sparse)]
+        );
+        assert_eq!(
+            d.allocation(0, 20).unwrap(),
+            vec![(0, 20, Allocation::Data)]
+        );
+        // Las lecturas no se ven afectadas.
+        let mut b = vec![0u8; 512 * 5];
+        d.read_sectors(20, 5, &mut b).unwrap();
     }
 
     #[test]

@@ -718,7 +718,15 @@ impl BlockDevice for VhdImage {
                 push_run(&mut runs, s, stop - s, Allocation::Data);
             } else {
                 let len = usize::try_from((stop - s) * SECTOR).unwrap_or(usize::MAX);
-                let map = self.bitmap(d, block, u64::from(entry) * SECTOR, s * SECTOR, len)?;
+                let Ok(map) = self.bitmap(d, block, u64::from(entry) * SECTOR, s * SECTOR, len)
+                else {
+                    // Mapa de bits ilegible: no se sabe qué sectores están escritos. Se informa
+                    // `Data` (conservador) en vez de fallar toda la consulta; la lectura de esos
+                    // sectores volverá a necesitar el mapa y fallará con su posición exacta.
+                    push_run(&mut runs, s, stop - s, Allocation::Data);
+                    s = stop;
+                    continue;
+                };
                 let mut rel = s - block_first;
                 let rel_stop = stop - block_first;
                 while rel < rel_stop {
@@ -1194,6 +1202,110 @@ mod tests {
             open_bytes(&img).1,
             Err(IoError::ExternalReference { .. })
         ));
+    }
+
+    /// Como `sample`, pero con el bloque 2 (mapa parcial) al final del fichero, para poder dejar
+    /// ilegible solo su mapa de bits truncando el fichero.
+    fn sample_block2_last() -> (Vec<u8>, Vec<u8>) {
+        let (_, expect) = sample();
+        let size = 4 * BS as u64 + 1024;
+        let img = dynamic_image(
+            DISK_DYNAMIC,
+            size,
+            5,
+            &[
+                (0, 0xFF, pattern(1, 4096)),
+                (3, 0xFF, pattern(3, 4096)),
+                (4, 0xFF, pattern(4, 4096)),
+                (2, 0b1010_0001, pattern(2, 4096)),
+            ],
+        );
+        (img, expect)
+    }
+
+    #[test]
+    fn unreadable_bitmap_reports_data_and_verify_marks_it_unreadable() {
+        use mr_io::resilient::{read_range, OnError, ReadPolicy};
+        use mr_io::SectorState as St;
+        let (bytes, expect) = sample_block2_last();
+        let (tmp, img) = open_bytes(&bytes);
+        let img = img.unwrap();
+        assert_eq!(read_all(&img), expect);
+        // Tras abrir, el soporte deja de devolver el mapa de bits del bloque 2 (y lo que le
+        // sigue): se trunca el fichero en mitad de ese mapa.
+        let cut = u64::from(bat_entry(&bytes, 2)) * 512 + 100;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(tmp.path())
+            .unwrap()
+            .set_len(cut)
+            .unwrap();
+        // La consulta no falla: el bloque 2 pasa a `Data` (nunca `Sparse`); el resto es exacto.
+        assert_eq!(
+            img.allocation(0, 34).unwrap(),
+            vec![
+                (0, 8, Allocation::Data),
+                (8, 8, Allocation::Sparse),
+                (16, 18, Allocation::Data)
+            ]
+        );
+        assert_eq!(
+            img.allocation(17, 2).unwrap(),
+            vec![(17, 2, Allocation::Data)]
+        );
+        // Leer el bloque sigue fallando con la posición virtual exacta.
+        assert!(matches!(
+            img.read_at(17 * 512, &mut [0u8; 512]),
+            Err(IoError::Read { offset, .. }) if offset == 17 * 512
+        ));
+
+        // Verificación con relleno: termina y el bloque 2 queda `Unreadable`.
+        let p = ReadPolicy {
+            chunk_sectors: 8,
+            on_error: OnError::FillAndContinue,
+            ..ReadPolicy::default()
+        };
+        let mut data = Vec::new();
+        let mut states: Vec<St> = Vec::new();
+        let r = read_range(
+            &img,
+            0,
+            34,
+            &p,
+            |_, d, s| {
+                data.extend_from_slice(d);
+                states.extend_from_slice(s);
+                Ok(())
+            },
+            |_, _| true,
+        )
+        .unwrap();
+        assert_eq!(
+            r.map.runs(),
+            &[
+                (0, 8, St::Read),
+                (8, 8, St::Sparse),
+                (16, 8, St::Unreadable),
+                (24, 10, St::Read)
+            ]
+        );
+        for (i, st) in states.iter().enumerate() {
+            let sec = &data[i * 512..(i + 1) * 512];
+            match st {
+                St::Unreadable => assert!(sec.chunks(4).all(|c| c == p.bad_fill)),
+                _ => assert_eq!(sec, &expect[i * 512..(i + 1) * 512], "sector {i}"),
+            }
+        }
+        // Estricto (hashes): el error sigue abortando con la posición del primer sector afectado.
+        let r = read_range(
+            &img,
+            0,
+            34,
+            &ReadPolicy::default(),
+            |_, _, _| Ok(()),
+            |_, _| true,
+        );
+        assert!(matches!(r, Err(IoError::Read { offset, .. }) if offset == 16 * 512));
     }
 
     // ---- modo tolerante (ADR-020) ----
