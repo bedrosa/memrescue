@@ -37,7 +37,10 @@ Resultado en `PROGRESO.md` (etapa 3). Pendiente heredado: oráculo de terceros p
 - Esqueleto de `mr-api` (tareas, progreso, cancelación) y `memrescue-cli`.
 - **Salida**: build reproducible; primeras imágenes del corpus con hashes.
 
-## M1 · Capa de bloques e imágenes (solo lectura): **EN CURSO** (iteración 2 entregada 2026-10-17; pendiente de revisión)
+## M1 · Capa de bloques e imágenes (solo lectura): **TERMINADO 2026-10-18**
+
+Cerrado por el propietario tras la validación de cierre (`PROGRESO.md`, etapa 7). Las variantes adicionales
+de contenedor pasan a M1.5 y no bloquean M2 a M4.
 
 Hecho en la iteración 1 (detalle en `PROGRESO.md`, etapa 4):
 - ✔ Revisión técnica previa con 25 correcciones y pruebas de regresión (`REVISION_TECNICA_M1.md`).
@@ -60,21 +63,33 @@ Hecho en la iteración 2 (detalle en `PROGRESO.md`, etapa 5):
   tamaño de sector para contenedores.
 - ✔ Prueba automática de la interfaz (UI Automation, 9 pruebas), barra de posición para imágenes grandes.
 
-Pendiente en M1 (no se avanza a M2 sin revisión del propietario):
+Completado en M1 por issues:
 - ✔ `NullDevice` (ceros, asignación dispersa) y `PatternDevice` (patrón constante).
 - ✔ Omitir errores por código y modo «ignorar todo» (IO-09): sin reintentos para los códigos elegidos, sectores siempre `Unreadable`.
 - ✔ Tablas de asignación parcialmente dañadas en VHD/VHDX/VMDK (issue #4, ADR-020): modo estricto por
   defecto y modo tolerante solo por activación explícita (API, ABI `MR_OPEN_TOLERANT`, CLI `--tolerant`,
   confirmación y aviso en la interfaz); los bloques descartados se entregan como ilegibles.
-- VHD/VHDX diferenciales, VHDX con registro pendiente, VMDK streamOptimized / multiextensión / flat
-  (exigen abrir otros ficheros con confirmación explícita del usuario o descomprimir).
 - ✔ Patrones de relleno configurables desde la interfaz (preferencias por usuario) y colores por estado
   dentro del volcado (issue #7, ADR-021): `mr_source_read_mapped_ex` sin cambiar la ABI 3, CLI
   `sectors --bad-fill/--skip-fill`, leyenda y estados por sector accesibles.
 
+- ✔ Revisión de robustez de cierre: memoria acotada al validar tablas de asignación (#38), metadatos de
+  asignación ilegibles tratados como datos en lugar de abortar (#39), endurecimiento y pruebas de corrupción
+  (#40).
+
 - **Paridad objetivo**: IM-01, IM-02, IM-03, IM-04, IM-05, IO-06…IO-09 (simulados).
 
-## M2 · Particiones
+## M1.5 · Variantes adicionales de contenedores
+
+Milestone propio para no retrasar particiones y sistemas de archivos. Exigen abrir otros ficheros con
+confirmación explícita del usuario o descomprimir; hoy se rechazan con errores tipados
+(`ExternalReference`, `UnsupportedFeature`).
+- VHD/VHDX diferenciales con selección explícita del padre (#8).
+- VMDK streamOptimized (#9).
+- Reproducción en memoria del registro pendiente de VHDX (#10).
+- VMDK multiextensión y flat con confirmación explícita (#11).
+
+## M2 · Particiones: **EN CURSO** (plan técnico en `PLAN_M2.md`)
 
 - INV-05 (acotada) → MBR/EBR, GPT con copia y tolerancias, APM.
 - Búsqueda exprés de particiones perdidas (boot sectors/superbloques en ubicaciones típicas).

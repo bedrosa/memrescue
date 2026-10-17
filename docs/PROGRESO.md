@@ -216,13 +216,42 @@ checks obligatorios de `main`; pruebas de interfaz a demanda; `CONTRIBUTING.md` 
 | #6 | #34 | `NullDevice` (todo disperso) y `PatternDevice` (patrón constante) |
 | #5 | #35 | Omisión de errores por código y modo «ignorar todo» (IO-09); `mr_source_verify_start_ex` sin cambiar la ABI 3 |
 | #4 | #36 | Tablas de asignación dañadas en VHD/VHDX/VMDK (ADR-020): estricto por defecto (ahora también rechaza bloques solapados o duplicados y valida todas las GT de VMDK al abrir) y modo tolerante solo explícito (`OpenOptions.tolerant`, `MR_OPEN_TOLERANT`, `--tolerant`, confirmación en la interfaz); un bloque solo se usa si su zona del fichero es inequívoca; los descartados se leen como ilegibles, nunca como datos |
-| #7 | este PR | Patrones de relleno configurables (ADR-021): `mr_source_read_mapped_ex` con `mr_read_options` (ABI 3 sin cambios en lo existente), validación común (ni ceros, ni cuatro bytes iguales, ni ambos iguales), ajustes por usuario en `%APPDATA%\MemRescue\settings.json` con escritura atómica, colores por estado con texto, barra lateral y leyenda (contraste mínimo 7:1, alto contraste del sistema), diálogo de opciones y CLI `sectors --bad-fill/--skip-fill/--jump/--read-back` |
+| #7 | #37 | Patrones de relleno configurables (ADR-021): `mr_source_read_mapped_ex` con `mr_read_options` (ABI 3 sin cambios en lo existente), validación común (ni ceros, ni cuatro bytes iguales, ni ambos iguales), ajustes por usuario en `%APPDATA%\MemRescue\settings.json` con escritura atómica, colores por estado con texto, barra lateral y leyenda (contraste mínimo 7:1, alto contraste del sistema), diálogo de opciones y CLI `sectors --bad-fill/--skip-fill/--jump/--read-back` |
 
 Verificación de #4: 213 pruebas Rust, 11 contra qemu-img 11.1.2 (2 nuevas en modo tolerante), 67 de interop
 C#, 11 de interfaz y auditoría de higiene sin problemas. Verificación de #7: 219 pruebas Rust, 94 de
 interop C#, 13 de interfaz; las pruebas nunca escriben en el perfil real (`MEMRESCUE_SETTINGS_DIR`).
 
-## Siguiente tarea (no se avanza a M2)
+## Etapa 7 · Cierre de M1 (2026-10-18)
 
-1. Validación de cierre de M1. Variantes de contenedor pendientes: #8 (diferenciales VHD/VHDX), #9 (VMDK streamOptimized), #10 (registro VHDX en memoria) y #11 (VMDK
-   multiextensión y flat).
+**Revisión de robustez** (solo lectura, límites de memoria y ficheros corruptos). Encontró dos fallos
+reales, corregidos con pruebas de regresión, y varios puntos de endurecimiento:
+
+| Issue | PR | Resultado |
+|---|---|---|
+| #38 | #43 | Abrir una tabla de 256 MiB con entradas duplicadas llegaba a 2,8 GiB (y una falta de memoria abortaba el proceso). Ahora el pico es de 385 a 529 MiB según el formato, con presupuesto por apertura (`open_memory_budget`) y `try_reserve_exact`: superarlo devuelve un error |
+| #39 | #41 | Un mapa de bits de VHD ilegible abortaba toda la verificación; ahora ese bloque se lee como datos y, si falla, queda ilegible con relleno, nunca disperso. Con `Fail` (hashes) el error sigue abortando |
+| #40 | #42 | Enumeración O(1) de tramos no fiables en la FFI, reintentos acotados a 100 también en Rust, repetidos de imágenes divididas con `HashSet`, `overflow-checks` en Release y pruebas de corrupción: 900 inversiones aleatorias de bytes (VHDX, VMDK, divididas), 159 truncados en fronteras de estructura y ficheros acortados tras abrir, sin pánicos, bloqueos ni datos de estructuras rechazadas |
+
+**Validación de cierre** sobre `main` (a30a4ae):
+
+| Comprobación | Resultado |
+|---|---|
+| `scripts\test.ps1` (Debug) | 14/14 pasos |
+| Pruebas Rust | 244 en Debug y 244 en Release (con comprobación de desbordamiento) |
+| Comparación independiente con qemu-img 11.1.2 | 11/11 |
+| Interop C# / UI Automation | 94/94 y 13/13 |
+| `MemRescue.exe` Release publicado (`scripts\build.ps1 -Configuration Release -Publish`) | Autodiagnóstico correcto con GPT 512 B y GPT 4Kn: SHA-256 igual al manifiesto, 0 sectores malos, imagen sin modificar |
+| Higiene (rutas, secretos, U+2014) | 0 problemas |
+
+**Decisión del propietario**: M1 cerrado; las variantes adicionales de contenedor (#8 a #11) pasan al
+milestone M1.5 y no bloquean M2.
+
+**Limitaciones que quedan**: el modo tolerante de VHDX solo se prueba con imágenes sintéticas; no se lee el
+GD redundante de VMDK; los sectores saltados solo aparecen en lecturas con salto (CLI y API); los colores y
+el alto contraste no tienen prueba automática; sin hardware real hasta M9.
+
+## Siguiente tarea
+
+1. M2 según `PLAN_M2.md`: #14 (corpus de tablas dañadas) y #16 (investigación INV-05b) en paralelo; después
+   #12 (MBR/EBR) y #13 (GPT) sobre el crate común `mr-part`; por último #15 (búsqueda exprés).
