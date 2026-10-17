@@ -204,7 +204,10 @@ Actions de solo lectura; escaneo de secretos con bloqueo en el push. 30 issues (
 tipo, prioridad y área y milestones M1 a M12. Decisión del propietario sobre contenedores con tablas de
 asignación dañadas (issue #4): modo estricto por defecto y modo tolerante solo por activación explícita.
 
-## Siguiente tarea (pendiente de revisión del propietario; no se avanza a M2)
+**Integración continua** (issue #1, PR #31): workflow de GitHub Actions con 4 jobs (higiene del
+repositorio, Rust, .NET e interop, lectores contra qemu-img), verificados en GitHub Actions y exigidos como
+checks obligatorios de `main`; pruebas de interfaz a demanda; `CONTRIBUTING.md` con el flujo de trabajo.
 
-1. Integrar la CI (#1) y exigir sus checks en `main` cuando hayan pasado en GitHub Actions.
-2. Completar M1 según los issues del milestone M1 (prioridad: #3, #4, #5, #6).
+## Siguiente tarea (no se avanza a M2)
+
+1. Completar M1 según los issues del milestone M1 (prioridad: #3, #4, #5, #6).
