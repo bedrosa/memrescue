@@ -5,7 +5,8 @@ Uso: python -I tools/fetch_qemu_img.py <directorio_destino>   (normalmente .tool
 
 Cadena de confianza (ver docs/HERRAMIENTAS_TERCEROS.md):
   1. Claves de firma de MSYS2 desde el repositorio oficial github.com/msys2/MSYS2-keyring (HTTPS),
-     fijado a un commit concreto; solo se aceptan las huellas de `msys2-trusted`.
+     fijado a un commit concreto y con el SHA-256 de cada fichero comprobado; solo se aceptan las
+     huellas de `msys2-trusted`.
   2. Base de datos del repositorio ucrt64 de MSYS2 (`ucrt64.db`) verificada con su firma GPG.
   3. Cada paquete: SHA-256 igual al de la base de datos firmada **y** firma GPG propia válida.
 Solo se extraen `qemu-img.exe`, las DLL y las licencias. No se ejecuta nada descargado; no se toca el
@@ -30,7 +31,13 @@ MIRROR = "https://repo.msys2.org/mingw/ucrt64/"
 # Alternativas si el repositorio principal no responde. La integridad no depende del espejo: todo se
 # verifica por firma GPG y por el SHA-256 de la base de datos firmada.
 FALLBACK_MIRRORS = ["https://mirror.msys2.org/mingw/ucrt64/"]
-KEYRING_COMMIT = "master"
+# Commit del repositorio de claves y SHA-256 esperados de sus ficheros. Para actualizarlos, revisar el
+# cambio en github.com/msys2/MSYS2-keyring y anotar el nuevo commit en docs/HERRAMIENTAS_TERCEROS.md.
+KEYRING_COMMIT = "5d249077a0cfeec9dbf51515e5e01da413d28859"
+KEYRING_SHA256 = {
+    "msys2.gpg": "1257d4ccc536c53333445a618039af4c3ea3f56b96601de9af89151ea529c19a",
+    "msys2-trusted": "a8d39040a7b6cc14bf4394b5d9c838443925c32b00a7d34e8729c972392dca04",
+}
 KEYRING_BASE = f"https://raw.githubusercontent.com/msys2/MSYS2-keyring/{KEYRING_COMMIT}/"
 GPG = r"C:\Program Files\Git\usr\bin\gpg.exe"
 UA = {"User-Agent": "MemRescue-dev-tools/1.0"}
@@ -170,6 +177,15 @@ def resolve(pkgs: dict[str, dict], root: str) -> list[dict]:
     return sorted(seen.values(), key=lambda p: p["NAME"][0])
 
 
+def fetch_keyring_file(name: str) -> bytes:
+    """Descarga un fichero del repositorio de claves fijado y exige su SHA-256 esperado."""
+    data = fetch(KEYRING_BASE + name)
+    got = sha256(data)
+    if got != KEYRING_SHA256[name]:
+        raise SystemExit(f"{name}: SHA-256 {got} distinto del esperado {KEYRING_SHA256[name]}")
+    return data
+
+
 def main(dest: str) -> int:
     sys.stdout.reconfigure(encoding="utf-8")
     out = Path(dest).resolve()
@@ -179,8 +195,8 @@ def main(dest: str) -> int:
         d.mkdir(parents=True, exist_ok=True)
 
     print("1/4 Claves de MSYS2 (github.com/msys2/MSYS2-keyring)")
-    keyring = fetch(KEYRING_BASE + "msys2.gpg")
-    trusted_raw = fetch(KEYRING_BASE + "msys2-trusted").decode()
+    keyring = fetch_keyring_file("msys2.gpg")
+    trusted_raw = fetch_keyring_file("msys2-trusted").decode()
     trusted = {l.split(":")[0].strip() for l in trusted_raw.splitlines() if l.strip() and not l.startswith("#")}
     (dl / "msys2.gpg").write_bytes(keyring)
     r = gpg(home, "--import", msys(dl / "msys2.gpg"))
@@ -233,6 +249,7 @@ def main(dest: str) -> int:
         "root_package": ROOT_PACKAGE,
         "mirror": MIRROR,
         "keyring_source": KEYRING_BASE,
+        "keyring_commit": KEYRING_COMMIT,
         "keyring_sha256": sha256(keyring),
         "trusted_fingerprints": sorted(trusted),
         "db_sha256": sha256(db),
