@@ -19,9 +19,12 @@ Estas herramientas **no** forman parte de MemRescue, no se distribuyen con él y
 
 ### Verificación de procedencia e integridad (`tools/fetch_qemu_img.py`)
 
-1. **Claves**: `msys2.gpg` y `msys2-trusted` desde `github.com/msys2/MSYS2-keyring` (HTTPS); `msys2-trusted`
-   contiene 5 claves maestras con confianza total. SHA-256 de `msys2.gpg`:
-   `1257d4ccc536c53333445a618039af4c3ea3f56b96601de9af89151ea529c19a`.
+1. **Claves**: `msys2.gpg` y `msys2-trusted` desde `github.com/msys2/MSYS2-keyring` (HTTPS), fijados al
+   commit `5d249077a0cfeec9dbf51515e5e01da413d28859` (2026-08-14, último que modifica `msys2.gpg`) y con
+   SHA-256 comprobado antes de usarlos: `msys2.gpg` =
+   `1257d4ccc536c53333445a618039af4c3ea3f56b96601de9af89151ea529c19a`, `msys2-trusted` =
+   `a8d39040a7b6cc14bf4394b5d9c838443925c32b00a7d34e8729c972392dca04`. Si no coinciden, el script se
+   detiene. `msys2-trusted` contiene 5 claves maestras con confianza total.
 2. **Base de datos del repositorio** (`ucrt64.db`) verificada con su firma GPG. La firmó la clave
    `5F944B027F7FE2091985AA2EFA11531AA0AA7F57` (Christoph Reiter, *MSYS2 development key*), que **no** es
    maestra pero está certificada con firmas válidas por **3 claves maestras distintas**
