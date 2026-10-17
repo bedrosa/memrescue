@@ -116,10 +116,19 @@ error, con caracteres de control escapados y truncados a 260 caracteres.
 
 ## Memoria y rendimiento
 
-- El GD se carga entero al abrir (≤ 256 MiB y ≤ tamaño del fichero).
+- El GD se carga entero al abrir (≤ 256 MiB y ≤ tamaño del fichero), leído por trozos de 1 MiB; tras
+  validarlo se reutiliza como índice de las GT, sin copia.
 - Las GT presentes se cargan y validan al abrir (2 KiB cada una, en total ≤ `MAX_TABLE_BYTES`; si no,
-  `UnsupportedFeature`): un disco de 2 TiB con granos de 64 KiB ocupa 128 MiB. La detección de solapes
-  usa además 8 bytes por grano asignado durante la apertura.
+  `UnsupportedFeature`): un disco de 2 TiB con granos de 64 KiB ocupa 128 MiB.
+- Memoria de trabajo de la apertura ≤ `open_memory_budget(t)` por tabla (17/8 × `t` + 64 KiB, ADR-020,
+  addendum), con `t` = bytes del GD y de las GT presentes: como mucho unos 1088 MiB con ambos al
+  límite. La detección de solapes usa una lista de índices `u32` (entradas del GD; para los granos,
+  su posición en las GT cargadas) y el modo tolerante un bit por entrada. Reservas con
+  `try_reserve_exact`; un fallo o un exceso es `UnsupportedFeature`, nunca un aborto. Picos medidos
+  con entradas duplicadas: GD al límite (todas las entradas en la misma GT) 512 / 520 MiB
+  (estricto / tolerante; antes 2,5 GiB); GT al límite (131 072 GT, todos los granos en el mismo
+  sector) 521 / 529 MiB (antes 2,5 GiB). En modo estricto la apertura falla en la primera entrada
+  inválida o en el primer solape encontrado.
 - `allocation()` salta de golpe los tramos de 512 granos cuya GT no existe, así que un disco
   enorme casi vacío se describe en pocas iteraciones.
 

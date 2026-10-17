@@ -297,8 +297,38 @@ fiables)» («granos» en VMDK). El modo estricto ahora detecta también solapes
 (antes no se comprobaban) y, en VMDK, valida todas las GT y sus granos al abrir (antes los granos se
 validaban al leerlos): una imagen con esos daños se rechaza en la apertura. Las imágenes válidas no
 cambian (pruebas contra qemu-img). Memoria: VMDK guarda las GT presentes (≤ `MAX_TABLE_BYTES`); la
-detección de solapes usa 8 bytes por entrada asignada durante la apertura. Detalle por formato en
-`formatos/vhd.md`, `formatos/vhdx.md` y `formatos/vmdk.md`.
+memoria de trabajo de la apertura está acotada por el presupuesto del addendum siguiente. Detalle por
+formato en `formatos/vhd.md`, `formatos/vhdx.md` y `formatos/vmdk.md`.
+
+**Addendum (issue #38): presupuesto de memoria por apertura.** Con la BAT de un VHD al límite
+(256 MiB, bloques de 512 B, 67 108 864 entradas) y todas las entradas en el mismo bloque, la apertura
+llegaba a unos 2,8 GiB en ambos modos (VHDX 1,4 GiB, VMDK 2,5 GiB), porque la detección de solapes y el
+registro de daños guardaban varias copias por entrada; un fallo de asignación abortaba el proceso (no
+lo capturan los guardas de pánicos de la FFI ni de las tareas). Se decide:
+
+- **Presupuesto**: la memoria de trabajo proporcional a las tablas que reserva una apertura no pasa de
+  `mr_image::open_memory_budget(t)` = 17/8 × `t` + 64 KiB (`OPEN_MEMORY_FIXED_BYTES`) por tabla, con
+  `t` = bytes de tablas de asignación leídos del fichero (BAT; en VMDK, GD y GT presentes). Desglose:
+  tabla decodificada que conserva la imagen (≤ 1 × `t`), lista de candidatos que se ordena para la
+  detección de solapes (índices `u32`, ≤ 1 × `t`), registro de daños (1 bit por entrada, ≤ `t`/32) y
+  estructuras menores (zonas e índice de las GT en VMDK). Con `MAX_TABLE_BYTES` = 256 MiB: como mucho
+  unos 544 MiB en VHD y VHDX y unos 1088 MiB en VMDK (GD y GT al límite a la vez).
+- **Cumplimiento**: cada una de esas reservas pasa por un contador (`budget.rs`) que rechaza superar el
+  presupuesto y reserva con `try_reserve_exact`; tanto el exceso como un fallo de asignación se
+  informan con `UnsupportedFeature` y un mensaje claro, nunca abortan.
+- **Sin copias**: las tablas en bruto se leen por trozos de 1 MiB y se decodifican sobre la marcha;
+  la detección de solapes procesa los grupos en flujo (solo guarda el primer elemento de cada grupo
+  hasta que llega el segundo y entrega cada elemento una vez); `Damage` es un mapa de bits con
+  recuento en modo tolerante y no guarda nada en modo estricto. En VMDK el GD se reutiliza como índice
+  de las GT y los granos se identifican por su posición en las GT cargadas.
+- **Estricto falla pronto**: la apertura estricta termina en la primera entrada inválida (fuera del
+  fichero o estado inválido, en orden de índice) o en el primer solape que encuentra el recorrido (en
+  orden de desplazamiento en el fichero), sin seguir validando. El tipo de error (`Corrupt`) no
+  cambia; si hay varios daños, el que se nombra en el mensaje puede ser otro que antes.
+
+Pico medido (prueba `core/mr-ffi/tests/table_memory.rs`, tablas al límite y entradas duplicadas,
+estricto / tolerante): VHD 512 / 520 MiB (antes 2816), VHDX 385 / 389 MiB (antes 1409), VMDK con GD
+al límite 512 / 520 MiB (antes 2560), VMDK con GT al límite 521 / 529 MiB (antes 2575).
 
 ---
 

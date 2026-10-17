@@ -25,7 +25,8 @@
 //!   GD al final), `COWD` (ESX antiguo), versiones e indicadores desconocidos y descriptores de
 //!   texto separados (monolithicFlat, twoGbMaxExtent*, vmfs…).
 
-use crate::tolerant::{self, Damage, Zone};
+use crate::budget::{Budget, TABLE_CHUNK};
+use crate::tolerant::{self, Damage, Hit, Zone};
 use crate::MAX_TABLE_BYTES;
 use mr_io::{Allocation, AllocationRun, BlockDevice, IoError, Result};
 use std::fs::File;
@@ -373,15 +374,6 @@ fn le_u64(b: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(a)
 }
 
-/// Decodifica una tabla de entradas `u32` little-endian.
-fn le_u32_table(raw: &[u8]) -> Vec<u32> {
-    raw.as_chunks::<4>()
-        .0
-        .iter()
-        .map(|c| u32::from_le_bytes(*c))
-        .collect()
-}
-
 impl SparseHeader {
     /// `b` mide `HEADER_LEN` bytes y empieza por `KDMV`.
     fn parse(b: &[u8; HEADER_LEN]) -> Self {
@@ -585,7 +577,9 @@ impl VmdkImage {
         if header.gd_offset == 0 && gd_entries > 0 {
             return Err(corrupt("gdOffset = 0"));
         }
-        let mut raw_gd = Vec::new();
+        let mut budget = Budget::new(FORMAT);
+        budget.add_tables(gd_bytes);
+        let mut gd: Vec<u32> = budget.vec(gd_entries, "directorio de granos")?;
         let mut zones = vec![
             Zone::fixed(0, HEADER_LEN as u64),
             Zone::fixed(desc_off, desc_bytes),
@@ -598,15 +592,36 @@ impl VmdkImage {
                     "el descriptor y el directorio de granos se solapan",
                 ));
             }
-            let mut raw = vec![0u8; gd_bytes as usize];
-            read_exact_at(&file, gd_off, &mut raw)?;
-            raw_gd = le_u32_table(&raw);
+            // Por trozos: el GD en bruto nunca se guarda entero.
+            let mut buf = vec![0u8; TABLE_CHUNK.min(gd_bytes as usize)];
+            let mut pos = 0u64;
+            while pos < gd_bytes {
+                let len = (gd_bytes - pos).min(buf.len() as u64) as usize;
+                let chunk = &mut buf[..len];
+                read_exact_at(&file, gd_off + pos, chunk)?;
+                gd.extend(
+                    chunk
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|c| u32::from_le_bytes(*c)),
+                );
+                pos += len as u64;
+            }
             zones.push(Zone::fixed(gd_off, gd_bytes));
         }
         let size = header.capacity * SECTOR;
         let grain_span = |g: u64| -> u64 { grain_bytes.min(size - g * grain_bytes) };
         let (gt_slot, gtes, discarded) = Self::load_tables(
-            &file, file_len, &header, &raw_gd, grains, grain_span, &zones, tolerant,
+            &file,
+            file_len,
+            &header,
+            gd,
+            grains,
+            grain_span,
+            &zones,
+            tolerant,
+            &mut budget,
         )?;
 
         Ok(Self {
@@ -623,61 +638,81 @@ impl VmdkImage {
         })
     }
 
-    /// Valida las GT del GD principal y sus granos, y devuelve `(gt_slot, gtes, descartados)`.
+    /// Valida las GT del GD principal `gd` y sus granos, y devuelve `(gt_slot, gtes, descartados)`.
+    /// `gd` se reutiliza como `gt_slot` (cada entrada se lee antes de sobrescribirla).
     ///
     /// Correspondencia inequívoca: cada GT (2 KiB) y cada grano (su parte útil) quedan enteros dentro
     /// del fichero y no solapan la cabecera, el descriptor, el GD, otra GT ni otro grano. Si un grano
-    /// solapa una GT se descartan los dos (y con la GT, todos sus granos).
+    /// solapa una GT se descartan los dos (y con la GT, todos sus granos). En modo estricto la
+    /// apertura falla en la primera entrada inválida.
     #[allow(clippy::too_many_arguments)]
     fn load_tables(
         file: &File,
         file_len: u64,
         header: &SparseHeader,
-        raw_gd: &[u32],
+        gd: Vec<u32>,
         grains: u64,
         grain_span: impl Fn(u64) -> u64,
         zones: &[Zone],
         tolerant: bool,
+        budget: &mut Budget,
     ) -> Result<(Vec<u32>, Vec<u32>, u64)> {
-        // 1) Tablas de granos.
-        let mut gt_damage = Damage::default();
-        let mut candidates = Vec::new();
-        for (i, &gt) in raw_gd.iter().enumerate() {
+        // `[sector × 512, + bytes)` dentro del fichero (sin construir el mensaje de error).
+        let fits = |sector: u32, bytes: u64| {
+            (u64::from(sector) * SECTOR)
+                .checked_add(bytes)
+                .is_some_and(|end| end <= file_len)
+        };
+
+        // 1) Tablas de granos. Índices `u32`: el GD tiene como mucho MAX_TABLE_BYTES / 4 = 2^26
+        //    entradas.
+        let gd_entries = gd.len() as u64;
+        let mut gt_damage = Damage::new(FORMAT, gd_entries, tolerant, budget)?;
+        let mut in_file = 0u64;
+        for (i, &gt) in gd.iter().enumerate() {
             if gt == 0 {
                 continue;
             }
-            match Self::checked_region(
-                &format!("tabla de granos {i}"),
-                u64::from(gt),
-                GT_BYTES,
-                file_len,
-            ) {
-                Ok(_) => candidates.push(i as u64),
-                Err(e) => gt_damage.add(i as u64, || detail(e)),
+            if fits(gt, GT_BYTES) {
+                in_file += 1;
+            } else {
+                let e = Self::checked_region(
+                    &format!("tabla de granos {i}"),
+                    u64::from(gt),
+                    GT_BYTES,
+                    file_len,
+                )
+                .err()
+                .map(detail)
+                .unwrap_or_default();
+                gt_damage.add(i as u64, || e)?;
             }
         }
-        let gt_span = |i: u64| -> (u64, u64) {
-            let start = u64::from(raw_gd[i as usize]) * SECTOR;
+        let mut candidates: Vec<u32> = budget.vec(in_file, "lista de tablas de granos")?;
+        candidates.extend(
+            gd.iter()
+                .enumerate()
+                .filter(|&(_, &gt)| gt != 0 && fits(gt, GT_BYTES))
+                .map(|(i, _)| i as u32),
+        );
+        let gt_span = |i: u32| -> (u64, u64) {
+            let start = u64::from(gd[i as usize]) * SECTOR;
             (start, start + GT_BYTES)
         };
-        for i in tolerant::overlaps(candidates, gt_span, zones).entries {
-            gt_damage.add(i, || {
+        tolerant::overlaps(&mut candidates, gt_span, &mut zones.to_vec(), |hit| {
+            match hit {
+            Hit::Entry(i) => gt_damage.add(u64::from(i), || {
                 format!("la tabla de granos {i} solapa la cabecera, el descriptor, el directorio u otra tabla")
-            });
+            }),
+            Hit::Tag(_) => Ok(()),
         }
-        if !gt_damage.is_empty() && !tolerant {
-            return Err(corrupt(gt_damage.first().unwrap_or_default()));
-        }
-        let bad_gts = gt_damage.into_sorted();
+        })?;
+        budget.release(candidates);
 
-        let mut gt_slot = vec![GT_ABSENT; raw_gd.len()];
-        for &i in &bad_gts {
-            gt_slot[i as usize] = GT_DISCARDED;
-        }
-        let present = raw_gd
+        let present = gd
             .iter()
-            .zip(&gt_slot)
-            .filter(|(&gt, &slot)| gt != 0 && slot != GT_DISCARDED)
+            .enumerate()
+            .filter(|&(i, &gt)| gt != 0 && !gt_damage.contains(i as u64))
             .count() as u64;
         let gt_table_bytes = present * GT_BYTES;
         if gt_table_bytes > MAX_TABLE_BYTES {
@@ -685,85 +720,122 @@ impl VmdkImage {
                 "las tablas de granos ocupan {gt_table_bytes} bytes (límite de memoria {MAX_TABLE_BYTES})"
             )));
         }
+        budget.add_tables(gt_table_bytes);
 
-        // 2) Entradas de las GT válidas.
-        let mut gtes: Vec<u32> = Vec::with_capacity((present * GTES_PER_GT) as usize);
-        let mut grain_damage = Damage::default();
-        let mut candidates = Vec::new();
-        let mut gt_zones: Vec<Zone> = zones.to_vec();
+        // 2) Entradas de las GT válidas. Las posiciones en `gtes` (< 2^26, porque las GT ocupan
+        //    como mucho MAX_TABLE_BYTES) identifican los granos en el registro de daños y en la
+        //    detección de solapes; `slot_gd` da el índice del GD de cada GT presente.
+        let mut gtes: Vec<u32> = budget.vec(present * GTES_PER_GT, "tablas de granos")?;
+        let mut slot_gd: Vec<u32> = budget.vec(present, "índice de tablas de granos")?;
+        let mut gt_zones: Vec<Zone> = budget.vec(
+            zones.len() as u64 + present,
+            "zonas de las tablas de granos",
+        )?;
+        gt_zones.extend_from_slice(zones);
+        let mut grain_damage = Damage::new(FORMAT, present * GTES_PER_GT, tolerant, budget)?;
+        let mut allocated = 0u64;
+        let mut gt_slot = gd;
         let mut raw = [0u8; GT_BYTES as usize];
-        for (i, &gt) in raw_gd.iter().enumerate() {
-            if gt == 0 || gt_slot[i] == GT_DISCARDED {
+        for (i, slot) in gt_slot.iter_mut().enumerate() {
+            let gt = *slot;
+            if gt == 0 {
+                *slot = GT_ABSENT;
+                continue;
+            }
+            if gt_damage.contains(i as u64) {
+                *slot = GT_DISCARDED;
                 continue;
             }
             let start = u64::from(gt) * SECTOR;
             read_exact_at(file, start, &mut raw)?;
-            gt_slot[i] = (gtes.len() as u64 / GTES_PER_GT) as u32;
+            *slot = slot_gd.len() as u32;
+            slot_gd.push(i as u32);
             gt_zones.push(Zone {
                 start,
                 end: start + GT_BYTES,
                 tag: Some(i as u64),
             });
-            for (j, &entry) in le_u32_table(&raw).iter().enumerate() {
+            for (j, c) in raw.as_chunks::<4>().0.iter().enumerate() {
+                let entry = u32::from_le_bytes(*c);
                 let g = i as u64 * GTES_PER_GT + j as u64;
+                let p = gtes.len() as u64;
                 let value = if g >= grains || entry == 0 {
                     0
                 } else if entry == GTE_ZEROED {
                     if header.flags & FLAG_ZEROED_GTE != 0 {
                         0
                     } else {
-                        grain_damage.add(g, || {
+                        grain_damage.add(p, || {
                             format!(
                                 "grano {g} apunta al sector 1 sin el indicador de granos a cero"
                             )
-                        });
+                        })?;
                         GRAIN_DISCARDED
                     }
                 } else {
-                    match Self::checked_region(
-                        &format!("grano {g}"),
-                        u64::from(entry),
-                        grain_span(g),
-                        file_len,
-                    ) {
-                        Ok(_) => candidates.push(g),
-                        Err(e) => grain_damage.add(g, || detail(e)),
+                    if fits(entry, grain_span(g)) {
+                        allocated += 1;
+                    } else {
+                        let e = Self::checked_region(
+                            &format!("grano {g}"),
+                            u64::from(entry),
+                            grain_span(g),
+                            file_len,
+                        )
+                        .err()
+                        .map(detail)
+                        .unwrap_or_default();
+                        grain_damage.add(p, || e)?;
                     }
                     entry
                 };
                 gtes.push(value);
             }
         }
+        gt_damage.release(budget);
 
         // 3) Solapes de los granos entre sí y con las estructuras y las GT.
-        let pos = |g: u64| -> usize {
-            (u64::from(gt_slot[(g / GTES_PER_GT) as usize]) * GTES_PER_GT + g % GTES_PER_GT)
-                as usize
+        let grain_of = |p: u32| -> u64 {
+            u64::from(slot_gd[(u64::from(p) / GTES_PER_GT) as usize]) * GTES_PER_GT
+                + u64::from(p) % GTES_PER_GT
         };
-        let span = |g: u64| -> (u64, u64) {
-            let start = u64::from(gtes[pos(g)]) * SECTOR;
-            (start, start + grain_span(g))
+        // Candidatos: granos con ubicación (> GRAIN_DISCARDED) que no se han descartado ya.
+        let mut candidates: Vec<u32> = budget.vec(allocated, "lista de granos asignados")?;
+        candidates.extend(
+            gtes.iter()
+                .enumerate()
+                .filter(|&(p, &v)| v > GRAIN_DISCARDED && !grain_damage.contains(p as u64))
+                .map(|(p, _)| p as u32),
+        );
+        let span = |p: u32| -> (u64, u64) {
+            let start = u64::from(gtes[p as usize]) * SECTOR;
+            (start, start + grain_span(grain_of(p)))
         };
-        let found = tolerant::overlaps(candidates, span, &gt_zones);
-        for &g in &found.entries {
-            grain_damage.add(g, || {
-                format!("el grano {g} solapa las estructuras del contenedor, una tabla de granos u otro grano")
-            });
+        // GT solapadas por un grano: como mucho una por GT presente.
+        let mut bad_gts: Vec<u32> = Vec::new();
+        tolerant::overlaps(&mut candidates, span, &mut gt_zones, |hit| match hit {
+            Hit::Entry(p) => {
+                let g = grain_of(p);
+                grain_damage.add(u64::from(p), || {
+                    format!("el grano {g} solapa las estructuras del contenedor, una tabla de granos u otro grano")
+                })
+            }
+            Hit::Tag(i) => {
+                if !tolerant {
+                    return Err(corrupt(format!(
+                        "la tabla de granos {i} se solapa con un grano"
+                    )));
+                }
+                bad_gts.push(i as u32);
+                Ok(())
+            }
+        })?;
+        budget.release(candidates);
+        budget.release(gt_zones);
+        for p in grain_damage.iter() {
+            gtes[p as usize] = GRAIN_DISCARDED;
         }
-        for &i in &found.tags {
-            grain_damage.add(i * GTES_PER_GT, || {
-                format!("la tabla de granos {i} se solapa con un grano")
-            });
-        }
-        if !grain_damage.is_empty() && !tolerant {
-            return Err(corrupt(grain_damage.first().unwrap_or_default()));
-        }
-        let bad_grains = grain_damage.into_sorted();
-        for &g in &bad_grains {
-            let p = pos(g);
-            gtes[p] = GRAIN_DISCARDED;
-        }
-        for &i in &found.tags {
+        for &i in &bad_gts {
             gt_slot[i as usize] = GT_DISCARDED;
         }
 
@@ -775,10 +847,15 @@ impl VmdkImage {
             .filter(|(_, &s)| s == GT_DISCARDED)
             .map(|(i, _)| covered(i as u64))
             .sum();
-        discarded += bad_grains
+        discarded += grain_damage
             .iter()
-            .filter(|&&g| gt_slot[(g / GTES_PER_GT) as usize] != GT_DISCARDED)
+            .filter(|&p| {
+                let i = slot_gd[(p / GTES_PER_GT) as usize];
+                gt_slot[i as usize] != GT_DISCARDED
+            })
             .count() as u64;
+        grain_damage.release(budget);
+        budget.release(slot_gd);
         Ok((gt_slot, gtes, discarded))
     }
 
