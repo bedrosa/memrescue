@@ -20,7 +20,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import subprocess
 import sys
 
 SEED = "memrescue-ntfs-corpus-v1"
@@ -190,20 +189,15 @@ class Volume:
             "size": len(data), "sha256": sha256(data), "content": spec, "ads": [],
         }
 
-    def write_sparse(self, path: str, spec: dict, punch: list[tuple[int, int]] | None = None) -> None:
-        """Escribe solo los segmentos (saltando huecos con seek). Con `punch`, primero escribe el
-        fichero entero con un relleno, luego los segmentos y después perfora los tramos indicados."""
+    def write_sparse(self, path: str, spec: dict) -> None:
+        """Escribe solo los segmentos, saltando los huecos con seek, y fija el tamaño con truncate.
+        ntfs-3g no implementa fallocate (no se pueden perforar huecos): los huecos nacen sin escribir."""
         assert spec["kind"] == "segments"
         with open(self.host(path), "wb", buffering=0) as f:
-            if punch:
-                f.write(binary_bytes(f"{path}#relleno", spec["size"]))
             for seg in spec["segments"]:
                 f.seek(seg["offset"])
                 f.write(binary_bytes(seg["label"], seg["length"]))
             f.truncate(spec["size"])
-        for off, length in punch or []:
-            subprocess.run(["fallocate", "--punch-hole", "--keep-size", "--offset", str(off), "--length",
-                            str(length), self.host(path)], check=True)
         self.ops.append(f"sparse {path} ({spec['size']} B lógicos)")
         self._register(path, self._file_entry(path, spec, content(spec), "live"))
 
@@ -365,9 +359,10 @@ def scenario_sparse_ads(v: Volume) -> dict:
     v.write_sparse(p, {"kind": "segments", "size": 576 * k, "segments": [seg(p, 0, 64 * k), seg(p, 512 * k, 64 * k)]})
     p = "/disperso/hueco_final.bin"
     v.write_sparse(p, {"kind": "segments", "size": 1024 * k, "segments": [seg(p, 0, 64 * k)]})
-    p = "/disperso/perforado.bin"
-    v.write_sparse(p, {"kind": "segments", "size": 256 * k, "segments": [seg(p, 0, 64 * k), seg(p, 192 * k, 64 * k)]},
-                   punch=[(64 * k, 128 * k)])
+    p = "/disperso/varios_huecos.bin"
+    v.write_sparse(p, {"kind": "segments", "size": 1000 * k,
+                       "segments": [seg(p, 64 * k, 12 * k), seg(p, 256 * k, 4 * k), seg(p, 512 * k, 100 * k),
+                                    seg(p, 900 * k, 1000)]})
     p = "/disperso/solo_hueco.bin"
     v.write_sparse(p, {"kind": "segments", "size": 512 * k, "segments": []})
     p = "/flujos/con_flujos.txt"

@@ -45,7 +45,7 @@ SCENARIOS = {
     "ntfs_deleted": {"desc": "ntfs_basic con 5 ficheros y 1 directorio (con 5 ficheros) borrados sin sobrescribir"},
     "ntfs_overwritten": {"desc": "ntfs_basic, volumen lleno con /relleno.bin, 3 ficheros borrados cuyos clusters reutilizan dos ficheros nuevos y 2 borrados intactos"},
     "ntfs_fragmented": {"desc": "4 ficheros escritos a trozos de 8 KiB intercalados (fragmentados) y 2 contiguos de control"},
-    "ntfs_sparse_ads": {"desc": "Ficheros dispersos (hueco inicial, intermedio, final, perforado y solo hueco) y flujos alternativos en ficheros y en un directorio"},
+    "ntfs_sparse_ads": {"desc": "Ficheros dispersos (hueco inicial, intermedio, final, varios huecos y solo hueco) y flujos alternativos en ficheros y en un directorio"},
     "ntfs_damaged_boot": {"desc": "ntfs_basic con el sector de arranque principal sobrescrito; la copia del final está intacta", "base": "ntfs_basic"},
     "ntfs_damaged_mft": {"desc": "ntfs_basic con 4 registros MFT de ficheros sobrescritos", "base": "ntfs_basic"},
     "ntfs_damaged_mftmirr": {"desc": "ntfs_basic con los 4 registros de $MFTMirr sobrescritos", "base": "ntfs_basic"},
