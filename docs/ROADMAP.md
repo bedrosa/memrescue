@@ -89,14 +89,16 @@ confirmación explícita del usuario o descomprimir; hoy se rechazan con errores
 - Reproducción en memoria del registro pendiente de VHDX (#10).
 - VMDK multiextensión y flat con confirmación explícita (#11).
 
-## M2 · Particiones: **EN CURSO** (plan técnico en `PLAN_M2.md`)
+## M2 · Particiones: **TERMINADO 2026-10-18** (plan técnico en `PLAN_M2.md`)
+
+Cerrado por el propietario (`PROGRESO.md`, etapa 8). APM y la copia del particionado pasan a M2.5.
 
 - INV-05 (acotada) → MBR/EBR, GPT con copia y tolerancias, APM.
   - **MBR/EBR: hecho (#12)**: parser con confianza y anomalías tipadas, API, ABI 3 ampliada, CLI
     `partitions` / `--partition N` y pestaña «Particiones» en la interfaz (ADR-022).
   - **GPT con copia y tolerancias: hecho (#13)** e **integrado (#12)**: particiones GPT, copia de respaldo
     en uso y desplazamiento en API, ABI, CLI (`--apply-shift`) e interfaz (ADR-022, adenda).
-  - APM: #17 (opcional).
+  - APM: #17, en M2.5.
 - **Búsqueda exprés de particiones perdidas: hecha (#15)**: candidatos por niveles con presupuesto
   acotado, NTFS/FAT/exFAT con sus copias, tablas encontradas, hipótesis de desplazamiento, API, ABI 3
   ampliada, CLI `find-partitions` / `--found N` y acción en la pestaña «Particiones» (ADR-023).
@@ -104,7 +106,16 @@ confirmación explícita del usuario o descomprimir; hoy se rechazan con errores
   (`formatos/busqueda-particiones.md`).
 - **Paridad objetivo**: PT-01…PT-06, PT-10 (lectura/guardar).
 
-## M3 · NTFS lectura
+## M2.5 · Funciones adicionales de particiones
+
+Milestone propio para no retrasar NTFS y la recuperación.
+- Apple Partition Map (#17, PT-04).
+- Guardar y cargar una copia del particionado en formato propio (#18, PT-10).
+
+## M3 · NTFS lectura: **EN CURSO**
+
+- Corpus NTFS (#19) generado en un runner Linux desechable de GitHub Actions con mkntfs y ntfs-3g y
+  validado con The Sleuth Kit como oráculo independiente (decisión del propietario, 2026-10-18).
 
 - `mr-fs-ntfs`: boot, MFT, fixups, atributos, runs, índices, LZNT1, sparse, ADS, $LogFile (lectura).
 - Ficheros borrados (registros MFT no en uso, entradas INDX residuales).

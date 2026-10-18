@@ -251,7 +251,32 @@ milestone M1.5 y no bloquean M2.
 GD redundante de VMDK; los sectores saltados solo aparecen en lecturas con salto (CLI y API); los colores y
 el alto contraste no tienen prueba automática; sin hardware real hasta M9.
 
+## Etapa 8 · M2 Particiones (2026-10-18)
+
+| Issue | PR | Resultado |
+|---|---|---|
+| #16 | #46 | INV-05b en sala limpia (sin ejecutar ni analizar DMDE): algoritmo propio de candidatos por niveles con presupuesto acotado |
+| #14 | #48 | Corpus de 38 escenarios de tablas dañadas, desplazadas y borradas (esquema de manifiesto 2), validador independiente y 57 pruebas negativas que no dependen del hash |
+| #12 (base) | #47 | Crate `mr-part`: tipos comunes y `sector::read_trusted` (un sector ilegible nunca se interpreta) |
+| #13 | #49 | GPT con copia principal y de respaldo, CRC-32, 512 y 4096 B, imagen desplazada o recortada (informada, nunca aplicada en silencio) |
+| #12 | #50 | MBR/EBR con confianza y anomalías tipadas (ADR-022), GPT integrada, particiones en API, ABI 3 ampliada, CLI (`partitions`, `--partition`, `--apply-shift`) y pestaña «Particiones» |
+| #15 | #51 | Búsqueda exprés de particiones perdidas (ADR-023): NTFS, FAT12/16/32 y exFAT con sus copias, indicadores E/P/C/S/U/A, progreso y cancelación, solo bajo petición |
+
+**Verificación** sobre `main` (3e062b8): 331 pruebas Rust; `mr-part` contra el corpus 11/11; CLI contra el
+corpus 13/13; interop C# 249/249; UI Automation 17/17; higiene sin problemas. Los 38 manifiestos coinciden
+con exactitud (particiones, anomalías y 18 volúmenes encontrados). Un relleno que imita un arranque NTFS
+perfecto en un sector ilegible nunca produce un volumen. La búsqueda hace las mismas lecturas en un
+dispositivo virtual de 1 GiB que en uno de 2 TiB.
+
+**Decisiones del propietario**: M2 cerrado; #17 (APM) y #18 (copia del particionado) pasan a M2.5; el
+corpus NTFS de M3 se genera en un runner Linux desechable de GitHub Actions (mkntfs, ntfs-3g) y se valida con
+The Sleuth Kit.
+
+**Limitaciones que quedan**: la búsqueda exprés no encuentra volúmenes fuera de toda posición típica y sin
+copia localizable (escaneo completo, M6); los volúmenes sintéticos del corpus no tienen MFT; comparación
+manual con DMDE pendiente (opcional, ADR-002).
+
 ## Siguiente tarea
 
-1. M2 según `PLAN_M2.md`: #14 (corpus de tablas dañadas) y #16 (investigación INV-05b) en paralelo; después
-   #12 (MBR/EBR) y #13 (GPT) sobre el crate común `mr-part`; por último #15 (búsqueda exprés).
+1. M3 · NTFS lectura: #19 (corpus NTFS en GitHub Actions), después #20 (arranque y MFT con fixups), #21
+   (atributos y runs), #22 (índices y rutas) y #23 (ficheros borrados).
