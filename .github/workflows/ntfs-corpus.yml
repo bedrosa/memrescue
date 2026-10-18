@@ -8,7 +8,7 @@ name: NTFS corpus
 on:
   workflow_dispatch:
   push:
-    branches: ["feat/**", "fix/**"]
+    branches: ["main", "feat/**", "fix/**"]
     paths:
       - "tests/generators/ntfs/**"
       - "tests/generators/validate_ntfs_images.py"
