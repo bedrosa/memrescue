@@ -6,8 +6,11 @@
   Omite el autodiagnóstico que abre la ventana de MemRescue.exe.
 .PARAMETER SkipQemu
   Omite las pruebas cruzadas de formatos contra qemu-img (si falta qemu-img y no se omiten, el paso falla).
+.PARAMETER SkipNtfsCorpus
+  Omite las pruebas del lector NTFS contra el corpus NTFS (si falta el corpus y no se omiten, el paso
+  falla e indica cómo descargarlo con tools\fetch_ntfs_corpus.py).
 #>
-param([switch] $SkipGui, [switch] $SkipQemu)
+param([switch] $SkipGui, [switch] $SkipQemu, [switch] $SkipNtfsCorpus)
 . "$PSScriptRoot\env.ps1"
 Set-Location $Root
 
@@ -23,6 +26,7 @@ function Step([string] $name, [scriptblock] $body) {
 
 $gen = 'tests\corpus\generated'
 $refs = 'tests\corpus\manifests'
+$ntfsGen = 'tests\corpus\ntfs\generated'
 
 Step 'Repositorio: higiene (rutas, credenciales, material excluido, U+2014)' { & $Python -I -X utf8 tools\check_repo_hygiene.py }
 Step 'Rust: formato (cargo fmt --check)' { cargo fmt --all -- --check }
@@ -30,13 +34,27 @@ Step 'Rust: análisis (clippy -D warnings)' { cargo clippy --workspace --all-tar
 Step 'Rust: pruebas unitarias e integración' { cargo test --workspace }
 Step 'Corpus: generación determinista' { & $Python -I -X utf8 tests\generators\gen_partition_images.py $gen }
 # Huella de los orígenes tras generarlos: al final se comprueba que nada los ha modificado.
-$fingerprint = Get-ChildItem "$gen\*.img" | ForEach-Object {
+$fingerprint = @(Get-ChildItem "$gen\*.img") + @(Get-ChildItem "$ntfsGen\*.img" -ErrorAction SilentlyContinue) | ForEach-Object {
     [pscustomobject]@{ Path = $_.FullName; Hash = (Get-FileHash $_.FullName).Hash; Mtime = $_.LastWriteTimeUtc; Len = $_.Length }
 }
 Step 'Corpus: validación independiente vs manifiestos versionados' { & $Python -I -X utf8 tests\generators\validate_partition_images.py $gen $refs }
 Step 'Corpus: pruebas negativas del validador' { & $Python -I -X utf8 tests\generators\test_validator.py $gen $refs }
 Step 'Rust: pruebas cruzadas con el corpus' { cargo test -p memrescue-cli --test corpus -- --ignored }
 Step 'Rust: tablas de particiones y búsqueda de perdidas contra el corpus' { cargo test -p mr-part -- --ignored }
+if (-not $SkipNtfsCorpus) {
+    # Corpus NTFS (ADR-024): artefacto del workflow ntfs-corpus.yml, verificado con SHA-256 al descargarlo.
+    Step 'Rust: lector NTFS y ntfs-info contra el corpus NTFS' {
+        if (-not (Test-Path "$ntfsGen\ntfs_basic.img")) {
+            Write-Host "  Falta el corpus NTFS en $ntfsGen. Descárguelo con:"
+            Write-Host "    python -I -X utf8 tools\fetch_ntfs_corpus.py   (necesita gh autenticado)"
+            Write-Host "  o ejecute este script con -SkipNtfsCorpus."
+            $global:LASTEXITCODE = 1; return
+        }
+        cargo test -p mr-fs-ntfs --test ntfs_corpus -- --ignored
+        if ($LASTEXITCODE -ne 0) { return }
+        cargo test -p memrescue-cli --test ntfs_corpus -- --ignored
+    }
+}
 if (-not $SkipQemu) {
     # Referencia independiente: qemu-img portable verificado (docs/HERRAMIENTAS_TERCEROS.md). Solo se usa
     # sobre imágenes temporales creadas por las pruebas, con convert/info/map (nunca reparación).

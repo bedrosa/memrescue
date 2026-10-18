@@ -2,6 +2,9 @@
 //!
 //! Todas las operaciones son de solo lectura y solo aceptan ficheros de imagen.
 
+use mr_api::mr_fs_ntfs::{
+    BackupState, BootSource, NtfsVolume, RecordOutcome, RecordSource, RecordState,
+};
 use mr_api::mr_part::gpt::GptCopy;
 use mr_api::mr_part::search::{Check, FoundTableKind, FoundVolume, SearchStatus};
 use mr_api::mr_part::{Anomaly, Confidence, Origin, PartitionKind, Scheme, Severity};
@@ -29,6 +32,7 @@ USO:
   memrescue-cli split-list <imagen.001>
   memrescue-cli partitions <imagen> [ORIGEN] [--json]
   memrescue-cli find-partitions <imagen> [ORIGEN] [--json] [--max-reads N]
+  memrescue-cli ntfs-info <imagen> [ORIGEN] [--json]
   memrescue-cli sectors <imagen> --lba N [--count M] [--retries N] [--jump N] [--read-back]
                         [--bad-fill PATRÓN] [--skip-fill PATRÓN] [ORIGEN]
   memrescue-cli verify <imagen> [--retries N] [--jump N] [--read-back]
@@ -83,6 +87,15 @@ BÚSQUEDA DE PARTICIONES PERDIDAS (find-partitions):
   Indicadores: E entrada de tabla, P principal, C copia coherente, S estructuras básicas,
   U inicio declarado coherente, A alineación; + sí, x no o dañada, ? no verificable (sector
   ilegible: nunca se interpreta su relleno), o fuera de la imagen, - no aplica.
+
+VOLUMEN NTFS (ntfs-info):
+  Abre el volumen NTFS que empieza en el origen (imagen sin tabla, --partition N o --found N):
+  arranque usado (principal o copia del último sector) y estado de la copia, campos del arranque,
+  número de serie, etiqueta y versión, ubicación y runs de $MFT, comparación con $MFTMirr, y
+  recorre todos los registros de la MFT: en uso, no en uso (borrados o libres), vacíos, dañados
+  (firma, fixups o cabecera; nunca se usan) e ilegibles (sector no fiable: nunca se interpretan).
+  Las LBA de los sectores ilegibles son relativas al origen abierto (la partición, si la hay).
+  Código de salida 3 si algún registro tiene sectores ilegibles.
 
 Formatos: RAW, VHD (fijo/dinámico), VHDX (fijo/dinámico), VMDK monolithicSparse e imágenes
 divididas. Tamaños de sector habituales: 512, 1024, 2048, 4096.
@@ -895,6 +908,29 @@ fn run(args: Vec<String>) -> Result<(), (u8, String)> {
                 ));
             }
         }
+        "ntfs-info" => {
+            let p = one(&a)?;
+            let src = open_src(&a, &p).map_err(|e| op(&e))?;
+            let v = mr_api::ntfs_open(&src).map_err(|e| {
+                let hint = if a.partition.is_none() && a.found.is_none() && a.range.is_none() {
+                    " (si el origen es un disco con particiones, use --partition N)"
+                } else {
+                    ""
+                };
+                (1u8, format!("{e}{hint}"))
+            })?;
+            let sum = ntfs_summary(&v).map_err(|e| op(&e))?;
+            print_ntfs(&v, &sum, a.json);
+            if !sum.unreadable.is_empty() {
+                return Err((
+                    3,
+                    format!(
+                        "{} registros MFT con sectores ilegibles: no se interpretaron",
+                        sum.unreadable.len()
+                    ),
+                ));
+            }
+        }
         "image-info" => {
             let p = one(&a)?;
             let src = open_src(&a, &p).map_err(|e| op(&e))?;
@@ -969,6 +1005,291 @@ fn run(args: Vec<String>) -> Result<(), (u8, String)> {
         other => return Err(usage(&format!("comando desconocido: {other}"))),
     }
     Ok(())
+}
+
+/// Recorrido completo de la MFT para `ntfs-info`.
+struct NtfsSummary {
+    counts: std::collections::BTreeMap<RecordState, u64>,
+    directories: u64,
+    /// (registro, código, mensaje)
+    damaged: Vec<(u64, &'static str, String)>,
+    /// (registro, LBA del origen no fiables)
+    unreadable: Vec<(u64, Vec<u64>)>,
+}
+
+fn ntfs_summary(v: &NtfsVolume) -> Result<NtfsSummary, mr_api::mr_fs_ntfs::NtfsError> {
+    let mut s = NtfsSummary {
+        counts: RecordState::ALL.iter().map(|&k| (k, 0)).collect(),
+        directories: 0,
+        damaged: Vec::new(),
+        unreadable: Vec::new(),
+    };
+    for r in v.records() {
+        let (n, o) = r?;
+        *s.counts.entry(o.state()).or_default() += 1;
+        match &o {
+            RecordOutcome::Parsed(rec) if rec.in_use() && rec.is_directory() => s.directories += 1,
+            RecordOutcome::Damaged(d) => s.damaged.push((n, d.code(), d.to_string())),
+            RecordOutcome::Unreadable { lbas } => s.unreadable.push((n, lbas.clone())),
+            _ => {}
+        }
+    }
+    Ok(s)
+}
+
+fn backup_state_label(s: &BackupState) -> &'static str {
+    match s {
+        BackupState::Matches => "coincide con el principal",
+        BackupState::Differs => "DISTINTA del principal",
+        BackupState::Invalid(_) => "NO VÁLIDA",
+        BackupState::Unreadable { .. } => "ILEGIBLE",
+        BackupState::OutsideSource => "fuera del origen",
+        BackupState::InUse => "en uso (el principal no es válido)",
+    }
+}
+
+fn runs_json(runs: &[mr_api::mr_fs_ntfs::runs::Run]) -> String {
+    let v: Vec<String> = runs
+        .iter()
+        .map(|r| {
+            format!(
+                "[{},{},{}]",
+                r.vcn,
+                r.lcn.map_or_else(|| "null".into(), |l| l.to_string()),
+                r.length
+            )
+        })
+        .collect();
+    format!("[{}]", v.join(","))
+}
+
+/// JSON de `ntfs-info`.
+fn ntfs_json(v: &NtfsVolume, s: &NtfsSummary) -> String {
+    let i = v.info();
+    let b = &i.boot;
+    let (src, boot_off) = match i.boot_source {
+        BootSource::Primary => ("primary", 0),
+        BootSource::Backup { offset } => ("backup", offset),
+    };
+    let mism: Vec<String> = i
+        .mirror
+        .mismatches
+        .iter()
+        .map(|m| {
+            format!(
+                "{{\"record\":{},\"kind\":\"{}\",\"mft\":\"{}\",\"mirror\":\"{}\"}}",
+                m.record,
+                m.kind(),
+                m.mft.code(),
+                m.mirror.code()
+            )
+        })
+        .collect();
+    let counts: Vec<String> = s
+        .counts
+        .iter()
+        .map(|(k, n)| format!("\"{}\":{n}", k.code()))
+        .collect();
+    let damaged: Vec<String> = s
+        .damaged
+        .iter()
+        .map(|(n, c, m)| {
+            format!(
+                "{{\"record\":{n},\"code\":\"{c}\",\"message\":{}}}",
+                json_str(m)
+            )
+        })
+        .collect();
+    let unreadable: Vec<String> = s
+        .unreadable
+        .iter()
+        .map(|(n, l)| {
+            let l: Vec<String> = l.iter().map(u64::to_string).collect();
+            format!("{{\"record\":{n},\"lbas\":[{}]}}", l.join(","))
+        })
+        .collect();
+    let anomalies: Vec<String> = i
+        .anomalies
+        .iter()
+        .map(|a| {
+            format!(
+                "{{\"code\":\"{}\",\"severity\":\"{}\",\"record\":{},\"message\":{}}}",
+                a.code(),
+                severity_name(a.severity()),
+                opt_json(a.record()),
+                json_str(&a.to_string())
+            )
+        })
+        .collect();
+    let mut o = Vec::new();
+    o.push(format!("\"boot_source\":\"{src}\""));
+    o.push(format!("\"boot_offset\":{boot_off}"));
+    o.push(format!("\"primary_boot\":\"{}\"", i.primary_boot.code()));
+    o.push(format!(
+        "\"backup_boot\":{{\"offset\":{},\"state\":\"{}\"}}",
+        i.backup_boot.offset,
+        i.backup_boot.state.code()
+    ));
+    o.push(format!("\"serial\":\"{:016x}\"", b.serial));
+    o.push(format!(
+        "\"label\":{}",
+        i.label.as_deref().map_or_else(|| "null".into(), json_str)
+    ));
+    o.push(format!(
+        "\"version\":{}",
+        i.version
+            .map_or_else(|| "null".into(), |(a, b)| format!("\"{a}.{b}\""))
+    ));
+    o.push(format!("\"bytes_per_sector\":{}", b.bytes_per_sector));
+    o.push(format!("\"device_sector_size\":{}", i.device_sector_size));
+    o.push(format!("\"sectors_per_cluster\":{}", b.sectors_per_cluster));
+    o.push(format!("\"cluster_size\":{}", b.cluster_size));
+    o.push(format!("\"total_sectors\":{}", b.total_sectors));
+    o.push(format!("\"volume_bytes\":{}", b.volume_bytes()));
+    o.push(format!("\"mft_lcn\":{}", b.mft_lcn));
+    o.push(format!("\"mftmirr_lcn\":{}", b.mftmirr_lcn));
+    o.push(format!("\"mft_record_size\":{}", b.mft_record_size));
+    o.push(format!("\"index_record_size\":{}", b.index_record_size));
+    o.push(format!(
+        "\"mft\":{{\"record0_source\":\"{}\",\"runs\":{},\"allocated_size\":{},\"data_size\":{},\"initialized_size\":{},\"record_count\":{}}}",
+        match i.mft_record0_source {
+            RecordSource::Mft => "mft",
+            RecordSource::Mirror => "mirror",
+        },
+        runs_json(&i.mft.runs),
+        i.mft.allocated_size,
+        i.mft.data_size,
+        i.mft.initialized_size,
+        i.mft.record_count
+    ));
+    o.push(format!(
+        "\"mirror\":{{\"lcn\":{},\"records\":{},\"mismatches\":[{}]}}",
+        i.mirror.lcn,
+        i.mirror.records,
+        mism.join(",")
+    ));
+    o.push(format!(
+        "\"records\":{{{},\"directories\":{},\"damaged_records\":[{}],\"unreadable_records\":[{}]}}",
+        counts.join(","),
+        s.directories,
+        damaged.join(","),
+        unreadable.join(",")
+    ));
+    o.push(format!(
+        "\"confidence\":\"{}\"",
+        confidence_name(&i.confidence())
+    ));
+    o.push(format!("\"anomalies\":[{}]", anomalies.join(",")));
+    format!("{{{}}}", o.join(","))
+}
+
+/// Imprime la información del volumen NTFS (texto o JSON).
+fn print_ntfs(v: &NtfsVolume, s: &NtfsSummary, json: bool) {
+    if json {
+        println!("{}", ntfs_json(v, s));
+        return;
+    }
+    let i = v.info();
+    let b = &i.boot;
+    println!(
+        "Volumen NTFS (confianza: {})",
+        confidence_label(&i.confidence())
+    );
+    let used = match i.boot_source {
+        BootSource::Primary => "principal (sector 0)".to_string(),
+        BootSource::Backup { offset } => {
+            format!("COPIA en el byte {offset} (el principal no es válido)")
+        }
+    };
+    println!("  Arranque usado:       {used}");
+    println!(
+        "  Copia del arranque:   byte {}: {}",
+        i.backup_boot.offset,
+        backup_state_label(&i.backup_boot.state)
+    );
+    println!("  Número de serie:      {:016x}", b.serial);
+    println!(
+        "  Etiqueta:             {}",
+        i.label.as_deref().unwrap_or("(sin etiqueta)")
+    );
+    println!(
+        "  Versión NTFS:         {}",
+        i.version
+            .map_or_else(|| "(desconocida)".into(), |(a, b)| format!("{a}.{b}"))
+    );
+    println!(
+        "  Bytes por sector:     {} (origen: {})",
+        b.bytes_per_sector, i.device_sector_size
+    );
+    println!(
+        "  Clúster:              {} B ({} sectores)",
+        b.cluster_size, b.sectors_per_cluster
+    );
+    println!(
+        "  Total de sectores:    {} ({} bytes)",
+        b.total_sectors,
+        b.volume_bytes()
+    );
+    println!(
+        "  Registros:            MFT de {} B, índice de {} B",
+        b.mft_record_size, b.index_record_size
+    );
+    println!(
+        "  $MFT:                 LCN {}, {} registros (datos {} B, inicializados {} B, asignados {} B){}",
+        b.mft_lcn,
+        i.mft.record_count,
+        i.mft.data_size,
+        i.mft.initialized_size,
+        i.mft.allocated_size,
+        if i.mft_record0_source == RecordSource::Mirror {
+            ", localizada con la copia de $MFTMirr"
+        } else {
+            ""
+        }
+    );
+    for r in &i.mft.runs {
+        println!(
+            "    run: VCN {:<8} LCN {:<10} {} clústeres",
+            r.vcn,
+            r.lcn.map_or_else(|| "disperso".into(), |l| l.to_string()),
+            r.length
+        );
+    }
+    println!(
+        "  $MFTMirr:             LCN {}, {} registros comparados, {}",
+        i.mirror.lcn,
+        i.mirror.records,
+        if i.mirror.mismatches.is_empty() {
+            "coinciden".to_string()
+        } else {
+            format!("{} NO COINCIDEN", i.mirror.mismatches.len())
+        }
+    );
+    println!("Registros de la MFT:");
+    for (k, n) in &s.counts {
+        if *n > 0 {
+            println!("  {:<34} {n}", k.label());
+        }
+    }
+    println!("  {:<34} {}", "(directorios en uso)", s.directories);
+    const MAX_LISTED: usize = 50;
+    for (n, c, m) in s.damaged.iter().take(MAX_LISTED) {
+        println!("  DAÑADO   registro {n}: {c}: {m}");
+    }
+    for (n, l) in s.unreadable.iter().take(MAX_LISTED) {
+        println!("  ILEGIBLE registro {n}: sectores {l:?}");
+    }
+    let hidden =
+        s.damaged.len().saturating_sub(MAX_LISTED) + s.unreadable.len().saturating_sub(MAX_LISTED);
+    if hidden > 0 {
+        println!("  ... y {hidden} más (use --json para la lista completa)");
+    }
+    if !i.anomalies.is_empty() {
+        println!("Anomalías:");
+        for a in &i.anomalies {
+            println!("  [{}] {}: {a}", severity_label(a.severity()), a.code());
+        }
+    }
 }
 
 /// Opciones de la búsqueda según los argumentos (presupuesto de lecturas).

@@ -14,6 +14,8 @@
 //! - [`start_partition_search_task`]: búsqueda exprés de particiones perdidas (cancelable, con
 //!   progreso respecto al presupuesto de lecturas); [`open_found_volume`]: un volumen encontrado
 //!   como origen.
+//! - [`ntfs_open`]: detecta y abre el volumen NTFS de un origen (imagen completa, partición o
+//!   volumen encontrado): arranque usado, MFT, `$MFTMirr` y lectura de registros (#20).
 //! - [`start_hash_task`]: hashes del fichero completo en segundo plano.
 //! - [`start_verify_task`]: lectura completa tolerante a errores con mapa de validez por sector.
 
@@ -30,6 +32,7 @@ use task::{Task, TaskContext};
 use thiserror::Error;
 
 pub use mr_common::ENGINE_VERSION;
+pub use mr_fs_ntfs;
 pub use mr_image::OpenOptions;
 pub use mr_part;
 pub use mr_part::search::{SearchOptions, SearchResult};
@@ -41,6 +44,8 @@ pub enum ApiError {
     Io(#[from] mr_io::IoError),
     #[error(transparent)]
     Store(#[from] mr_store::StoreError),
+    #[error(transparent)]
+    Ntfs(#[from] mr_fs_ntfs::NtfsError),
     #[error("operación cancelada")]
     Cancelled,
     #[error("argumento no válido: {0}")]
@@ -290,6 +295,15 @@ pub fn open_partition(
         }
         d
     })
+}
+
+/// Detecta y abre el volumen NTFS que empieza en el primer byte de `src` (una imagen sin tabla,
+/// una partición de [`open_partition`] o un volumen de [`open_found_volume`]). Solo lectura. Si el
+/// arranque principal no es válido se usa su copia y se informa; los registros dañados o ilegibles
+/// se informan al leerlos. Error [`ApiError::Ntfs`] si no es NTFS o la MFT no se puede localizar.
+pub fn ntfs_open(src: &Source) -> Result<mr_fs_ntfs::NtfsVolume> {
+    let dev: Arc<dyn BlockDevice> = Arc::clone(src) as Arc<dyn BlockDevice>;
+    Ok(mr_fs_ntfs::NtfsVolume::open(dev)?)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1163,5 +1177,17 @@ mod tests {
         let mut hasher = MultiHasher::new(&[HashAlgorithm::Sha256]);
         hasher.update(&cd);
         assert_eq!(hasher.finish(), h.digests);
+    }
+
+    #[test]
+    fn ntfs_open_rejects_a_source_without_ntfs() {
+        let src = source_from_device(
+            Arc::new(MemDevice::new(vec![0u8; 64 * 512], 512).unwrap()),
+            "ceros",
+        );
+        match ntfs_open(&src) {
+            Err(ApiError::Ntfs(mr_fs_ntfs::NtfsError::NotNtfs { .. })) => {}
+            other => panic!("{other:?}"),
+        }
     }
 }

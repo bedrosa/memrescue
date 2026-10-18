@@ -381,6 +381,11 @@ fn api_error_code(e: &ApiError) -> i32 {
     match e {
         ApiError::Io(io) => io_error_code(io),
         ApiError::Store(_) => MR_ERR_STORE,
+        ApiError::Ntfs(mr_api::mr_fs_ntfs::NtfsError::Io(io)) => io_error_code(io),
+        ApiError::Ntfs(mr_api::mr_fs_ntfs::NtfsError::RecordOutOfRange { .. }) => {
+            MR_ERR_OUT_OF_RANGE
+        }
+        ApiError::Ntfs(_) => MR_ERR_CORRUPT,
         ApiError::Cancelled => MR_ERR_CANCELLED,
         ApiError::InvalidArgument(_) => MR_ERR_INVALID_ARGUMENT,
         ApiError::Spawn(_) => MR_ERR_IO,

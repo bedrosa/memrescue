@@ -585,3 +585,20 @@ fn found_option_opens_a_found_volume() {
         assert_eq!(o.status.code(), Some(2), "{args:?}");
     }
 }
+
+#[test]
+fn ntfs_info_rejects_a_source_without_ntfs() {
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("ceros.img");
+    std::fs::write(&img, vec![0u8; 64 * 1024]).unwrap();
+    let o = cli()
+        .args(["ntfs-info", img.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("no es un volumen NTFS"), "{err}");
+    assert!(err.contains("--partition"), "{err}");
+    let o = cli().args(["ntfs-info"]).output().unwrap();
+    assert_eq!(o.status.code(), Some(2));
+}

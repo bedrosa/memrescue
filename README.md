@@ -18,7 +18,7 @@ versionado); los scripts lo usan si existe.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\build.ps1     # compila motor, CLI, DLL y WPF
-powershell -ExecutionPolicy Bypass -File scripts\test.ps1      # 15 pasos de verificación
+powershell -ExecutionPolicy Bypass -File scripts\test.ps1      # 16 pasos de verificación (-SkipGui, -SkipQemu, -SkipNtfsCorpus)
 powershell -ExecutionPolicy Bypass -File scripts\build.ps1 -Configuration Release -Publish
 #   → artifacts\MemRescue\MemRescue.exe (autocontenido, no necesita .NET instalado)
 ```
@@ -31,7 +31,7 @@ Flujo de trabajo, ramas, issues, integración continua y normas del repositorio:
 
 | Carpeta | Contenido |
 |---|---|
-| `core/` | Motor Rust: `mr-common`, `mr-io`, `mr-store` (SQLite), `mr-api`, `mr-ffi` (`memrescue_core.dll`) |
+| `core/` | Motor Rust: `mr-common`, `mr-io`, `mr-image`, `mr-part`, `mr-fs-ntfs`, `mr-store` (SQLite), `mr-api`, `mr-ffi` (`memrescue_core.dll`) |
 | `cli/` | `memrescue-cli` |
 | `app/` | Solución .NET: `MemRescue` (WPF), `MemRescue.Core.Interop`, pruebas xUnit |
 | `tests/` | Generadores, manifiestos y corpus de imágenes sintéticas |
@@ -52,7 +52,7 @@ Flujo de trabajo, ramas, issues, integración continua y normas del repositorio:
 | [docs/DECISIONES.md](docs/DECISIONES.md) | ADR (tecnología, seguridad, sala limpia) |
 | [docs/PRUEBAS.md](docs/PRUEBAS.md) | Corpus, simulador, criterios de paridad, cómo ejecutar |
 | [docs/PRUEBAS_UI.md](docs/PRUEBAS_UI.md) | Pruebas automáticas de la interfaz (UI Automation) |
-| [docs/formatos/](docs/formatos/) | VHD, VHDX, VMDK, imágenes divididas y rangos, mapa de validez, GPT |
+| [docs/formatos/](docs/formatos/) | VHD, VHDX, VMDK, imágenes divididas y rangos, mapa de validez, GPT, búsqueda de particiones, NTFS |
 | [docs/HERRAMIENTAS_TERCEROS.md](docs/HERRAMIENTAS_TERCEROS.md) | qemu-img portable como referencia de pruebas (procedencia y licencias) |
 | [docs/PLAN_CORPUS_NTFS.md](docs/PLAN_CORPUS_NTFS.md) | Plan de imágenes NTFS con ficheros borrados |
 | [docs/investigacion/](docs/investigacion/README.md) | Ingeniería inversa de DMDE y manual oficial |

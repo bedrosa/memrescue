@@ -205,6 +205,7 @@ name = "mr-api"
 version = "0.2.0"
 dependencies = [
  "mr-common",
+ "mr-fs-ntfs",
  "mr-image",
  "mr-io",
  "mr-part",
@@ -234,6 +235,16 @@ dependencies = [
  "mr-image",
  "mr-io",
  "tempfile",
+]
+
+[[package]]
+name = "mr-fs-ntfs"
+version = "0.2.0"
+dependencies = [
+ "mr-common",
+ "mr-io",
+ "mr-part",
+ "thiserror",
 ]
 
 [[package]]

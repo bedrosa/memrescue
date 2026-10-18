@@ -93,12 +93,15 @@ cada imagen tenga el tamaño y el SHA-256 de su manifiesto versionado y solo ent
 (`gh workflow run ntfs-corpus.yml --ref <rama>`): como la generación es byte a byte, los SHA-256 no
 cambian.
 
-**Uso por las pruebas de M3 (#20 en adelante).** Las pruebas de corpus NTFS de Rust serán
-`#[ignore]` y leerán imágenes y manifiestos de esas rutas (variable `MR_NTFS_CORPUS` para otra
-ubicación); en CI, un paso los obtendrá con `tools/fetch_ntfs_corpus.py --branch main` (el token de
-Actions con `actions: read` basta) o se ejecutarán en un job que dependa del workflow del corpus. Mientras
-ninguna prueba los use, la CI obligatoria no descarga el corpus: el workflow `NTFS corpus` ya valida las
-imágenes con TSK, con el validador estructural y con sus pruebas negativas en cada cambio del generador.
+**Uso por las pruebas de M3 (#20 en adelante).** Las pruebas de corpus NTFS de Rust son
+`#[ignore]` y leen imágenes y manifiestos de esas rutas (variable `MR_NTFS_CORPUS` para otra
+ubicación de las imágenes). En la CI, el job `ntfs` de `ci.yml` (el único con `actions: read`, además de
+`contents: read`, y `GH_TOKEN` = el token de Actions) descarga el artefacto con
+`tools/fetch_ntfs_corpus.py` (última ejecución con éxito de `main` o, si no hay, de cualquier rama;
+el SHA-256 de cada imagen debe coincidir con su manifiesto versionado) y ejecuta
+`cargo test -p mr-fs-ntfs --test ntfs_corpus -- --ignored` y
+`cargo test -p memrescue-cli --test ntfs_corpus -- --ignored`. En local, `scripts/test.ps1` tiene el
+mismo paso (`-SkipNtfsCorpus` para omitirlo; sin corpus, el paso falla e indica cómo descargarlo).
 
 **Validación independiente.** Tres comprobaciones que no comparten código entre sí:
 `build_manifests.py` (TSK; además exige que lo que ve TSK coincida con la intención del generador: rutas,
@@ -169,7 +172,7 @@ Una fila de `PARIDAD_DMDE_PRO.md` pasa a **Paridad** solo si:
 ```powershell
 # Desde la raíz del repositorio (no requiere administrador)
 powershell -ExecutionPolicy Bypass -File scripts\build.ps1                 # compila todo (Debug)
-powershell -ExecutionPolicy Bypass -File scripts\test.ps1                  # 15 pasos (-SkipGui, -SkipQemu)
+powershell -ExecutionPolicy Bypass -File scripts\test.ps1                  # 16 pasos (-SkipGui, -SkipQemu, -SkipNtfsCorpus)
 powershell -ExecutionPolicy Bypass -File scripts\build.ps1 -Configuration Release -Publish   # exe autocontenido
 ```
 
@@ -190,6 +193,11 @@ Pasos de `test.ps1`:
 | 12 | Orígenes intactos | SHA-256, tamaño y fecha de las imágenes iguales antes y después de todas las operaciones |
 
 (Desde M1 el paso 3 ejecuta 77 pruebas Rust y el 7 incluye la lectura de marcadores en LBA exactas.)
+
+Desde #20 (16 pasos): un paso nuevo, **«Rust: lector NTFS y ntfs-info contra el corpus NTFS»**, ejecuta
+las pruebas ignoradas de `mr-fs-ntfs` y de la CLI contra el corpus NTFS descargado
+(`tools/fetch_ntfs_corpus.py`); `-SkipNtfsCorpus` lo omite. El paso final «Orígenes intactos» incluye
+también las imágenes NTFS si están descargadas.
 
 Desde M1-iteración 2 (13 pasos): el paso 3 ejecuta **176** pruebas Rust; un paso nuevo, **«Formatos contra
 qemu-img»**, ejecuta las 9 pruebas ignoradas por defecto (`MR_QEMU_IMG`): VHD/VHDX/VMDK generados por
@@ -411,6 +419,44 @@ Total: 16 unitarias y 7 de corpus en mr-part, 3 en mr-api, 5 en mr-ffi, 2 de CLI
 5 + 38 casos en C# y 1 de UI Automation. Las pruebas de corpus de Rust se ejecutan en los pasos ya
 existentes (`cargo test -p mr-part -- --ignored` y `cargo test -p memrescue-cli --test corpus --
 --ignored`), sin pasos nuevos.
+
+Lector NTFS (issue #20, ADR-025, `formatos/ntfs.md`):
+
+- `core/mr-fs-ntfs/src` (33 unitarias): arranque (`boot`: cada campo fuera de rango con su código,
+  codificaciones de clúster grande y de tamaño de registro, avisos, fuzzing de 20 000 sectores),
+  registros (`record`: fixups correctos y desajuste en cada tramo, USA no válida, `BAAD`, otra firma,
+  truncado, límites de cabecera, registro no en uso, fixups de un nodo de 4 KiB, fuzzing de 20 000
+  registros con recorrido de atributos y runs), atributos (`attr`: residentes, no residentes, nombres
+  y cada límite), runs (`runs`: deltas con signo, dispersos, errores, desbordamiento, límite de runs,
+  fusión, fuzzing de 50 000 listas), lectura de tramos con sectores ilegibles (`read`), mapa de la
+  MFT (`mft`) y volúmenes sintéticos mínimos (`volume_tests.rs` con `testvol.rs`, clústeres de 512 B,
+  1 KiB y 4 KiB): sano, sectores de 4096 B en el origen, arranque principal dañado, ilegible o con la
+  copia un sector más allá, copia dañada, distinta, ilegible o fuera del origen, no NTFS, registros
+  dañados (fixups, `BAAD`, tamaño asignado), sectores ilegibles de la MFT con `FaultyDevice`
+  (también en un registro partido entre runs), registro 0 desde `$MFTMirr`, `$MFTMirr` discrepante o
+  ilegible, MFT incompleta o con tamaño no múltiplo, origen truncado y fuzzing de 400 volúmenes.
+- `core/mr-fs-ntfs/tests/ntfs_corpus.rs` (3, `--ignored`): `volume_fields_match_every_manifest`
+  compara los 10 manifiestos (`serial`, `label`, `version`, `mft_lcn`, `mftmirr_lcn`,
+  `mft_record_size`, `index_record_size`, `sector_size`, `cluster_size`, `total_sectors`,
+  `mft_entries` = registros + 1 por la entrada virtual que añade TSK, `mft_runs` = runs fusionados y
+  recortados al tamaño de datos como los da TSK, `backup_boot_offset`), abre `ntfs_mbr` y `ntfs_gpt`
+  por su partición de `mr-part` (`[partition]`: esquema, índice, inicio, sectores y `offset`) y
+  comprueba los daños: `ntfs_damaged_boot` se abre desde la copia y lo informa; `ntfs_damaged_mft`
+  marca exactamente los registros de `records` y `tsk_unreadable_records` (y sus `regions`);
+  `ntfs_damaged_mftmirr` informa los 4 registros de `$MFTMirr` (y su región); las imágenes sanas no
+  tienen anomalías ni registros dañados. `file_records_match_state_and_sequence`: las 523 entradas
+  `[[files]]` (507 vivas, 13 borradas, 3 sobrescritas): en uso = `live`, secuencia, directorio,
+  registro base y atributos recorridos sin errores; las 4 con `mft_damaged` están dañadas;
+  `entries_live` y `entries_deleted` (borradas más sobrescritas) cuadran.
+  `unreadable_mft_sectors_on_the_corpus`: `ntfs_basic` con `FaultyDevice` en un sector de 3 registros
+  (solo esos cambian, a ilegibles, con su LBA) y en `$MFTMirr` (se informa sin cambiar la MFT).
+- CLI: `cli/tests/cli.rs` (`ntfs-info` sobre un origen sin NTFS: código 1 con la sugerencia de
+  `--partition`; sin argumentos: 2) y `cli/tests/ntfs_corpus.rs` (1, `--ignored`: `ntfs-info --json`
+  de las 10 imágenes frente a su manifiesto, `--partition 1` en las particionadas, y salida de texto).
+- `mr-api`: `ntfs_open_rejects_a_source_without_ntfs`.
+
+Campos del manifiesto NTFS que no se comparan todavía: `[[files]]` `path`, `size`, `sha256`,
+`resident`, `runs`, `sparse`, `init_size`, `recoverable` y `[[files.ads]]` (#21, #22, #23).
 
 ## 7. Registro
 
