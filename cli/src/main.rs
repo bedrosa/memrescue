@@ -2,8 +2,12 @@
 //!
 //! Todas las operaciones son de solo lectura y solo aceptan ficheros de imagen.
 
+use mr_api::mr_part::gpt::GptCopy;
+use mr_api::mr_part::{Anomaly, Confidence, Origin, PartitionKind, Scheme, Severity};
 use mr_api::task::TaskState;
-use mr_api::{HashOptions, ImageInfo, OpenOptions, Source, VerifyOptions};
+use mr_api::{
+    HashOptions, ImageInfo, OpenOptions, Partition, PartitionTable, Source, VerifyOptions,
+};
 use mr_common::HashAlgorithm;
 use mr_io::resilient::{OnError, ReadPolicy};
 use mr_io::SectorState;
@@ -21,6 +25,7 @@ USO:
   memrescue-cli probe <fichero>
   memrescue-cli image-info <imagen> [ORIGEN] [--json]
   memrescue-cli split-list <imagen.001>
+  memrescue-cli partitions <imagen> [ORIGEN] [--json]
   memrescue-cli sectors <imagen> --lba N [--count M] [--retries N] [--jump N] [--read-back]
                         [--bad-fill PATRÓN] [--skip-fill PATRÓN] [ORIGEN]
   memrescue-cli verify <imagen> [--retries N] [--jump N] [--read-back]
@@ -37,6 +42,11 @@ ORIGEN (opcional):
                      ilegibles (patrón de relleno, nunca datos); sin esta opción se rechazan
   --split            abrir la imagen dividida que empieza en <imagen.001> (ver split-list)
   --range INI:NUM    trabajar solo con NUM sectores desde el LBA INI (partición o rango)
+  --partition N      trabajar solo con la partición N (numeración de «partitions», desde 1);
+                     no se combina con --range
+  --apply-shift      con --partition en una imagen desplazada (GPT): abrir la partición en
+                     LBA del disco - desplazamiento (sin esta opción se rechaza; nunca se aplica
+                     en silencio)
 
 POLÍTICA DE ERRORES (verify):
   --skip-codes LISTA códigos de error del sistema que no se reintentan (p. ej. 23,1117)
@@ -49,6 +59,13 @@ PATRONES DE RELLENO (sectors):
   P: 4 caracteres ASCII (BAD!) u 8 dígitos hexadecimales (DEADBEEF). No se admiten patrones con
   los cuatro bytes iguales (00000000 se confundiría con sectores dispersos) ni el mismo patrón
   para ambos. El relleno nunca son datos: cada sector indica su estado.
+
+PARTICIONES (partitions):
+  Lee el MBR y la cadena de EBR (o detecta el MBR protector o híbrido de GPT) sin abortar ante
+  sectores dañados. Cada partición lleva su confianza (válida, sospechosa, inválida) y sus
+  anomalías; con --json, códigos estables. Con GPT (MBR protector o híbrido, o firma GPT sin MBR)
+  se listan las particiones GPT con nombre y GUID de tipo, la copia en uso (primaria o de
+  respaldo) y el desplazamiento de la imagen si lo hay (las LBA son las del disco).
 
 Formatos: RAW, VHD (fijo/dinámico), VHDX (fijo/dinámico), VMDK monolithicSparse e imágenes
 divididas. Tamaños de sector habituales: 512, 1024, 2048, 4096.
@@ -69,6 +86,10 @@ struct Args {
     tolerant: bool,
     split: bool,
     range: Option<(u64, u64)>,
+    /// Partición (desde 1) con la que trabajar.
+    partition: Option<usize>,
+    /// Aplicar explícitamente el desplazamiento de la imagen al abrir una partición GPT.
+    apply_shift: bool,
     jump: u64,
     read_back: bool,
     /// Política de omisión de errores (`verify`).
@@ -131,6 +152,8 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
         tolerant: false,
         split: false,
         range: None,
+        partition: None,
+        apply_shift: false,
         jump: 0,
         read_back: false,
         skip_codes: Vec::new(),
@@ -176,6 +199,14 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
                 };
                 a.range = Some((parse(s)?, parse(c)?));
             }
+            "--partition" => {
+                let n: usize = num(&mut it, "--partition")?;
+                if n == 0 {
+                    return Err("--partition empieza en 1".into());
+                }
+                a.partition = Some(n);
+            }
+            "--apply-shift" => a.apply_shift = true,
             "--algo" => {
                 let v = it.next().ok_or("falta el valor de --algo")?;
                 a.algos = v
@@ -226,9 +257,262 @@ fn open_src(a: &Args, p: &str) -> Result<Source, mr_api::ApiError> {
             src.info().description
         );
     }
+    if let Some(n) = a.partition {
+        let t = mr_api::partitions(src.as_ref())?;
+        if n > t.partitions.len() {
+            return Err(mr_api::ApiError::InvalidArgument(format!(
+                "no existe la partición {n} (el origen tiene {})",
+                t.partitions.len()
+            )));
+        }
+        let part = mr_api::open_partition(&src, &t, n - 1, a.apply_shift)?;
+        eprintln!("Partición {n}: {}", part.info().description);
+        return Ok(part);
+    }
     match a.range {
         Some((start, count)) => mr_api::open_range(&src, start, count),
         None => Ok(src),
+    }
+}
+
+/// Nombre estable (JSON) del esquema.
+fn scheme_name(s: Scheme) -> &'static str {
+    match s {
+        Scheme::None => "none",
+        Scheme::Mbr => "mbr",
+        Scheme::Gpt => "gpt",
+        Scheme::Hybrid => "hybrid",
+    }
+}
+
+/// Nombre estable (JSON) de un nivel de confianza.
+fn confidence_name(c: &Confidence) -> &'static str {
+    match c {
+        Confidence::Valid => "valid",
+        Confidence::ValidWithFixes(_) => "valid_with_fixes",
+        Confidence::Suspicious(_) => "suspicious",
+        Confidence::Invalid(_) => "invalid",
+    }
+}
+
+fn confidence_label(c: &Confidence) -> &'static str {
+    match c {
+        Confidence::Valid => "válida",
+        Confidence::ValidWithFixes(_) => "corregida",
+        Confidence::Suspicious(_) => "SOSPECHOSA",
+        Confidence::Invalid(_) => "INVÁLIDA",
+    }
+}
+
+fn severity_name(s: Severity) -> &'static str {
+    match s {
+        Severity::Notice => "notice",
+        Severity::Compensated => "compensated",
+        Severity::Suspicious => "suspicious",
+        Severity::Invalid => "invalid",
+    }
+}
+
+fn severity_label(s: Severity) -> &'static str {
+    match s {
+        Severity::Notice => "aviso",
+        Severity::Compensated => "compensada",
+        Severity::Suspicious => "sospechosa",
+        Severity::Invalid => "INVÁLIDA",
+    }
+}
+
+fn opt_json(v: Option<u64>) -> String {
+    v.map_or_else(|| "null".into(), |x| x.to_string())
+}
+
+fn anomaly_json(an: &Anomaly) -> String {
+    format!(
+        "{{\"code\":{},\"severity\":\"{}\",\"lba\":{},\"target_lba\":{},\"value\":{},\"message\":{}}}",
+        json_str(an.code()),
+        severity_name(an.severity()),
+        opt_json(an.lba()),
+        opt_json(an.target()),
+        if an.value_signed() {
+            an.value()
+                .map_or_else(|| "null".into(), |v| (v as i64).to_string())
+        } else {
+            opt_json(an.value())
+        },
+        json_str(&an.to_string())
+    )
+}
+
+fn origin_parts(o: &Origin) -> (&'static str, u64, Option<u64>) {
+    match *o {
+        Origin::Primary { slot } => ("primary", u64::from(slot), None),
+        Origin::Logical { ebr_lba, slot } => ("logical", u64::from(slot), Some(ebr_lba)),
+        Origin::Gpt { index } => ("gpt", u64::from(index), None),
+    }
+}
+
+fn kind_text(k: &PartitionKind) -> (String, &'static str) {
+    let name = k.type_name().unwrap_or("desconocido");
+    match k {
+        PartitionKind::Mbr(t) => (format!("0x{t:02X}"), name),
+        PartitionKind::Gpt(g) => (mr_api::mr_part::gpt::format_guid(g), name),
+    }
+}
+
+/// Imprime la tabla de particiones (texto o JSON).
+fn print_partitions(t: &PartitionTable, json: bool) {
+    let end = |p: &Partition| p.start_lba.saturating_add(p.sector_count.saturating_sub(1));
+    if json {
+        let parts: Vec<String> = t
+            .partitions
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let (origin, slot, ebr) = origin_parts(&p.origin);
+                let kind = match p.kind {
+                    PartitionKind::Mbr(k) => k.to_string(),
+                    PartitionKind::Gpt(_) => json_str(&kind_text(&p.kind).0),
+                };
+                let anomalies: Vec<String> = p.anomalies.iter().map(anomaly_json).collect();
+                let gpt = match t.gpt_entry(p) {
+                    Some(e) => format!(
+                        ",\"name\":{},\"unique_guid\":\"{}\",\"attributes\":{}",
+                        json_str(p.name.as_deref().unwrap_or("")),
+                        mr_api::mr_part::gpt::format_guid(&e.unique_guid),
+                        e.attributes
+                    ),
+                    None => String::new(),
+                };
+                format!(
+                    "{{\"number\":{},\"origin\":\"{origin}\",\"slot\":{slot},\"ebr_lba\":{},\"start_lba\":{},\"sectors\":{},\"end_lba\":{},\"type\":{kind},\"type_name\":{},\"active\":{},\"confidence\":\"{}\"{gpt},\"anomalies\":[{}]}}",
+                    i + 1,
+                    opt_json(ebr),
+                    p.start_lba,
+                    p.sector_count,
+                    end(p),
+                    p.kind.type_name().map_or_else(|| "null".into(), json_str),
+                    p.active,
+                    confidence_name(&p.confidence),
+                    anomalies.join(",")
+                )
+            })
+            .collect();
+        let anomalies: Vec<String> = t.anomalies.iter().map(anomaly_json).collect();
+        let gpt = match &t.gpt {
+            Some(g) => format!(
+                "{{\"selected\":{},\"shift\":{},\"trailing_sectors_missing\":{},\"sector_size\":{},\"disk_guid\":{}}}",
+                match g.selected {
+                    Some(GptCopy::Primary) => "\"primary\"",
+                    Some(GptCopy::Backup) => "\"backup\"",
+                    None => "null",
+                },
+                g.shift,
+                g.trailing_sectors_missing,
+                g.sector_size,
+                g.header().map_or_else(
+                    || "null".into(),
+                    |h| json_str(&mr_api::mr_part::gpt::format_guid(&h.disk_guid))
+                )
+            ),
+            None => "null".into(),
+        };
+        println!(
+            "{{\"scheme\":\"{}\",\"sector_size\":{},\"confidence\":\"{}\",\"gpt\":{gpt},\"partitions\":[{}],\"anomalies\":[{}]}}",
+            scheme_name(t.scheme),
+            t.sector_size,
+            confidence_name(&t.confidence()),
+            parts.join(","),
+            anomalies.join(",")
+        );
+        return;
+    }
+    let scheme = match t.scheme {
+        Scheme::None => "sin tabla de particiones reconocible",
+        Scheme::Mbr => "MBR",
+        Scheme::Gpt => "GPT",
+        Scheme::Hybrid => "híbrido MBR + GPT (entradas del MBR y después las de la GPT)",
+    };
+    println!("Esquema:         {scheme}");
+    println!("Tamaño sector:   {} bytes", t.sector_size);
+    println!("Confianza:       {}", confidence_label(&t.confidence()));
+    if let Some(g) = &t.gpt {
+        let copy = match g.selected {
+            Some(GptCopy::Primary) => "primaria",
+            Some(GptCopy::Backup) => "COPIA DE RESPALDO EN USO (la primaria no es utilizable)",
+            None => "NINGUNA (ninguna copia es utilizable)",
+        };
+        println!("Copia GPT:       {copy}");
+        if let Some(h) = g.header() {
+            println!(
+                "GUID de disco:   {}",
+                mr_api::mr_part::gpt::format_guid(&h.disk_guid)
+            );
+        }
+        if g.shift != 0 {
+            println!(
+                "Desplazamiento:  {} sectores (LBA disco = LBA imagen + {}); las LBA mostradas son del disco; \
+                 para abrir una partición use --partition N --apply-shift",
+                g.shift, g.shift
+            );
+        }
+        if g.trailing_sectors_missing > 0 {
+            println!(
+                "Faltan al final: {} sectores del disco",
+                g.trailing_sectors_missing
+            );
+        }
+    }
+    if t.partitions.is_empty() {
+        println!("(sin particiones)");
+    } else {
+        println!(
+            "{:>3}  {:<22} {:>3}  {:>12}  {:>12}  {:>12}  {:<34} {:<20} Confianza",
+            "N", "Origen", "Act", "LBA inicial", "LBA final", "Sectores", "Tipo", "Nombre"
+        );
+        for (i, p) in t.partitions.iter().enumerate() {
+            let origin = match p.origin {
+                Origin::Primary { slot } => format!("primaria {}", u32::from(slot) + 1),
+                Origin::Logical { ebr_lba, .. } => format!("lógica (EBR {ebr_lba})"),
+                Origin::Gpt { index } => format!("GPT {}", u64::from(index) + 1),
+            };
+            let (code, name) = kind_text(&p.kind);
+            let kind = match p.kind {
+                PartitionKind::Mbr(_) => format!("{code} {name}"),
+                PartitionKind::Gpt(_) => name.to_string(),
+            };
+            println!(
+                "{:>3}  {:<22} {:>3}  {:>12}  {:>12}  {:>12}  {:<34} {:<20} {}",
+                i + 1,
+                origin,
+                if p.active { "*" } else { "" },
+                p.start_lba,
+                end(p),
+                p.sector_count,
+                kind,
+                p.name.as_deref().unwrap_or(""),
+                confidence_label(&p.confidence)
+            );
+            if let PartitionKind::Gpt(_) = p.kind {
+                println!("       tipo GUID {code}");
+            }
+            for an in &p.anomalies {
+                println!(
+                    "       - [{}] {}: {an}",
+                    severity_label(an.severity()),
+                    an.code()
+                );
+            }
+        }
+    }
+    if !t.anomalies.is_empty() {
+        println!("Anomalías de la tabla:");
+        for an in &t.anomalies {
+            println!(
+                "  - [{}] {}: {an}",
+                severity_label(an.severity()),
+                an.code()
+            );
+        }
     }
 }
 
@@ -308,6 +592,9 @@ fn run(args: Vec<String>) -> Result<(), (u8, String)> {
         }
     };
     let op = |e: &dyn std::fmt::Display| (1u8, e.to_string());
+    if a.partition.is_some() && a.range.is_some() {
+        return Err(usage("--partition y --range no se pueden combinar"));
+    }
     if cmd != "sectors" && (a.bad_fill.is_some() || a.skip_fill.is_some()) {
         return Err(usage("--bad-fill y --skip-fill solo se aplican a sectors"));
     }
@@ -505,6 +792,22 @@ fn run(args: Vec<String>) -> Result<(), (u8, String)> {
                 return Err((
                     3,
                     format!("{untrusted} sectores no fiables ({bad} ilegibles)"),
+                ));
+            }
+        }
+        "partitions" => {
+            let p = one(&a)?;
+            let src = open_src(&a, &p).map_err(|e| op(&e))?;
+            let t = mr_api::partitions(src.as_ref()).map_err(|e| op(&e))?;
+            print_partitions(&t, a.json);
+            let unreadable = t
+                .all_anomalies()
+                .filter(|x| matches!(x, Anomaly::UnreadableSector { .. }))
+                .count();
+            if unreadable > 0 {
+                return Err((
+                    3,
+                    format!("{unreadable} sectores de tabla ilegibles: no se interpretaron"),
                 ));
             }
         }

@@ -1065,3 +1065,505 @@ fn untrusted_ranges_are_indexed_in_constant_time() {
     mr_task_free(task);
     mr_source_close(src);
 }
+
+// ---------- Particiones (issue #12) ----------
+
+/// Disco de 4096 sectores: P1 activa [2048, +1024) tipo 0x07, P2 tipo 0x7F (desconocido) que termina
+/// fuera del disco y extendida 0x0F en [3600, +496) con una lógica Linux. Cada sector vale su LBA
+/// módulo 256 salvo las tablas.
+fn partitioned_disk() -> Vec<u8> {
+    let mut d: Vec<u8> = (0..4096 * 512).map(|i| (i / 512) as u8).collect();
+    let mut table = |lba: usize, entries: &[(u8, u8, u32, u32)]| {
+        let s = &mut d[lba * 512..(lba + 1) * 512];
+        s.fill(0);
+        for (i, &(boot, kind, start, count)) in entries.iter().enumerate() {
+            let e = &mut s[0x1BE + 16 * i..0x1BE + 16 * (i + 1)];
+            e[0] = boot;
+            e[4] = kind;
+            e[8..12].copy_from_slice(&start.to_le_bytes());
+            e[12..16].copy_from_slice(&count.to_le_bytes());
+        }
+        s[510] = 0x55;
+        s[511] = 0xAA;
+    };
+    table(
+        0,
+        &[
+            (0x80, 0x07, 2048, 1024),
+            (0, 0x7F, 3072, 2000),
+            (0, 0x0F, 3600, 496),
+        ],
+    );
+    table(3600, &[(0, 0x83, 8, 100)]);
+    d
+}
+
+fn table_info(t: u64) -> Result<MrPartitionTableInfo, i32> {
+    let mut i = MrPartitionTableInfo {
+        struct_size: std::mem::size_of::<MrPartitionTableInfo>() as u32,
+        ..Default::default()
+    };
+    match unsafe { mr_partitions_info(t, &mut i) } {
+        MR_OK => Ok(i),
+        rc => Err(rc),
+    }
+}
+
+fn partition(t: u64, index: u32) -> Result<MrPartitionInfo, i32> {
+    let mut p = MrPartitionInfo {
+        struct_size: std::mem::size_of::<MrPartitionInfo>() as u32,
+        ..Default::default()
+    };
+    match unsafe { mr_partition_get(t, index, &mut p) } {
+        MR_OK => Ok(p),
+        rc => Err(rc),
+    }
+}
+
+fn anomaly(t: u64, part: u32, index: u32) -> Result<(MrPartitionAnomaly, String), i32> {
+    let mut a = MrPartitionAnomaly {
+        struct_size: std::mem::size_of::<MrPartitionAnomaly>() as u32,
+        ..Default::default()
+    };
+    let rc = unsafe { mr_partition_anomaly(t, part, index, &mut a) };
+    if rc != MR_OK {
+        return Err(rc);
+    }
+    let mut buf = vec![0u8; 1024];
+    let mut n = 0usize;
+    let rc =
+        unsafe { mr_partition_anomaly_text(t, part, index, buf.as_mut_ptr(), buf.len(), &mut n) };
+    assert_eq!(rc, MR_OK);
+    Ok((a, String::from_utf8(buf[..n].to_vec()).unwrap()))
+}
+
+#[test]
+fn partition_structs_match_header() {
+    assert_eq!(std::mem::size_of::<MrPartitionTableInfo>(), 80);
+    assert_eq!(std::mem::size_of::<MrPartitionInfo>(), 96);
+    assert_eq!(std::mem::offset_of!(MrPartitionInfo, ebr_lba), 16);
+    assert_eq!(std::mem::offset_of!(MrPartitionInfo, active), 40);
+    assert_eq!(std::mem::offset_of!(MrPartitionInfo, gpt_type), 56);
+    assert_eq!(std::mem::offset_of!(MrPartitionInfo, unique_guid), 72);
+    assert_eq!(std::mem::offset_of!(MrPartitionInfo, attributes), 88);
+    assert_eq!(std::mem::offset_of!(MrPartitionTableInfo, shift), 40);
+    assert_eq!(std::mem::offset_of!(MrPartitionTableInfo, disk_guid), 64);
+    assert_eq!(std::mem::size_of::<MrPartitionAnomaly>(), 40);
+    assert_eq!(std::mem::offset_of!(MrPartitionAnomaly, lba), 16);
+}
+
+#[test]
+fn partitions_are_enumerated_by_index_and_open_as_sources() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("particiones.img");
+    std::fs::write(&path, partitioned_disk()).unwrap();
+    let src = open(path.to_str().unwrap(), 512, 0).unwrap();
+    let mut t = 0u64;
+    assert_eq!(unsafe { mr_source_partitions(src, &mut t) }, MR_OK);
+    let info = table_info(t).unwrap();
+    assert_eq!(
+        (info.scheme, info.sector_size, info.partition_count),
+        (MR_SCHEME_MBR, 512, 3)
+    );
+    assert_eq!(info.confidence, MR_CONFIDENCE_SUSPICIOUS);
+    assert_eq!(
+        info.anomaly_count, 2,
+        "solapes de P2 con la extendida y con la lógica"
+    );
+
+    let p0 = partition(t, 0).unwrap();
+    assert_eq!(
+        (
+            p0.origin,
+            p0.slot,
+            p0.mbr_type,
+            p0.start_lba,
+            p0.sector_count,
+            p0.active
+        ),
+        (MR_ORIGIN_PRIMARY, 0, 0x07, 2048, 1024, 1)
+    );
+    assert_eq!((p0.confidence, p0.anomaly_count), (MR_CONFIDENCE_VALID, 0));
+    let p1 = partition(t, 1).unwrap();
+    assert_eq!(
+        (p1.mbr_type, p1.confidence, p1.anomaly_count),
+        (0x7F, MR_CONFIDENCE_SUSPICIOUS, 2)
+    );
+    let p2 = partition(t, 2).unwrap();
+    assert_eq!(
+        (
+            p2.origin,
+            p2.ebr_lba,
+            p2.start_lba,
+            p2.sector_count,
+            p2.active
+        ),
+        (MR_ORIGIN_LOGICAL, 3600, 3608, 100, 0)
+    );
+    assert_eq!(partition(t, 3).unwrap_err(), MR_ERR_OUT_OF_RANGE);
+
+    // Nombres de tipo (vacío si es desconocido) con el protocolo de búfer pequeño.
+    let mut n = 0usize;
+    assert_eq!(
+        unsafe { mr_partition_type_name(t, 0, std::ptr::null_mut(), 0, &mut n) },
+        MR_ERR_BUFFER_TOO_SMALL
+    );
+    let mut buf = vec![0u8; n + 1];
+    assert_eq!(
+        unsafe { mr_partition_type_name(t, 0, buf.as_mut_ptr(), buf.len(), &mut n) },
+        MR_OK
+    );
+    assert_eq!(&buf[..n], "NTFS / exFAT / HPFS".as_bytes());
+    assert_eq!(
+        unsafe { mr_partition_type_name(t, 1, buf.as_mut_ptr(), buf.len(), &mut n) },
+        MR_OK
+    );
+    assert_eq!(n, 0);
+
+    // Anomalías de la partición 1 y de la tabla.
+    let (a, text) = anomaly(t, 1, 0).unwrap();
+    assert_eq!(
+        (a.code, a.severity, a.lba),
+        (107, MR_SEVERITY_SUSPICIOUS, 0)
+    );
+    assert_eq!((a.flags, a.value), (MR_ANOMALY_HAS_VALUE, 5072));
+    assert!(text.starts_with("mbr_partially_outside_disk\n"), "{text}");
+    let (a, _) = anomaly(t, 1, 1).unwrap();
+    assert_eq!((a.code, a.value), (109, 0x7F));
+    let (a, text) = anomaly(t, MR_PARTITION_TABLE, 0).unwrap();
+    assert_eq!(a.code, 108);
+    assert!(
+        text.starts_with("mbr_overlap\n") && text.contains("se solapa"),
+        "{text}"
+    );
+    assert_eq!(anomaly(t, 1, 2).unwrap_err(), MR_ERR_OUT_OF_RANGE);
+    assert_eq!(anomaly(t, 9, 0).unwrap_err(), MR_ERR_OUT_OF_RANGE);
+
+    // Abrir particiones: la recortada se abre hasta el final del origen.
+    let mut ps = 0u64;
+    assert_eq!(unsafe { mr_partition_open(t, 0, &mut ps) }, MR_OK);
+    let mut pi = MrImageInfo::default();
+    assert_eq!(unsafe { mr_source_info(ps, &mut pi) }, MR_OK);
+    assert_eq!(pi.sector_count, 1024);
+    assert!(describe(ps).starts_with("Partición LBA 2048–3071 (tipo 0x07)"));
+    let mut sector = vec![0u8; 512];
+    assert_eq!(
+        unsafe { mr_source_read(ps, 1, 1, sector.as_mut_ptr(), 512, &mut n) },
+        MR_OK
+    );
+    assert!(sector.iter().all(|&b| b == (2049 % 256) as u8));
+    let mut trimmed = 0u64;
+    assert_eq!(unsafe { mr_partition_open(t, 1, &mut trimmed) }, MR_OK);
+    assert_eq!(unsafe { mr_source_info(trimmed, &mut pi) }, MR_OK);
+    assert_eq!(pi.sector_count, 1024);
+    assert!(describe(trimmed).contains("recortada"));
+    assert_eq!(
+        unsafe { mr_partition_open(t, 7, &mut trimmed) },
+        MR_ERR_OUT_OF_RANGE
+    );
+
+    // La tabla sobrevive al cierre del origen y las particiones abiertas, a la tabla.
+    assert_eq!(mr_source_close(src), MR_OK);
+    assert!(table_info(t).is_ok());
+    assert_eq!(mr_partitions_free(t), MR_OK);
+    assert_eq!(mr_partitions_free(t), MR_ERR_INVALID_HANDLE);
+    assert_eq!(table_info(t).unwrap_err(), MR_ERR_INVALID_HANDLE);
+    assert_eq!(
+        unsafe { mr_source_read(ps, 0, 1, sector.as_mut_ptr(), 512, &mut n) },
+        MR_OK
+    );
+    assert_eq!(mr_source_close(ps), MR_OK);
+    assert_eq!(mr_source_close(trimmed), MR_OK);
+}
+
+#[test]
+fn partition_calls_validate_handles_sizes_and_pointers() {
+    let src = insert(Entry::Source(mr_api::source_from_device(
+        Arc::new(mr_io::MemDevice::new(vec![0u8; 512 * 8], 512).unwrap()),
+        "vacío",
+    )));
+    let mut t = 0u64;
+    assert_eq!(
+        unsafe { mr_source_partitions(src, std::ptr::null_mut()) },
+        MR_ERR_INVALID_ARGUMENT
+    );
+    assert_eq!(unsafe { mr_source_partitions(src, &mut t) }, MR_OK);
+    let info = table_info(t).unwrap();
+    assert_eq!(
+        (
+            info.scheme,
+            info.partition_count,
+            info.anomaly_count,
+            info.confidence
+        ),
+        (MR_SCHEME_NONE, 0, 1, MR_CONFIDENCE_VALID)
+    );
+    let (a, text) = anomaly(t, MR_PARTITION_TABLE, 0).unwrap();
+    assert_eq!((a.code, a.severity), (100, MR_SEVERITY_NOTICE));
+    assert!(text.starts_with("mbr_missing\n"));
+    // struct_size distinto del esperado, punteros nulos y handles de otro tipo.
+    let mut i = MrPartitionTableInfo {
+        struct_size: 24,
+        ..Default::default()
+    };
+    assert_eq!(
+        unsafe { mr_partitions_info(t, &mut i) },
+        MR_ERR_INVALID_ARGUMENT
+    );
+    assert!(last_error().contains("mr_partition_table_info"));
+    assert_eq!(
+        unsafe { mr_partitions_info(t, std::ptr::null_mut()) },
+        MR_ERR_INVALID_ARGUMENT
+    );
+    let mut p = MrPartitionInfo::default();
+    assert_eq!(
+        unsafe { mr_partition_get(t, 0, &mut p) },
+        MR_ERR_INVALID_ARGUMENT
+    );
+    let mut a = MrPartitionAnomaly {
+        struct_size: 41,
+        ..Default::default()
+    };
+    assert_eq!(
+        unsafe { mr_partition_anomaly(t, MR_PARTITION_TABLE, 0, &mut a) },
+        MR_ERR_INVALID_ARGUMENT
+    );
+    assert_eq!(table_info(src).unwrap_err(), MR_ERR_INVALID_HANDLE);
+    assert_eq!(mr_partitions_free(src), MR_ERR_INVALID_HANDLE);
+    assert_eq!(mr_source_close(t), MR_ERR_INVALID_HANDLE);
+    assert_eq!(mr_task_free(t), MR_ERR_INVALID_HANDLE);
+    assert_eq!(mr_task_cancel(t), MR_ERR_INVALID_HANDLE);
+    let mut st = MrTaskStatus::default();
+    assert_eq!(
+        unsafe { mr_task_status_get(t, &mut st) },
+        MR_ERR_INVALID_HANDLE
+    );
+    assert_eq!(
+        unsafe { mr_source_partitions(t, &mut t) },
+        MR_ERR_INVALID_HANDLE
+    );
+    let mut out = 0u64;
+    assert_eq!(
+        unsafe { mr_partition_open(t, 0, &mut out) },
+        MR_ERR_OUT_OF_RANGE
+    );
+    assert_eq!(
+        unsafe { mr_partition_open(t, 0, std::ptr::null_mut()) },
+        MR_ERR_INVALID_ARGUMENT
+    );
+    assert_eq!(mr_partitions_free(t), MR_OK);
+    assert_eq!(mr_source_close(src), MR_OK);
+}
+
+#[test]
+fn unreadable_mbr_is_an_anomaly_not_an_error() {
+    let dev = mr_io::FaultyDevice::new(mr_io::MemDevice::new(partitioned_disk(), 512).unwrap())
+        .with_bad([3600]);
+    let src = insert(Entry::Source(mr_api::source_from_device(
+        Arc::new(dev),
+        "EBR ilegible",
+    )));
+    let mut t = 0u64;
+    assert_eq!(unsafe { mr_source_partitions(src, &mut t) }, MR_OK);
+    let info = table_info(t).unwrap();
+    assert_eq!(
+        info.partition_count, 2,
+        "la lógica del EBR ilegible no aparece"
+    );
+    let codes: Vec<u32> = (0..info.anomaly_count as u32)
+        .map(|i| anomaly(t, MR_PARTITION_TABLE, i).unwrap().0.code)
+        .collect();
+    assert!(codes.contains(&1), "{codes:?}");
+    let (a, _) = anomaly(
+        t,
+        MR_PARTITION_TABLE,
+        codes.iter().position(|&c| c == 1).unwrap() as u32,
+    )
+    .unwrap();
+    assert_eq!(a.lba, 3600);
+    assert_eq!(mr_partitions_free(t), MR_OK);
+    assert_eq!(mr_source_close(src), MR_OK);
+}
+
+// ---------- GPT integrada en la tabla (issue #12 sobre #13) ----------
+
+/// GUID «Datos básicos de Microsoft» en el orden del disco.
+const BASIC_DATA: [u8; 16] = [
+    0xA2, 0xA0, 0xD0, 0xEB, 0xE5, 0xB9, 0x33, 0x44, 0x87, 0xC0, 0x68, 0xB6, 0xB7, 0x26, 0x99, 0xC7,
+];
+
+/// Disco GPT de 256 sectores de 512 B según UEFI: MBR protector, cabeceras y tablas primaria y de
+/// respaldo, una partición «DATOS» en [64, 128). Cada sector fuera de las estructuras vale su LBA
+/// del disco (mod 256). Con `cut` > 0 se quitan los `cut` primeros sectores (imagen desplazada).
+fn gpt_disk(cut: usize) -> Vec<u8> {
+    const TOTAL: u64 = 256;
+    let mut d: Vec<u8> = (0..TOTAL as usize * 512).map(|i| (i / 512) as u8).collect();
+    let mut entries = vec![0u8; 128 * 128];
+    entries[..16].copy_from_slice(&BASIC_DATA);
+    entries[16..32].copy_from_slice(&[0x5A; 16]);
+    entries[32..40].copy_from_slice(&64u64.to_le_bytes());
+    entries[40..48].copy_from_slice(&127u64.to_le_bytes());
+    for (i, c) in "DATOS".encode_utf16().enumerate() {
+        entries[56 + 2 * i..58 + 2 * i].copy_from_slice(&c.to_le_bytes());
+    }
+    let ecrc = mr_common::hash::crc32(&entries);
+    let header = |my: u64, alt: u64, at: u64| {
+        let mut h = vec![0u8; 512];
+        h[..8].copy_from_slice(b"EFI PART");
+        h[8..12].copy_from_slice(&0x0001_0000u32.to_le_bytes());
+        h[12..16].copy_from_slice(&92u32.to_le_bytes());
+        h[24..32].copy_from_slice(&my.to_le_bytes());
+        h[32..40].copy_from_slice(&alt.to_le_bytes());
+        h[40..48].copy_from_slice(&34u64.to_le_bytes());
+        h[48..56].copy_from_slice(&(TOTAL - 34).to_le_bytes());
+        h[56..72].copy_from_slice(&[0x77; 16]);
+        h[72..80].copy_from_slice(&at.to_le_bytes());
+        h[80..84].copy_from_slice(&128u32.to_le_bytes());
+        h[84..88].copy_from_slice(&128u32.to_le_bytes());
+        h[88..92].copy_from_slice(&ecrc.to_le_bytes());
+        let crc = mr_common::hash::crc32(&h[..92]);
+        h[16..20].copy_from_slice(&crc.to_le_bytes());
+        h
+    };
+    d[..512].fill(0);
+    let e = &mut d[0x1BE..0x1CE];
+    e[4] = 0xEE;
+    e[8..12].copy_from_slice(&1u32.to_le_bytes());
+    e[12..16].copy_from_slice(&((TOTAL - 1) as u32).to_le_bytes());
+    d[510] = 0x55;
+    d[511] = 0xAA;
+    d[512..1024].copy_from_slice(&header(1, TOTAL - 1, 2));
+    d[1024..1024 + entries.len()].copy_from_slice(&entries);
+    let back = (TOTAL as usize - 33) * 512;
+    d[back..back + entries.len()].copy_from_slice(&entries);
+    d[(TOTAL as usize - 1) * 512..].copy_from_slice(&header(TOTAL - 1, 1, TOTAL - 33));
+    d.split_off(cut * 512)
+}
+
+fn gpt_table(cut: usize) -> (u64, u64) {
+    let src = insert(Entry::Source(mr_api::source_from_device(
+        Arc::new(mr_io::MemDevice::new(gpt_disk(cut), 512).unwrap()),
+        "gpt",
+    )));
+    let mut t = 0u64;
+    assert_eq!(unsafe { mr_source_partitions(src, &mut t) }, MR_OK);
+    (src, t)
+}
+
+fn partition_name(t: u64, index: u32) -> String {
+    let mut buf = vec![0u8; 256];
+    let mut n = 0usize;
+    assert_eq!(
+        unsafe { mr_partition_name(t, index, buf.as_mut_ptr(), buf.len(), &mut n) },
+        MR_OK
+    );
+    String::from_utf8(buf[..n].to_vec()).unwrap()
+}
+
+#[test]
+fn gpt_partitions_are_enumerated_with_copy_shift_and_names() {
+    let (src, t) = gpt_table(0);
+    let info = table_info(t).unwrap();
+    assert_eq!(
+        (
+            info.scheme,
+            info.partition_count,
+            info.anomaly_count,
+            info.confidence
+        ),
+        (MR_SCHEME_GPT, 1, 0, MR_CONFIDENCE_VALID)
+    );
+    assert_eq!(
+        (
+            info.gpt_selected,
+            info.gpt_flags,
+            info.shift,
+            info.gpt_sector_size
+        ),
+        (MR_GPT_PRIMARY, MR_GPT_PRESENT, 0, 512)
+    );
+    assert_eq!(info.disk_guid, [0x77; 16]);
+    let p = partition(t, 0).unwrap();
+    assert_eq!(
+        (p.origin, p.slot, p.start_lba, p.sector_count, p.mbr_type),
+        (MR_ORIGIN_GPT, 0, 64, 64, 0)
+    );
+    assert_eq!((p.gpt_type, p.unique_guid), (BASIC_DATA, [0x5A; 16]));
+    assert_eq!(partition_name(t, 0), "DATOS");
+    let mut buf = vec![0u8; 128];
+    let mut n = 0usize;
+    assert_eq!(
+        unsafe { mr_partition_type_name(t, 0, buf.as_mut_ptr(), buf.len(), &mut n) },
+        MR_OK
+    );
+    assert_eq!(&buf[..n], "Datos básicos de Microsoft".as_bytes());
+    let mut ps = 0u64;
+    assert_eq!(unsafe { mr_partition_open(t, 0, &mut ps) }, MR_OK);
+    let mut sector = vec![0u8; 512];
+    assert_eq!(
+        unsafe { mr_source_read(ps, 0, 1, sector.as_mut_ptr(), 512, &mut n) },
+        MR_OK
+    );
+    assert!(sector.iter().all(|&b| b == 64));
+    assert_eq!(mr_source_close(ps), MR_OK);
+    assert_eq!(mr_partitions_free(t), MR_OK);
+    assert_eq!(mr_source_close(src), MR_OK);
+}
+
+#[test]
+fn shifted_gpt_partitions_open_only_when_the_shift_is_requested() {
+    let (src, t) = gpt_table(3);
+    let info = table_info(t).unwrap();
+    assert_eq!(
+        (info.scheme, info.gpt_selected, info.shift),
+        (MR_SCHEME_GPT, MR_GPT_BACKUP, 3)
+    );
+    let codes: Vec<(u32, u32, u64)> = (0..info.anomaly_count as u32)
+        .map(|i| {
+            let (a, _) = anomaly(t, MR_PARTITION_TABLE, i).unwrap();
+            (a.code, a.flags, a.value)
+        })
+        .collect();
+    assert!(codes.contains(&(100, 0, 0)), "LBA 0 sin MBR: {codes:?}");
+    assert!(
+        codes.contains(&(232, MR_ANOMALY_HAS_VALUE | MR_ANOMALY_VALUE_SIGNED, 3)),
+        "{codes:?}"
+    );
+    assert!(
+        codes.contains(&(230, 0, 0)),
+        "copia de respaldo en uso: {codes:?}"
+    );
+    let p = partition(t, 0).unwrap();
+    assert_eq!(
+        p.start_lba, 64,
+        "las particiones conservan la LBA del disco"
+    );
+    let mut ps = 0u64;
+    assert_eq!(
+        unsafe { mr_partition_open(t, 0, &mut ps) },
+        MR_ERR_INVALID_ARGUMENT
+    );
+    assert!(last_error().contains("desplazada"), "{}", last_error());
+    assert_eq!(
+        unsafe { mr_partition_open_ex(t, 0, 8, &mut ps) },
+        MR_ERR_INVALID_ARGUMENT
+    );
+    assert_eq!(
+        unsafe { mr_partition_open_ex(t, 0, MR_PARTITION_OPEN_APPLY_SHIFT, &mut ps) },
+        MR_OK
+    );
+    assert!(describe(ps).contains("desplazamiento aplicado: 3 sectores"));
+    let mut sector = vec![0u8; 512];
+    let mut n = 0usize;
+    assert_eq!(
+        unsafe { mr_source_read(ps, 0, 1, sector.as_mut_ptr(), 512, &mut n) },
+        MR_OK
+    );
+    assert!(
+        sector.iter().all(|&b| b == 64),
+        "LBA 64 del disco = 61 de la imagen"
+    );
+    assert_eq!(mr_source_close(ps), MR_OK);
+    assert_eq!(mr_partitions_free(t), MR_OK);
+    assert_eq!(mr_source_close(src), MR_OK);
+}

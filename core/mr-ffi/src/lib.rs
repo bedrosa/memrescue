@@ -4,6 +4,7 @@
 //! búferes del llamador y escribir estructuras de salida. Cada función exportada captura pánicos.
 //! Orígenes y tareas viven en un registro indexado por handles numéricos (nunca punteros).
 
+use mr_api::mr_part::{self, Anomaly, Confidence, Origin, PartitionKind, PartitionTable, Scheme};
 use mr_api::task::{Task, TaskState};
 use mr_api::{ApiError, HashOptions, HashResult, OpenOptions, Source, VerifyOptions};
 use mr_common::HashAlgorithm;
@@ -53,6 +54,218 @@ pub const MAX_SKIP_CODES: u32 = 256;
 pub const MR_ERR_PANIC: i32 = 99;
 /// `mr_read_options.flags`: tras un salto, leer hacia atrás hasta el siguiente error.
 pub const MR_READ_READ_BACK: u32 = 1;
+
+// ---------- Particiones (ampliación compatible de la ABI 3, issue #12) ----------
+
+/// `mr_partition_table_info.scheme`.
+pub const MR_SCHEME_NONE: u32 = 0;
+pub const MR_SCHEME_MBR: u32 = 1;
+pub const MR_SCHEME_GPT: u32 = 2;
+pub const MR_SCHEME_HYBRID: u32 = 3;
+/// Confianza de tablas y particiones.
+pub const MR_CONFIDENCE_VALID: u32 = 1;
+pub const MR_CONFIDENCE_VALID_WITH_FIXES: u32 = 2;
+pub const MR_CONFIDENCE_SUSPICIOUS: u32 = 3;
+pub const MR_CONFIDENCE_INVALID: u32 = 4;
+/// Gravedad de una anomalía.
+pub const MR_SEVERITY_NOTICE: u32 = 1;
+pub const MR_SEVERITY_SUSPICIOUS: u32 = 2;
+pub const MR_SEVERITY_INVALID: u32 = 3;
+/// Daño compensado por una redundancia (copia GPT válida): confianza «válida con correcciones».
+pub const MR_SEVERITY_COMPENSATED: u32 = 4;
+/// `mr_partition_table_info.gpt_selected`.
+pub const MR_GPT_NONE: u32 = 0;
+pub const MR_GPT_PRIMARY: u32 = 1;
+pub const MR_GPT_BACKUP: u32 = 2;
+/// `mr_partition_table_info.gpt_flags`: hay lectura GPT (esquema GPT o híbrido).
+pub const MR_GPT_PRESENT: u32 = 1;
+/// `mr_partition_open_ex`: aplicar explícitamente el desplazamiento de la imagen a una partición GPT.
+pub const MR_PARTITION_OPEN_APPLY_SHIFT: u32 = 1;
+/// Origen de una partición.
+pub const MR_ORIGIN_PRIMARY: u32 = 1;
+pub const MR_ORIGIN_LOGICAL: u32 = 2;
+pub const MR_ORIGIN_GPT: u32 = 3;
+/// `partition_index` de las anomalías de la tabla (no de una partición).
+pub const MR_PARTITION_TABLE: u32 = u32::MAX;
+/// `mr_partition_anomaly.flags`: `target_lba` / `value` tienen significado.
+pub const MR_ANOMALY_HAS_TARGET: u32 = 1;
+pub const MR_ANOMALY_HAS_VALUE: u32 = 2;
+/// `value` es un entero con signo en complemento a dos (desplazamiento de `image_shifted`).
+pub const MR_ANOMALY_VALUE_SIGNED: u32 = 4;
+
+/// Datos de una tabla de particiones (80 bytes). `struct_size` lo escribe el llamador.
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MrPartitionTableInfo {
+    pub struct_size: u32,
+    /// `MR_SCHEME_*`.
+    pub scheme: u32,
+    /// Tamaño de sector con que se expresan las LBA de las particiones.
+    pub sector_size: u32,
+    /// `MR_CONFIDENCE_*` del conjunto (peor gravedad de todas las anomalías y de la GPT).
+    pub confidence: u32,
+    pub partition_count: u64,
+    /// Anomalías de la tabla (`partition_index = MR_PARTITION_TABLE`).
+    pub anomaly_count: u64,
+    /// `MR_GPT_NONE` / `MR_GPT_PRIMARY` / `MR_GPT_BACKUP`: copia GPT en uso.
+    pub gpt_selected: u32,
+    /// `MR_GPT_PRESENT`.
+    pub gpt_flags: u32,
+    /// `LBA disco = LBA imagen + shift` (0 sin desplazamiento o sin GPT).
+    pub shift: i64,
+    /// Sectores del disco que faltan al final de la imagen (según la GPT).
+    pub trailing_sectors_missing: u64,
+    /// Tamaño de sector con que se interpretó la GPT (0 sin GPT).
+    pub gpt_sector_size: u32,
+    pub reserved: u32,
+    /// GUID de disco de la cabecera elegida, en el orden del disco (ceros si no hay).
+    pub disk_guid: [u8; 16],
+}
+
+/// Una partición (96 bytes). `struct_size` lo escribe el llamador.
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MrPartitionInfo {
+    pub struct_size: u32,
+    /// `MR_ORIGIN_*`.
+    pub origin: u32,
+    /// Entrada en su tabla (0 a 3) o índice GPT.
+    pub slot: u32,
+    /// Tipo MBR (0 en GPT).
+    pub mbr_type: u32,
+    /// EBR de una lógica (0 en las demás).
+    pub ebr_lba: u64,
+    pub start_lba: u64,
+    pub sector_count: u64,
+    /// 1 = activa (indicador 0x80).
+    pub active: u32,
+    /// `MR_CONFIDENCE_*`.
+    pub confidence: u32,
+    /// Anomalías propias de la partición.
+    pub anomaly_count: u32,
+    pub reserved: u32,
+    /// GUID de tipo GPT en el orden del disco (ceros en MBR).
+    pub gpt_type: [u8; 16],
+    /// GUID único GPT en el orden del disco (ceros en MBR).
+    pub unique_guid: [u8; 16],
+    /// Atributos GPT de 64 bits (0 en MBR).
+    pub attributes: u64,
+}
+
+/// Una anomalía (40 bytes). `struct_size` lo escribe el llamador.
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MrPartitionAnomaly {
+    pub struct_size: u32,
+    /// `MR_ANOMALY_*` (código numérico estable).
+    pub code: u32,
+    /// `MR_SEVERITY_*`.
+    pub severity: u32,
+    /// `MR_ANOMALY_HAS_TARGET | MR_ANOMALY_HAS_VALUE`.
+    pub flags: u32,
+    /// Sector de tabla donde se detectó.
+    pub lba: u64,
+    pub target_lba: u64,
+    pub value: u64,
+}
+
+/// Código numérico estable de una anomalía (`MR_ANOMALY_*` en la cabecera).
+pub fn anomaly_code(a: &Anomaly) -> u32 {
+    use mr_part::mbr::MbrAnomaly as M;
+    match a {
+        Anomaly::UnreadableSector { .. } => 1,
+        Anomaly::Mbr(m) => match m {
+            M::NoTable { .. } => 100,
+            M::Empty { .. } => 101,
+            M::SignatureMissing { .. } => 102,
+            M::InvalidBootIndicator { .. } => 103,
+            M::MultipleActive { .. } => 104,
+            M::MultipleExtended { .. } => 105,
+            M::OutsideDisk { .. } => 106,
+            M::PartiallyOutsideDisk { .. } => 107,
+            M::Overlap { .. } => 108,
+            M::UnknownType { .. } => 109,
+            M::ZeroLength { .. } => 110,
+            M::EbrLoop { .. } => 111,
+            M::LinkOutsideDisk { .. } => 112,
+            M::LinkOutsideExtended { .. } => 113,
+            M::ChainLimit { .. } => 114,
+            M::LogicalOutsideExtended { .. } => 115,
+            M::EbrInvalid { .. } => 116,
+            M::ExtraDataEntries { .. } => 117,
+            M::ProtectiveStart { .. } => 118,
+            M::ProtectiveSizeMismatch { .. } => 119,
+            M::Hybrid { .. } => 120,
+            M::Superfloppy { .. } => 121,
+            M::HybridMismatch { .. } => 122,
+        },
+        Anomaly::Gpt(g) => gpt_anomaly_code(g),
+    }
+}
+
+/// Códigos 201 a 241 (bloque reservado a GPT): las anomalías de una copia concreta usan un código
+/// para la primaria (impar) y el siguiente para la de respaldo.
+fn gpt_anomaly_code(g: &mr_part::gpt::GptAnomaly) -> u32 {
+    use mr_part::gpt::{GptAnomaly as G, GptCopy};
+    let per_copy = |base: u32, copy: &GptCopy| match copy {
+        GptCopy::Primary => base,
+        GptCopy::Backup => base + 1,
+    };
+    match g {
+        G::HeaderMissing { copy, .. } => per_copy(201, copy),
+        G::HeaderOutsideImage { copy, .. } => per_copy(203, copy),
+        G::HeaderCrc { copy, .. } => per_copy(205, copy),
+        G::HeaderSize { copy, .. } => per_copy(207, copy),
+        G::RevisionUnsupported { copy, .. } => per_copy(209, copy),
+        G::RevisionMinor { copy, .. } => per_copy(211, copy),
+        G::MyLbaMismatch { copy, .. } => per_copy(213, copy),
+        G::AlternateLbaMismatch { copy, .. } => per_copy(215, copy),
+        G::UsableRangeInvalid { copy, .. } => per_copy(217, copy),
+        G::EntriesLocationInvalid { copy, .. } => per_copy(219, copy),
+        G::EntryArrayLimits { copy, .. } => per_copy(221, copy),
+        G::EntriesCrc { copy, .. } => per_copy(223, copy),
+        G::EntriesOutsideImage { copy, .. } => per_copy(225, copy),
+        G::BackupInUse { .. } => 230,
+        G::CopiesDisagree { .. } => 231,
+        G::ImageShifted { .. } => 232,
+        G::ImageTruncated { .. } => 233,
+        G::UsableRangeOutsideImage { .. } => 234,
+        G::SectorSizeMismatch { .. } => 235,
+        G::EntryInverted { .. } => 236,
+        G::EntryOutsideUsable { .. } => 237,
+        G::EntryOutsideImage { .. } => 238,
+        G::EntryOverlap { .. } => 239,
+        G::DuplicateUniqueGuid { .. } => 240,
+        G::NameInvalid { .. } => 241,
+    }
+}
+
+fn confidence_code(c: &Confidence) -> u32 {
+    match c {
+        Confidence::Valid => MR_CONFIDENCE_VALID,
+        Confidence::ValidWithFixes(_) => MR_CONFIDENCE_VALID_WITH_FIXES,
+        Confidence::Suspicious(_) => MR_CONFIDENCE_SUSPICIOUS,
+        Confidence::Invalid(_) => MR_CONFIDENCE_INVALID,
+    }
+}
+
+fn severity_code(s: mr_part::Severity) -> u32 {
+    match s {
+        mr_part::Severity::Notice => MR_SEVERITY_NOTICE,
+        mr_part::Severity::Compensated => MR_SEVERITY_COMPENSATED,
+        mr_part::Severity::Suspicious => MR_SEVERITY_SUSPICIOUS,
+        mr_part::Severity::Invalid => MR_SEVERITY_INVALID,
+    }
+}
+
+fn scheme_code(s: Scheme) -> u32 {
+    match s {
+        Scheme::None => MR_SCHEME_NONE,
+        Scheme::Mbr => MR_SCHEME_MBR,
+        Scheme::Gpt => MR_SCHEME_GPT,
+        Scheme::Hybrid => MR_SCHEME_HYBRID,
+    }
+}
 
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]
@@ -198,6 +411,11 @@ enum Entry {
         /// Índices materializados del informe (se calculan una vez al consultar el resultado),
         /// para que las consultas por índice sean O(1) bajo el bloqueo del registro.
         index: Option<VerifyIndex>,
+    },
+    /// Tabla de particiones leída de un origen (que se conserva para abrir particiones).
+    Partitions {
+        parent: Source,
+        table: Box<PartitionTable>,
     },
 }
 
@@ -1265,6 +1483,385 @@ pub unsafe extern "C" fn mr_verify_untrusted_range(
     })
 }
 
+// ---------- Particiones ----------
+
+/// Lee la tabla de particiones del origen y devuelve un handle para consultarla por índice. La
+/// lectura es tolerante: un sector ilegible se informa como anomalía, no como error.
+///
+/// # Safety
+/// `out_table` debe ser un puntero válido.
+#[no_mangle]
+pub unsafe extern "C" fn mr_source_partitions(source_h: u64, out_table: *mut u64) -> i32 {
+    guard(|| {
+        if out_table.is_null() {
+            return fail(MR_ERR_INVALID_ARGUMENT, "puntero de salida nulo");
+        }
+        let src = match source(source_h) {
+            Ok(s) => s,
+            Err(c) => return c,
+        };
+        match mr_api::partitions(src.as_ref()) {
+            // SAFETY: `out_table` no es nulo.
+            Ok(table) => unsafe {
+                write_out(
+                    out_table,
+                    insert(Entry::Partitions {
+                        parent: src,
+                        table: Box::new(table),
+                    }),
+                )
+            },
+            Err(e) => api_fail(&e),
+        }
+    })
+}
+
+/// Ejecuta `f` sobre una tabla de particiones registrada.
+fn with_partitions<R>(h: u64, f: impl FnOnce(&Source, &PartitionTable) -> R) -> Result<R, i32> {
+    match with_entry(h, |e| match e {
+        Entry::Partitions { parent, table } => Some(f(parent, table)),
+        _ => None,
+    }) {
+        Some(Some(r)) => Ok(r),
+        _ => Err(fail(
+            MR_ERR_INVALID_HANDLE,
+            format!("handle de tabla de particiones no válido: {h}"),
+        )),
+    }
+}
+
+/// Comprueba el `struct_size` que el llamador escribió en una estructura de salida versionada.
+///
+/// # Safety
+/// `out` debe ser nulo o apuntar a una estructura escribible que empiece por `struct_size`.
+unsafe fn check_struct_size<T>(out: *mut T, name: &str) -> Result<(), i32> {
+    if out.is_null() {
+        return Err(fail(MR_ERR_INVALID_ARGUMENT, "puntero de salida nulo"));
+    }
+    // SAFETY: no nulo; el primer campo de toda estructura versionada es `struct_size` (u32).
+    let size = unsafe { out.cast::<u32>().read_unaligned() };
+    let expected = std::mem::size_of::<T>();
+    if size as usize != expected {
+        return Err(fail(
+            MR_ERR_INVALID_ARGUMENT,
+            format!("tamaño de {name} no válido: {size} (se esperaba {expected})"),
+        ));
+    }
+    Ok(())
+}
+
+fn index_error(what: &str, index: u64) -> i32 {
+    fail(
+        MR_ERR_OUT_OF_RANGE,
+        format!("índice de {what} fuera de límites: {index}"),
+    )
+}
+
+/// Esquema, tamaño de sector, confianza y recuentos de la tabla.
+///
+/// # Safety
+/// `out` debe apuntar a un `MrPartitionTableInfo` escribible con `struct_size` ya escrito.
+#[no_mangle]
+pub unsafe extern "C" fn mr_partitions_info(table_h: u64, out: *mut MrPartitionTableInfo) -> i32 {
+    guard(|| {
+        // SAFETY: contrato del llamador.
+        if let Err(c) = unsafe { check_struct_size(out, "mr_partition_table_info") } {
+            return c;
+        }
+        match with_partitions(table_h, |_, t| {
+            let g = t.gpt.as_ref();
+            MrPartitionTableInfo {
+                struct_size: std::mem::size_of::<MrPartitionTableInfo>() as u32,
+                scheme: scheme_code(t.scheme),
+                sector_size: t.sector_size,
+                confidence: confidence_code(&t.confidence()),
+                partition_count: t.partitions.len() as u64,
+                anomaly_count: t.anomalies.len() as u64,
+                gpt_selected: match g.and_then(|g| g.selected) {
+                    None => MR_GPT_NONE,
+                    Some(mr_part::gpt::GptCopy::Primary) => MR_GPT_PRIMARY,
+                    Some(mr_part::gpt::GptCopy::Backup) => MR_GPT_BACKUP,
+                },
+                gpt_flags: if g.is_some() { MR_GPT_PRESENT } else { 0 },
+                shift: t.shift(),
+                trailing_sectors_missing: g.map_or(0, |g| g.trailing_sectors_missing),
+                gpt_sector_size: g.map_or(0, |g| g.sector_size),
+                reserved: 0,
+                disk_guid: g.and_then(|g| g.header()).map_or([0; 16], |h| h.disk_guid),
+            }
+        }) {
+            // SAFETY: `out` comprobado.
+            Ok(v) => unsafe { write_out(out, v) },
+            Err(c) => c,
+        }
+    })
+}
+
+/// Partición número `index` (orden: primarias y después lógicas en orden de cadena).
+///
+/// # Safety
+/// `out` debe apuntar a un `MrPartitionInfo` escribible con `struct_size` ya escrito.
+#[no_mangle]
+pub unsafe extern "C" fn mr_partition_get(
+    table_h: u64,
+    index: u32,
+    out: *mut MrPartitionInfo,
+) -> i32 {
+    guard(|| {
+        // SAFETY: contrato del llamador.
+        if let Err(c) = unsafe { check_struct_size(out, "mr_partition_info") } {
+            return c;
+        }
+        let r = with_partitions(table_h, |_, t| {
+            let p = t.partitions.get(index as usize)?;
+            let (origin, slot, ebr_lba) = match p.origin {
+                Origin::Primary { slot } => (MR_ORIGIN_PRIMARY, u32::from(slot), 0),
+                Origin::Logical { ebr_lba, slot } => (MR_ORIGIN_LOGICAL, u32::from(slot), ebr_lba),
+                Origin::Gpt { index } => (MR_ORIGIN_GPT, index, 0),
+            };
+            let (mbr_type, gpt_type) = match p.kind {
+                PartitionKind::Mbr(t) => (u32::from(t), [0u8; 16]),
+                PartitionKind::Gpt(g) => (0, g),
+            };
+            let extra = t.gpt_entry(p);
+            Some(MrPartitionInfo {
+                struct_size: std::mem::size_of::<MrPartitionInfo>() as u32,
+                origin,
+                slot,
+                mbr_type,
+                ebr_lba,
+                start_lba: p.start_lba,
+                sector_count: p.sector_count,
+                active: u32::from(p.active),
+                confidence: confidence_code(&p.confidence),
+                anomaly_count: u32::try_from(p.anomalies.len()).unwrap_or(u32::MAX),
+                reserved: 0,
+                gpt_type,
+                unique_guid: extra.map_or([0; 16], |e| e.unique_guid),
+                attributes: extra.map_or(0, |e| e.attributes),
+            })
+        });
+        match r {
+            // SAFETY: `out` comprobado.
+            Ok(Some(v)) => unsafe { write_out(out, v) },
+            Ok(None) => index_error("partición", u64::from(index)),
+            Err(c) => c,
+        }
+    })
+}
+
+/// Nombre legible del tipo de la partición (cadena vacía si es desconocido).
+///
+/// # Safety
+/// Ver contrato de cadenas de salida.
+#[no_mangle]
+pub unsafe extern "C" fn mr_partition_type_name(
+    table_h: u64,
+    index: u32,
+    buf: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> i32 {
+    guard(|| {
+        let r = with_partitions(table_h, |_, t| {
+            t.partitions
+                .get(index as usize)
+                .map(|p| p.kind.type_name().unwrap_or("").to_string())
+        });
+        match r {
+            // SAFETY: contrato del llamador.
+            Ok(Some(name)) => unsafe { write_str(&name, buf, cap, out_len) },
+            Ok(None) => index_error("partición", u64::from(index)),
+            Err(c) => c,
+        }
+    })
+}
+
+/// Nombre GPT de la partición (cadena vacía en MBR).
+///
+/// # Safety
+/// Ver contrato de cadenas de salida.
+#[no_mangle]
+pub unsafe extern "C" fn mr_partition_name(
+    table_h: u64,
+    index: u32,
+    buf: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> i32 {
+    guard(|| {
+        let r = with_partitions(table_h, |_, t| {
+            t.partitions
+                .get(index as usize)
+                .map(|p| p.name.clone().unwrap_or_default())
+        });
+        match r {
+            // SAFETY: contrato del llamador.
+            Ok(Some(name)) => unsafe { write_str(&name, buf, cap, out_len) },
+            Ok(None) => index_error("partición", u64::from(index)),
+            Err(c) => c,
+        }
+    })
+}
+
+/// Anomalía `anomaly_index` de la partición `partition_index` o, con `MR_PARTITION_TABLE`, de la
+/// tabla.
+fn anomaly_at(t: &PartitionTable, partition_index: u32, anomaly_index: u32) -> Option<&Anomaly> {
+    let list = if partition_index == MR_PARTITION_TABLE {
+        &t.anomalies
+    } else {
+        &t.partitions.get(partition_index as usize)?.anomalies
+    };
+    list.get(anomaly_index as usize)
+}
+
+/// Anomalía de una partición o de la tabla (`partition_index = MR_PARTITION_TABLE`).
+///
+/// # Safety
+/// `out` debe apuntar a un `MrPartitionAnomaly` escribible con `struct_size` ya escrito.
+#[no_mangle]
+pub unsafe extern "C" fn mr_partition_anomaly(
+    table_h: u64,
+    partition_index: u32,
+    anomaly_index: u32,
+    out: *mut MrPartitionAnomaly,
+) -> i32 {
+    guard(|| {
+        // SAFETY: contrato del llamador.
+        if let Err(c) = unsafe { check_struct_size(out, "mr_partition_anomaly") } {
+            return c;
+        }
+        let r = with_partitions(table_h, |_, t| {
+            anomaly_at(t, partition_index, anomaly_index).map(|a| {
+                let (target, value) = (a.target(), a.value());
+                let mut flags = 0;
+                if target.is_some() {
+                    flags |= MR_ANOMALY_HAS_TARGET;
+                }
+                if value.is_some() {
+                    flags |= MR_ANOMALY_HAS_VALUE;
+                }
+                if a.value_signed() {
+                    flags |= MR_ANOMALY_VALUE_SIGNED;
+                }
+                MrPartitionAnomaly {
+                    struct_size: std::mem::size_of::<MrPartitionAnomaly>() as u32,
+                    code: anomaly_code(a),
+                    severity: severity_code(a.severity()),
+                    flags,
+                    lba: a.lba().unwrap_or(0),
+                    target_lba: target.unwrap_or(0),
+                    value: value.unwrap_or(0),
+                }
+            })
+        });
+        match r {
+            // SAFETY: `out` comprobado.
+            Ok(Some(v)) => unsafe { write_out(out, v) },
+            Ok(None) => index_error("anomalía", u64::from(anomaly_index)),
+            Err(c) => c,
+        }
+    })
+}
+
+/// Código textual estable y descripción legible de una anomalía, separados por un salto de línea:
+/// `"<código>\n<descripción>"`.
+///
+/// # Safety
+/// Ver contrato de cadenas de salida.
+#[no_mangle]
+pub unsafe extern "C" fn mr_partition_anomaly_text(
+    table_h: u64,
+    partition_index: u32,
+    anomaly_index: u32,
+    buf: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> i32 {
+    guard(|| {
+        let r = with_partitions(table_h, |_, t| {
+            anomaly_at(t, partition_index, anomaly_index).map(|a| format!("{}\n{a}", a.code()))
+        });
+        match r {
+            // SAFETY: contrato del llamador.
+            Ok(Some(text)) => unsafe { write_str(&text, buf, cap, out_len) },
+            Ok(None) => index_error("anomalía", u64::from(anomaly_index)),
+            Err(c) => c,
+        }
+    })
+}
+
+/// Abre la partición `index` como origen independiente (vista acotada del origen de la tabla; si
+/// termina fuera del origen se abre la parte existente). Una partición GPT de una imagen desplazada
+/// se rechaza (`MR_ERR_INVALID_ARGUMENT`): use `mr_partition_open_ex` con
+/// `MR_PARTITION_OPEN_APPLY_SHIFT`. Se cierra con `mr_source_close`.
+///
+/// # Safety
+/// `out_source` debe ser un puntero válido.
+#[no_mangle]
+pub unsafe extern "C" fn mr_partition_open(table_h: u64, index: u32, out_source: *mut u64) -> i32 {
+    // SAFETY: mismo contrato.
+    unsafe { mr_partition_open_ex(table_h, index, 0, out_source) }
+}
+
+/// Como `mr_partition_open`; con `MR_PARTITION_OPEN_APPLY_SHIFT` una partición GPT de una imagen
+/// desplazada se abre en `LBA disco - shift` y `mr_source_describe` indica el desplazamiento
+/// aplicado. Otros bits → `MR_ERR_INVALID_ARGUMENT`.
+///
+/// # Safety
+/// `out_source` debe ser un puntero válido.
+#[no_mangle]
+pub unsafe extern "C" fn mr_partition_open_ex(
+    table_h: u64,
+    index: u32,
+    flags: u32,
+    out_source: *mut u64,
+) -> i32 {
+    guard(|| {
+        if out_source.is_null() {
+            return fail(MR_ERR_INVALID_ARGUMENT, "puntero de salida nulo");
+        }
+        if flags & !MR_PARTITION_OPEN_APPLY_SHIFT != 0 {
+            return fail(
+                MR_ERR_INVALID_ARGUMENT,
+                "opciones de apertura de partición no válidas",
+            );
+        }
+        let r = with_partitions(table_h, |parent, t| {
+            ((index as usize) < t.partitions.len()).then(|| (Arc::clone(parent), t.clone()))
+        });
+        let (parent, table) = match r {
+            Ok(Some(v)) => v,
+            Ok(None) => return index_error("partición", u64::from(index)),
+            Err(c) => return c,
+        };
+        let apply = flags & MR_PARTITION_OPEN_APPLY_SHIFT != 0;
+        match mr_api::open_partition(&parent, &table, index as usize, apply) {
+            // SAFETY: `out_source` no es nulo.
+            Ok(src) => unsafe { write_out(out_source, insert(Entry::Source(src))) },
+            Err(e) => api_fail(&e),
+        }
+    })
+}
+
+/// Libera una tabla de particiones (los orígenes abiertos desde ella siguen siendo válidos).
+#[no_mangle]
+pub extern "C" fn mr_partitions_free(table_h: u64) -> i32 {
+    guard(|| {
+        let mut map = registry().lock().unwrap_or_else(|p| p.into_inner());
+        match map.get(&table_h) {
+            Some(Entry::Partitions { .. }) => {
+                map.remove(&table_h);
+                MR_OK
+            }
+            _ => fail(
+                MR_ERR_INVALID_HANDLE,
+                format!("handle de tabla de particiones no válido: {table_h}"),
+            ),
+        }
+    })
+}
+
 // ---------- Tareas: comunes ----------
 
 /// # Safety
@@ -1279,7 +1876,7 @@ pub unsafe extern "C" fn mr_task_status_get(task: u64, out: *mut MrTaskStatus) -
             let (state, (done, total)) = match e {
                 Entry::Hash { task, .. } => (task.state(), task.progress()),
                 Entry::Verify { task, .. } => (task.state(), task.progress()),
-                Entry::Source(_) => return None,
+                Entry::Source(_) | Entry::Partitions { .. } => return None,
             };
             Some(MrTaskStatus {
                 state: state as u32,
@@ -1308,7 +1905,7 @@ pub extern "C" fn mr_task_cancel(task: u64) -> i32 {
                 task.cancel();
                 true
             }
-            Entry::Source(_) => false,
+            Entry::Source(_) | Entry::Partitions { .. } => false,
         });
         if cancelled == Some(true) {
             MR_OK

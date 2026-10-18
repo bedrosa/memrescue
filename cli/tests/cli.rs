@@ -342,3 +342,143 @@ fn sectors_use_the_configured_fill_patterns() {
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     assert!(String::from_utf8_lossy(&o.stdout).contains("11 11 11 11"));
 }
+
+/// Disco de 4096 sectores (cada byte = LBA mod 256 fuera de las tablas): primaria activa 0x07 en
+/// [2048, +1024), extendida 0x0F en [3072, +1024) con una lógica Linux en 3136 y un tipo
+/// desconocido 0x7F que termina fuera del disco.
+fn partitioned_image(dir: &std::path::Path) -> std::path::PathBuf {
+    let mut d: Vec<u8> = (0..4096 * 512).map(|i| (i / 512) as u8).collect();
+    let mut table = |lba: usize, entries: &[(u8, u8, u32, u32)]| {
+        let s = &mut d[lba * 512..(lba + 1) * 512];
+        s.fill(0);
+        for (i, &(boot, kind, start, count)) in entries.iter().enumerate() {
+            let e = &mut s[0x1BE + 16 * i..0x1BE + 16 * (i + 1)];
+            e[0] = boot;
+            e[4] = kind;
+            e[8..12].copy_from_slice(&start.to_le_bytes());
+            e[12..16].copy_from_slice(&count.to_le_bytes());
+        }
+        s[510] = 0x55;
+        s[511] = 0xAA;
+    };
+    table(0, &[(0x80, 0x07, 2048, 1024), (0, 0x0F, 3072, 1024)]);
+    table(3072, &[(0, 0x83, 64, 512), (0, 0x05, 640, 384)]);
+    table(3712, &[(0, 0x7F, 64, 900)]);
+    let img = dir.join("p.img");
+    std::fs::write(&img, d).unwrap();
+    img
+}
+
+#[test]
+fn partitions_lists_table_confidence_and_anomalies() {
+    let dir = tempfile::tempdir().unwrap();
+    let img = partitioned_image(dir.path());
+    let f = img.to_str().unwrap();
+    let o = cli().args(["partitions", f]).output().unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(out.contains("Esquema:         MBR"), "{out}");
+    assert!(out.contains("Confianza:       SOSPECHOSA"), "{out}");
+    assert!(out.contains("NTFS / exFAT / HPFS"), "{out}");
+    assert!(out.contains("lógica (EBR 3072)"), "{out}");
+    assert!(out.contains("0x7F desconocido"), "{out}");
+    assert!(out.contains("mbr_unknown_type"), "{out}");
+    assert!(out.contains("mbr_partially_outside_disk"), "{out}");
+    let o = cli().args(["partitions", f, "--json"]).output().unwrap();
+    assert!(o.status.success());
+    let json = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        json.starts_with("{\"scheme\":\"mbr\",\"sector_size\":512,\"confidence\":\"suspicious\""),
+        "{json}"
+    );
+    assert!(json.contains("{\"number\":1,\"origin\":\"primary\",\"slot\":0,\"ebr_lba\":null,\"start_lba\":2048,\"sectors\":1024,\"end_lba\":3071,\"type\":7,\"type_name\":\"NTFS / exFAT / HPFS\",\"active\":true,\"confidence\":\"valid\",\"anomalies\":[]}"), "{json}");
+    assert!(
+        json.contains("\"origin\":\"logical\",\"slot\":0,\"ebr_lba\":3072,\"start_lba\":3136"),
+        "{json}"
+    );
+    assert!(json.contains("\"code\":\"mbr_unknown_type\",\"severity\":\"suspicious\",\"lba\":3712,\"target_lba\":null,\"value\":127"), "{json}");
+    // Sin tabla: esquema none con la anomalía informativa.
+    let blank = dir.path().join("blank.img");
+    std::fs::write(&blank, vec![0u8; 64 * 512]).unwrap();
+    let o = cli()
+        .args(["partitions", blank.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    assert!(o.status.success());
+    let json = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        json.contains(
+            "\"scheme\":\"none\",\"sector_size\":512,\"confidence\":\"valid\",\"gpt\":null,\"partitions\":[]"
+        ),
+        "{json}"
+    );
+    assert!(json.contains("\"code\":\"mbr_missing\""), "{json}");
+    assert_eq!(
+        std::fs::read(&img).unwrap()[..2],
+        [0, 0],
+        "el origen no cambia"
+    );
+}
+
+#[test]
+fn partition_option_opens_a_partition_for_sectors_and_verify() {
+    let dir = tempfile::tempdir().unwrap();
+    let img = partitioned_image(dir.path());
+    let f = img.to_str().unwrap();
+    // Partición 1: su LBA 1 es la 2049 del disco (bytes 0x01).
+    let o = cli()
+        .args(["sectors", f, "--partition", "1", "--lba", "1"])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(String::from_utf8_lossy(&o.stdout).contains("01 01 01 01"));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("Partición 1: Partición LBA 2048–3071"));
+    // Fuera de la partición: error de operación.
+    let o = cli()
+        .args(["sectors", f, "--partition", "1", "--lba", "1024"])
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(1));
+    // La lógica (partición 2) se verifica entera: 512 sectores.
+    let o = cli()
+        .args(["verify", f, "--partition", "2", "--json"])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(String::from_utf8_lossy(&o.stdout).contains("\"sectors\":512,\"ok\":512,\"bad\":0"));
+    // La recortada (partición 3) se abre hasta el final del disco.
+    let o = cli()
+        .args(["image-info", f, "--partition", "3", "--json"])
+        .output()
+        .unwrap();
+    assert!(o.status.success());
+    let info = String::from_utf8_lossy(&o.stdout);
+    assert!(info.contains("\"sector_count\":320"), "{info}");
+    assert!(info.contains("recortada"), "{info}");
+    // Número inexistente, cero y combinación con --range.
+    let o = cli()
+        .args(["sectors", f, "--partition", "9", "--lba", "0"])
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("no existe la partición 9"));
+    let o = cli()
+        .args(["sectors", f, "--partition", "0", "--lba", "0"])
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(2));
+    let o = cli()
+        .args([
+            "sectors",
+            f,
+            "--partition",
+            "1",
+            "--range",
+            "0:8",
+            "--lba",
+            "0",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(2));
+}

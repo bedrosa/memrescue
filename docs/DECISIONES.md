@@ -372,3 +372,82 @@ en el visor, los sectores `Skipped` solo aparecen en lecturas con salto (CLI `se
 paleta y los textos ya los cubren. El volcado pasa de `TextBox` a `RichTextBox` con el mismo
 `AutomationId` (`HexView`); UI Automation lo lee con `TextPattern`. Detalle en
 `formatos/mapa-de-validez.md` y `API_FFI.md`.
+
+---
+
+## ADR-022 · MBR/EBR: confianza en vez de aceptación y tabla de particiones por handle (Aceptada, 2026-10-18)
+
+**Contexto.** Issue #12 (PT-01). INV-05 §2.3 describe cómo la referencia acepta o rechaza un sector como
+tabla; §5 propone sustituir el booleano por la confianza de `mr_common::Confidence`. Hay que decidir qué
+se lista, cómo se gradúa y cómo cruza la frontera C sin romper la ABI 3.
+
+**Decisión.**
+1. **Sin tabla frente a tabla dudosa.** En la LBA 0 un sector se interpreta como MBR si tiene firma o, sin
+   firma, si es plausible (alguna entrada empieza dentro del disco, indicadores válidos en las entradas
+   usadas y como mucho una extendida). Si no, el esquema es `None` con `MbrAnomaly::NoTable` y su motivo
+   (en blanco, ninguna entrada dentro, indicador, extendidas, cabecera GPT). Un sector de arranque NTFS,
+   exFAT o FAT en la LBA 0 es `Superfloppy`, no una tabla vacía. La ausencia de tabla es **informativa**
+   (`Severity::Notice`): un disco sin particionar no es un disco dañado.
+2. **Gravedad de cada anomalía** (`Severity`): `Invalid` para indicador no válido en una entrada usada,
+   varias extendidas y entrada que empieza fuera del disco; `Suspicious` para firma ausente, varias
+   activas, tipo desconocido, entrada que termina fuera del disco, solape, problemas de la cadena (bucle,
+   enlace fuera, EBR inutilizable, límite) y sector de tabla ilegible; `Notice` para el resto (híbrido,
+   indicador en entrada libre). La confianza de una partición es la peor de sus anomalías, de las de la
+   tabla que la mencionan y de la falta de firma de su propia tabla; la del conjunto, la peor de todas.
+3. **Qué se lista.** Todas las entradas de datos con tamaño mayor que 0, aunque sean inválidas (con su
+   confianza), en orden de entrada y de cadena; la extendida es un contenedor y no se lista. Solo se
+   recorre la primera extendida. Las entradas 0x05, 0x0F y 0x85 son extendidas y enlaces (mejora frente a
+   la referencia, INV-05 §4). Datos relativos al EBR; enlaces relativos al inicio de la extendida; un
+   enlace que sale del disco o de la extendida, o que vuelve a un EBR visitado, termina la cadena con su
+   anomalía; máximo 1024 EBR. Los solapes se informan con un barrido ordenado (como mucho una anomalía
+   por partición), para que la salida quede acotada.
+4. **GPT.** Con una única entrada 0xEE el esquema es `Gpt` (con comprobación de inicio en la LBA 1 y de
+   tamaño, que admite 0xFFFFFFFF); con 0xEE y otras entradas, `Hybrid`, que lista las entradas MBR
+   distintas de 0xEE. Las particiones GPT las añadirá #13 en `read_partition_table`.
+5. **ABI.** Ampliación compatible de la ABI 3 (`API_FFI.md`): la tabla se lee una vez y queda en el
+   registro de handles junto a su origen (se pueden abrir particiones aunque el origen se cierre); se
+   consulta por índice con estructuras de salida versionadas por `struct_size`; cada anomalía lleva código
+   numérico estable, gravedad, LBA, destino y valor, y un texto con el código textual y la descripción
+   separados por un salto de línea. Abrir una partición que termina fuera del origen abre la parte
+   existente y lo dice en la descripción; nunca se inventan sectores.
+
+**Alternativas.** Rechazar la tabla como la referencia (se perdería la información de tablas dañadas que
+el usuario necesita ver); devolver toda la tabla serializada en una cadena JSON por la ABI (obligaría a
+la interfaz a analizar texto y no permitiría abrir particiones por índice).
+
+**Consecuencias.** La interfaz y la CLI muestran siempre lo que hay, con su grado de confianza, en lugar
+de ocultar tablas dañadas. La búsqueda de particiones perdidas (#15) podrá reutilizar `read_mbr_at` en
+posiciones candidatas con sus propias reglas estrictas. Los nombres de tipo son una lista propia de
+identificadores públicos; un tipo que no figura se informa como desconocido.
+
+### Adenda (2026-10-18): integración con GPT (#13)
+
+1. **Esquema.** `read_partition_table` (`core/mr-part/src/table.rs`) lee el MBR y, si es protector o
+   híbrido, o si la LBA 0 no tiene una tabla MBR utilizable (en blanco, ilegible, no plausible o con una
+   cabecera GPT) pero aparece alguna firma `EFI PART`, incorpora la GPT (`gpt::read_gpt`): esquema `Gpt`
+   (también para imágenes desplazadas sin MBR) o `Hybrid`. Con un MBR clásico o un disco sin
+   particionar la GPT no se mira (una GPT obsoleta no cambia lo que dice el MBR).
+2. **Unión.** Se listan las particiones MBR (en un híbrido, sus entradas distintas de 0xEE) y después
+   las GPT (`Origin::Gpt`, con nombre; GUID único y atributos en `PartitionTable::gpt_entry`). Las
+   anomalías GPT se añaden a las de la tabla sin duplicados. En un híbrido, cada entrada MBR que no
+   coincide en inicio y tamaño con una GPT recibe `hybrid_mbr_mismatch`. La lectura GPT completa queda
+   en `PartitionTable::gpt` (copia en uso, desplazamiento, sectores finales ausentes, GUID de disco).
+3. **Gravedad GPT.** `Severity::Compensated` (nueva) para el daño de una copia o de su posición: la
+   tabla queda «válida con correcciones», como en el lector GPT; sospechosas las que afectan a la imagen
+   o a la copia elegida (desplazamiento, recorte, rango fuera de la imagen, copias en desacuerdo,
+   tamaño de sector distinto, solapes y entradas fuera de rango); inválida la entrada invertida. La
+   confianza del conjunto es la peor entre la de las anomalías y la que da el lector GPT (inválida si
+   ninguna copia es utilizable).
+4. **Desplazamiento: opción segura.** Las particiones GPT conservan las LBA **del disco**. Abrir una
+   partición GPT de una imagen desplazada se **rechaza** por defecto (`InvalidArgument` con el
+   desplazamiento en el mensaje); solo con una petición explícita (`apply_shift` en `mr_api`,
+   `MR_PARTITION_OPEN_APPLY_SHIFT` en la ABI, `--apply-shift` en la CLI, confirmación en la interfaz) se
+   abre en `LBA disco - shift`, calculado con el desplazamiento informado, y la descripción del nuevo
+   origen lo dice («desplazamiento aplicado»). Si la partición empieza antes del inicio de la imagen,
+   se rechaza siempre. Una tabla interpretada con otro tamaño de sector que el del origen también se
+   rechaza: hay que reabrir el origen con ese tamaño (las LBA no se convierten en silencio).
+5. **ABI.** Sigue siendo una ampliación compatible de la ABI 3: `mr_partition_table_info` crece a 80 B
+   (copia GPT, desplazamiento con signo, sectores finales ausentes, tamaño de sector GPT y GUID de
+   disco) y `mr_partition_info` a 96 B (GUID único y atributos) antes de publicarse; funciones nuevas
+   `mr_partition_name` y `mr_partition_open_ex`; códigos GPT 201-241 en el bloque reservado y
+   `MR_ANOMALY_VALUE_SIGNED` para el valor de `image_shifted`.

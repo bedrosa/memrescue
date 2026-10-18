@@ -27,7 +27,7 @@ memrescue-cli.exe (Rust) ──────────────── llamad
 | Retorno | `int32_t mr_status`: 0 = `MR_OK`; ver tabla de códigos |
 | Cadenas de entrada | UTF-8, puntero + longitud en bytes; no requieren terminador. Puntero nulo solo con longitud 0 |
 | Cadenas de salida | El llamador aporta `(buf, cap, out_len)`. Si cabe, el motor escribe UTF-8 + `\0` y `*out_len` = longitud sin `\0`. Si no, `MR_ERR_BUFFER_TOO_SMALL` y `*out_len` = longitud necesaria (el cliente reintenta con `out_len + 1`) |
-| Estructuras | `#[repr(C)]`, campos de ancho fijo, relleno explícito (`reserved`). Tamaños comprobados por pruebas en ambos lados: `mr_image_info` = 32 B, `mr_task_status` = 24 B, `mr_verify_report` = 72 B, `mr_verify_options` = 48 B |
+| Estructuras | `#[repr(C)]`, campos de ancho fijo, relleno explícito (`reserved`). Tamaños comprobados por pruebas en ambos lados: `mr_image_info` = 32 B, `mr_task_status` = 24 B, `mr_verify_report` = 72 B, `mr_verify_options` = 48 B, `mr_read_options` = 32 B, `mr_partition_table_info` = 80 B, `mr_partition_info` = 96 B, `mr_partition_anomaly` = 40 B |
 | Enteros | `uint64_t` para tamaños y LBA; `uint32_t` para enumeraciones y máscaras |
 | Booleanos | No se usan en la ABI (evita discrepancias de tamaño) |
 
@@ -122,6 +122,35 @@ de errores (IO-09) y `mr_source_read_mapped_ex` con `mr_read_options` (IO-08) se
 versión: no modifican firmas ni estructuras existentes. Límites:
 cadenas de entrada ≤ 64 KiB (`MR_MAX_STRING_BYTES`), lecturas ≤ 64 MiB (`MR_MAX_READ_BYTES`).
 
+## Tablas de particiones (ampliación compatible de la ABI 3, issue #12, ADR-022)
+
+Funciones nuevas; ninguna firma, estructura ni significado existente cambia, así que la versión sigue
+siendo 3. La tabla se lee una vez y se consulta **por índice** a través de un handle propio (del mismo
+registro que orígenes y tareas). Las estructuras de salida son **versionadas**: el llamador escribe
+`struct_size = sizeof(...)` de su cabecera antes de llamar; otro valor se rechaza con
+`MR_ERR_INVALID_ARGUMENT` (mismo esquema que `mr_verify_options`, aplicado a una salida).
+
+| Función | Descripción |
+|---|---|
+| `mr_source_partitions(source, out_table)` | Lee el MBR y su cadena de EBR y, con MBR protector o híbrido (o sin MBR utilizable pero con firma GPT), la GPT con su copia de respaldo (ADR-022 y adenda); devuelve el handle de la tabla. Lectura tolerante: un sector de tabla ilegible es la anomalía `MR_ANOMALY_UNREADABLE_SECTOR`, nunca un error ni datos |
+| `mr_partitions_info(table, out)` | `mr_partition_table_info`: `scheme` (`MR_SCHEME_NONE` 0, `MBR` 1, `GPT` 2, `HYBRID` 3), `sector_size` (unidades de las LBA), `confidence` del conjunto (`MR_CONFIDENCE_VALID` 1, `VALID_WITH_FIXES` 2, `SUSPICIOUS` 3, `INVALID` 4), nº de particiones y de anomalías de la tabla; GPT: `gpt_selected` (`MR_GPT_NONE` 0, `PRIMARY` 1, `BACKUP` 2 = copia de respaldo en uso), `gpt_flags` (`MR_GPT_PRESENT`), `shift` (con signo: LBA disco = LBA imagen + shift), `trailing_sectors_missing`, `gpt_sector_size` y `disk_guid` |
+| `mr_partition_get(table, index, out)` | `mr_partition_info`: `origin` (`MR_ORIGIN_PRIMARY` 1, `LOGICAL` 2, `GPT` 3), `slot`, `mbr_type`, `ebr_lba`, `start_lba`, `sector_count`, `active`, `confidence`, nº de anomalías propias `gpt_type`, `unique_guid` (GUID en el orden del disco; ceros en MBR) y `attributes`. Orden: primarias y lógicas en orden de cadena (en un híbrido, las entradas MBR distintas de 0xEE) y después las GPT, que llevan LBA **del disco** |
+| `mr_partition_name(table, index, buf, cap, out_len)` | Nombre GPT (cadena vacía en MBR) |
+| `mr_partition_type_name(table, index, buf, cap, out_len)` | Nombre legible del tipo MBR o del GUID de tipo GPT (lista propia de identificadores públicos; cadena vacía si es desconocido) |
+| `mr_partition_anomaly(table, partition_index, anomaly_index, out)` | `mr_partition_anomaly`: `code` (`MR_ANOMALY_*`, numérico estable), `severity` (`MR_SEVERITY_NOTICE` 1, `SUSPICIOUS` 2, `INVALID` 3, `COMPENSATED` 4 = daño compensado por la otra copia GPT), `lba` (posición en la imagen), `target_lba` y `value` con `flags` que indican si tienen significado (`MR_ANOMALY_VALUE_SIGNED`: `value` es `int64_t`, desplazamiento de `image_shifted`). `partition_index = MR_PARTITION_TABLE` (0xFFFFFFFF) para las anomalías de la tabla |
+| `mr_partition_anomaly_text(table, partition_index, anomaly_index, buf, cap, out_len)` | `"<código estable>\n<descripción en español>"` (p. ej. `ebr_loop`) |
+| `mr_partition_open(table, index, out_source)` | La partición como origen independiente (`RangeView` sobre el origen de la tabla). Si termina fuera del origen se abre la parte existente y `mr_source_describe` dice «recortada»; si empieza fuera, si la tabla usa otro tamaño de sector que el origen o si es una partición GPT de una imagen desplazada, `MR_ERR_INVALID_ARGUMENT`. Se cierra con `mr_source_close` |
+| `mr_partition_open_ex(table, index, flags, out_source)` | Igual; con `MR_PARTITION_OPEN_APPLY_SHIFT` una partición GPT de una imagen desplazada se abre en `LBA disco - shift` y `mr_source_describe` dice «desplazamiento aplicado». El desplazamiento nunca se aplica en silencio |
+| `mr_partitions_free(table)` | Libera la tabla; los orígenes abiertos desde ella siguen siendo válidos y la tabla sobrevive al cierre de su origen |
+
+Índices fuera de límites → `MR_ERR_OUT_OF_RANGE`; handle que no es una tabla → `MR_ERR_INVALID_HANDLE`
+(y una tabla no es un origen ni una tarea). Códigos de anomalía: 1 sector ilegible; 100–121 MBR/EBR
+(lista en la cabecera; los códigos textuales coinciden con los del manifiesto del corpus cuando existe
+equivalente; 122 `hybrid_mbr_mismatch`); 201-241 GPT (las de una copia: impar la primaria, par la de respaldo;
+`image_shifted` = 232). En C#: `Source.ReadPartitions()` devuelve
+`PartitionTable` (`EngineHandle`: listas materializadas de `PartitionEntry` y `PartitionAnomaly`, `HasGpt`,
+`GptSelected`, `Shift`, `DiskGuid`, `OpenPartition(index, applyShift)`).
+
 ## Modo tolerante de contenedores (`MR_OPEN_TOLERANT`, ADR-020)
 
 Ampliación compatible de la ABI 3 (nuevo bit de `flags`; las estructuras y la versión no cambian). Sin el
@@ -153,7 +182,7 @@ después de liberarlos.
 
 ## Pruebas que garantizan el contrato
 
-- Rust (`core/mr-ffi/src/tests.rs`, 21 pruebas): tamaños de estructuras, verificación extendida con
+- Rust (`core/mr-ffi/src/tests.rs`, 28 pruebas): tamaños de estructuras (incluidas las de particiones), tabla GPT sintética (copia, GUID de disco, nombre, GUID único, nombre de tipo, apertura) y GPT desplazada (copia de respaldo, `image_shifted` con signo, apertura rechazada sin `MR_PARTITION_OPEN_APPLY_SHIFT` y correcta con él), tablas de particiones por índice (esquema, confianza, anomalías de tabla y de partición, nombres de tipo con búfer pequeño, apertura de una partición y de una recortada, tabla que sobrevive a su origen, `struct_size` incorrecto, punteros nulos, handles de otro tipo, EBR ilegible como anomalía), verificación extendida con
   códigos de error simulados (origen `FaultyDevice` registrado con `mr_api::source_from_device`) y
   validación de `mr_verify_options`, protocolo de búfer pequeño, rutas
   de dispositivo, UTF-8 inválido, punteros nulos y cadenas desmesuradas, handles inválidos o de otro
@@ -166,5 +195,5 @@ después de liberarlos.
 - C# (`app/tests/MemRescue.Core.Interop.Tests`): los mismos contratos desde .NET contra la DLL
   real (política de errores y `ErrorCodeList` en `VerifyPolicyTests`; patrones de relleno, preferencias y
   paleta en `FillPatternTests`, incluidos VHD fijo construido según la especificación, descriptor VMDK malicioso, rangos, estados y
-  divididas y modo tolerante con un VHD dinámico dañado), finalizadores, rutas no ASCII, cancelación, base de datos de trabajo, inmutabilidad del origen y el
+  divididas y modo tolerante con un VHD dinámico dañado; particiones en `PartitionTests` con un disco MBR sintético y el corpus completo), finalizadores, rutas no ASCII, cancelación, base de datos de trabajo, inmutabilidad del origen y el
   corpus sintético (lectura de marcadores en LBA exactas y cabeceras GPT).

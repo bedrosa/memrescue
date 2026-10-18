@@ -78,6 +78,9 @@ public sealed class TestImages : IDisposable
 
     public string MbrBasic => Path.Combine(Directory, "mbr_basic.img");
 
+    /// <summary>MBR con una cadena de EBR en bucle (anomalía <c>ebr_loop</c>).</summary>
+    public string MbrEbrLoop => Path.Combine(Directory, "mbr_ebr_loop.img");
+
     /// <summary>gpt_basic.img envuelto en un VHD fijo.</summary>
     public string GptBasicVhd => Path.Combine(Directory, "gpt_basic.vhd");
 
@@ -109,7 +112,7 @@ public sealed class TestImages : IDisposable
             proc.Kill(entireProcessTree: true);
             throw new TimeoutException("El generador de imágenes no terminó en 60 s.");
         }
-        if (proc.ExitCode != 0 || !File.Exists(GptBasic) || !File.Exists(Gpt4Kn) || !File.Exists(MbrBasic))
+        if (proc.ExitCode != 0 || !File.Exists(GptBasic) || !File.Exists(Gpt4Kn) || !File.Exists(MbrBasic) || !File.Exists(MbrEbrLoop))
         {
             throw new InvalidOperationException($"Falló el generador de imágenes (código {proc.ExitCode}):\n{stdout.Result}\n{stderr.Result}");
         }
