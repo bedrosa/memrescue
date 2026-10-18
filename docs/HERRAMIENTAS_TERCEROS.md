@@ -40,3 +40,34 @@ Estas herramientas **no** forman parte de MemRescue, no se distribuyen con él y
 - Solo sobre imágenes sintéticas creadas por los generadores de MemRescue en `tests/corpus/generated`.
 - Nunca sobre imágenes de usuarios ni dispositivos.
 - Sin opciones de reparación (`qemu-img check -r` prohibido); solo `create`, `convert`, `info`, `map`, `check` (sin `-r`).
+
+## Corpus NTFS: mkntfs, ntfs-3g, libfaketime y The Sleuth Kit (autorizado por el propietario el 2026-10-18, ADR-024)
+
+Se usan **solo en un ejecutor Ubuntu desechable de GitHub Actions** (workflow `NTFS corpus`,
+`.github/workflows/ntfs-corpus.yml`). No se instalan ni se ejecutan en el equipo del desarrollador, no
+forman parte de MemRescue y no se distribuyen con él; lo único que llega al equipo local son las imágenes
+generadas, verificadas por SHA-256 contra los manifiestos versionados (`tools/fetch_ntfs_corpus.py`).
+
+| Herramienta | Paquete de Ubuntu 24.04 (versión de la primera tanda) | Uso | Licencia |
+|---|---|---|---|
+| `mkntfs` | `ntfs-3g` 1:2022.10.3-1.2ubuntu3.2 | Formatear el fichero de imagen (`--zero-time`, geometría fija) | GPL-2.0-or-later |
+| `ntfs-3g` (FUSE) | `ntfs-3g` 1:2022.10.3-1.2ubuntu3.2 (`libntfs-3g89t64`) | Montar la imagen y escribir, borrar, crear dispersos y ADS | GPL-2.0-or-later |
+| libfaketime | `libfaketime` 0.9.10-2.1 | Congelar la hora que ve ntfs-3g (marcas de tiempo reproducibles) | GPL-2.0 |
+| The Sleuth Kit | `sleuthkit` 4.12.1+dfsg-1.1ubuntu2 (`libtsk19t64`) | Oráculo independiente: `mmls`, `fsstat`, `fls`, `istat`, `icat`, `ffind`, `ifind` | IBM-PL-1.0, CPL-1.0, GPL-2.0-or-later y otras (ver `/usr/share/doc/sleuthkit/copyright`) |
+| `sfdisk` | `util-linux` 2.39.3-9ubuntu6.6 (preinstalado) | Tablas MBR y GPT con identificadores fijos | GPL-2.0-or-later |
+
+Normas:
+
+- **Procedencia**: paquetes del archivo oficial de Ubuntu instalados con `apt-get` (firmas del archivo
+  verificadas por apt) en una máquina que GitHub destruye al terminar. El ejecutor está fijado a
+  `ubuntu-24.04` y las acciones de GitHub a un commit concreto (SHA completo).
+- **Versiones registradas**: cada artefacto lleva `PROVENANCE.txt` (imagen del ejecutor, núcleo, versión
+  de cada paquete y de cada herramienta, SHA-256 de cada imagen) y cada manifiesto lleva `tools` con las
+  versiones de los paquetes. Una versión nueva que cambie los bytes de las imágenes hace fallar el
+  workflow hasta que se revisen y se versionen los manifiestos nuevos.
+- **Privilegios**: `sudo` solo en el ejecutor y solo para el montaje FUSE de ntfs-3g; no se usan
+  dispositivos loop ni discos. El token del workflow es de solo lectura y no hay secretos.
+- **Desechable**: nada persiste salvo el artefacto (90 días; el de depuración, 14). Las imágenes se pueden
+  regenerar byte a byte relanzando el workflow.
+- **Uso**: solo sobre las imágenes sintéticas del corpus; nunca sobre imágenes de usuarios ni dispositivos.
+  Pendiente: un conjunto de referencia creado por Windows en una VM desechable (LZNT1), cuando se autorice.

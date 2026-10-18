@@ -1,0 +1,149 @@
+name: NTFS corpus
+
+# Corpus NTFS de pruebas (issue #19, ADR-024). Un ejecutor Ubuntu desechable crea las imágenes con
+# mkntfs y ntfs-3g (paquetes de Ubuntu) y The Sleuth Kit hace de oráculo independiente para los
+# manifiestos. Nada se instala en el equipo del desarrollador: las imágenes se publican como artefacto
+# con su SHA-256 y tools/fetch_ntfs_corpus.py las descarga y las verifica contra los manifiestos
+# versionados en tests/corpus/ntfs/manifests. Ver docs/PLAN_CORPUS_NTFS.md y docs/PRUEBAS.md (§1.2).
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main", "feat/**", "fix/**"]
+    paths:
+      - "tests/generators/ntfs/**"
+      - "tests/generators/validate_ntfs_images.py"
+      - "tests/generators/test_ntfs_validator.py"
+      - "tests/corpus/ntfs/manifests/**"
+      - ".github/workflows/ntfs-corpus.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ntfs-corpus-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DEBIAN_FRONTEND: noninteractive
+  PACKAGES: ntfs-3g libfaketime sleuthkit
+
+jobs:
+  generate:
+    name: Generate NTFS images and TSK manifests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install ntfs-3g, libfaketime and The Sleuth Kit (Ubuntu packages)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends $PACKAGES
+      - name: Generate the corpus (run A)
+        run: bash tests/generators/ntfs/generate.sh out/a
+      - name: Generate the corpus again from scratch (run B)
+        run: bash tests/generators/ntfs/generate.sh out/b
+      - name: Build semantic manifests with The Sleuth Kit (runs A and B)
+        run: |
+          python3 -I tests/generators/ntfs/build_manifests.py out/a out/manifests --compare-with out/b --tsk-dump out/tsk
+          python3 -I tests/generators/ntfs/build_manifests.py out/b out/manifests-b --compare-with out/a
+      - name: Semantic reproducibility (run A and run B give identical manifests)
+        run: diff -r out/manifests out/manifests-b
+      - name: Byte reproducibility report (run A against run B)
+        run: diff out/a/SHA256SUMS out/b/SHA256SUMS && echo "byte-identical" || echo "images differ between runs"
+      - name: Independent re-check of the manifests with The Sleuth Kit
+        run: python3 -I tests/generators/ntfs/verify_tsk.py out/a/images out/manifests
+      - name: Structural validator (Python, no TSK, no generator code)
+        run: python3 -I -X utf8 tests/generators/validate_ntfs_images.py out/a/images out/manifests
+      - name: Validator negative tests
+        run: python3 -I -X utf8 tests/generators/test_ntfs_validator.py out/a/images out/manifests
+      - name: Committed manifests match the TSK truth of this run
+        run: diff -r tests/corpus/ntfs/manifests out/manifests
+      - name: Provenance
+        if: always()
+        run: |
+          mkdir -p out/artifact
+          {
+            echo "MemRescue NTFS corpus"
+            echo "repository: $GITHUB_REPOSITORY"
+            echo "commit: $GITHUB_SHA"
+            echo "ref: $GITHUB_REF"
+            echo "workflow: $GITHUB_WORKFLOW (run $GITHUB_RUN_ID, attempt $GITHUB_RUN_ATTEMPT)"
+            echo "runner image: ${ImageOS:-unknown} ${ImageVersion:-unknown}"
+            echo "kernel: $(uname -srm)"
+            echo "os: $(. /etc/os-release && echo "$PRETTY_NAME")"
+            echo "python: $(python3 --version)"
+            echo
+            echo "apt packages (dpkg-query):"
+            dpkg-query -W -f '  ${Package} ${Version} ${Architecture}\n' ntfs-3g libntfs-3g89t64 libfaketime sleuthkit libtsk19t64 util-linux fuse3 2>/dev/null || true
+            echo
+            echo "tool versions:"
+            echo "  mkntfs: $(/usr/sbin/mkntfs --version 2>&1 | grep -m 1 .)"
+            echo "  ntfs-3g: $(ntfs-3g --version 2>&1 | head -n 1)"
+            echo "  fls: $(fls -V 2>&1 | head -n 1)"
+            echo "  sfdisk: $(sfdisk --version 2>&1 | head -n 1)"
+            echo
+            echo "byte reproducibility (run A vs run B):"
+            if diff -q out/a/SHA256SUMS out/b/SHA256SUMS >/dev/null 2>&1; then echo "  identical"; else echo "  different"; fi
+            echo
+            echo "SHA-256 of the published images:"
+            sed 's/^/  /' out/a/SHA256SUMS 2>/dev/null || true
+          } > out/artifact/PROVENANCE.txt
+          cat out/artifact/PROVENANCE.txt
+      - name: Debug material (manifests, intent, raw TSK output)
+        if: always()
+        run: |
+          mkdir -p out/debug
+          cp -r out/manifests out/debug/ 2>/dev/null || true
+          cp -r out/a/intent out/debug/ 2>/dev/null || true
+          cp out/tsk.zip out/debug/ 2>/dev/null || true
+          cp out/artifact/PROVENANCE.txt out/debug/ 2>/dev/null || true
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: ntfs-corpus-debug
+          path: out/debug
+          retention-days: 14
+          if-no-files-found: warn
+      - name: Assemble the corpus artifact
+        run: |
+          cp out/a/images/*.img out/artifact/
+          cp out/a/SHA256SUMS out/artifact/
+          mkdir -p out/artifact/manifests out/artifact/intent
+          cp out/manifests/*.toml out/artifact/manifests/
+          cp out/a/intent/*.json out/artifact/intent/
+          ls -l out/artifact
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ntfs-corpus
+          path: out/artifact
+          retention-days: 90
+          compression-level: 6
+          if-no-files-found: error
+
+  verify:
+    name: Verify the published artifact on a fresh runner
+    needs: generate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install The Sleuth Kit only (no NTFS tools on this runner)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends sleuthkit
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ntfs-corpus
+          path: corpus
+      - name: SHA-256 of every image against SHA256SUMS
+        run: cd corpus && sha256sum -c SHA256SUMS
+      - name: Structural validator against the committed manifests
+        run: python3 -I -X utf8 tests/generators/validate_ntfs_images.py corpus tests/corpus/ntfs/manifests
+      - name: Validator negative tests
+        run: python3 -I -X utf8 tests/generators/test_ntfs_validator.py corpus tests/corpus/ntfs/manifests
+      - name: Independent re-check with The Sleuth Kit against the committed manifests
+        run: python3 -I tests/generators/ntfs/verify_tsk.py corpus tests/corpus/ntfs/manifests

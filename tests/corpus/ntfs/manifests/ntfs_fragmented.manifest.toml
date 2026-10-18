@@ -1,0 +1,110 @@
+# Generado por tests/generators/ntfs/build_manifests.py con The Sleuth Kit como oráculo: no editar a mano.
+# Esquema en docs/PRUEBAS.md (§1.2). Los runs son [vcn, lcn, clusters] y los dispersos [vcn, clusters].
+schema_version = 1
+name = "ntfs_fragmented"
+file = "ntfs_fragmented.img"
+scenario = "4 ficheros escritos a trozos de 8 KiB intercalados (fragmentados) y 2 contiguos de control"
+generator = "tests/generators/ntfs/generate.sh"
+tools = ["libfaketime 0.9.10-2.1", "ntfs-3g 1:2022.10.3-1.2ubuntu3.2", "sleuthkit 4.12.1+dfsg-1.1ubuntu2", "util-linux 2.39.3-9ubuntu6.6"]
+fake_time = "2026-01-01 00:00:00 UTC"
+image_size = 33554432
+image_sha256 = "8aaca012911a66cc050cb654edaaba66e8b8ea6b781ef6e92cb2bd85581d7006"
+byte_reproducible = true
+entries_live = 7
+entries_deleted = 0
+entries_overwritten = 0
+
+[volume]
+offset = 0
+serial = "34f5ee1202469ff7"
+label = "MR_FRAG"
+version = "Windows XP"
+mft_lcn = 4
+mftmirr_lcn = 4095
+mft_record_size = 1024
+index_record_size = 4096
+mft_entries = 72
+sector_size = 512
+cluster_size = 4096
+total_sectors = 65535
+mft_runs = [[0, 4, 18]]
+backup_boot_offset = 33553920
+
+[[files]]
+path = "/fragmentos"
+type = "dir"
+mft_record = 64
+sequence = 1
+state = "live"
+
+[[files]]
+path = "/fragmentos/contiguo_antes.bin"
+type = "file"
+mft_record = 65
+sequence = 1
+state = "live"
+size = 50000
+sha256 = "b3dfaa33ebcc97e276544083594799a20e254efb3c1752be64e0628b03eb5387"
+resident = false
+runs = [[0, 4608, 13]]
+recoverable = "full"
+
+[[files]]
+path = "/fragmentos/contiguo_despues.bin"
+type = "file"
+mft_record = 70
+sequence = 1
+state = "live"
+size = 70000
+sha256 = "29948495b44c94950834fa2f335cddf98ca4b76787428616aba4bbc8d56bafd5"
+resident = false
+runs = [[0, 4745, 18]]
+recoverable = "full"
+
+[[files]]
+path = "/fragmentos/intercalado_a.bin"
+type = "file"
+mft_record = 66
+sequence = 1
+state = "live"
+size = 98304
+sha256 = "995132b1751550bdaae85b4383b6f531095e3ced9d9aec924fefcc6279d54f8a"
+resident = false
+runs = [[0, 4622, 2], [2, 4630, 2], [4, 4638, 2], [6, 4646, 2], [8, 4654, 2], [10, 4662, 2], [12, 4670, 2], [14, 4678, 2], [16, 4686, 2], [18, 4693, 2], [20, 4699, 2], [22, 4705, 2]]
+recoverable = "full"
+
+[[files]]
+path = "/fragmentos/intercalado_b.bin"
+type = "file"
+mft_record = 67
+sequence = 1
+state = "live"
+size = 131072
+sha256 = "ba85a026e9a9f6efbd5a4c416ba40dd024e87df278f3378e4b82a7a3e0e5ed34"
+resident = false
+runs = [[0, 4624, 2], [2, 4632, 2], [4, 4640, 2], [6, 4648, 2], [8, 4656, 2], [10, 4664, 2], [12, 4672, 2], [14, 4680, 2], [16, 4688, 2], [18, 4695, 2], [20, 4701, 2], [22, 4707, 2], [24, 4711, 2], [26, 4715, 2], [28, 4719, 2], [30, 4723, 2]]
+recoverable = "full"
+
+[[files]]
+path = "/fragmentos/intercalado_c.bin"
+type = "file"
+mft_record = 68
+sequence = 1
+state = "live"
+size = 66536
+sha256 = "f2442b761f4d45582fd3efc473dcf6e2c3d595796625b290756d71c5f78d2d20"
+resident = false
+runs = [[0, 4626, 2], [2, 4634, 2], [4, 4642, 2], [6, 4650, 2], [8, 4658, 2], [10, 4666, 2], [12, 4674, 2], [14, 4682, 2], [16, 4690, 1]]
+recoverable = "full"
+
+[[files]]
+path = "/fragmentos/intercalado_d.bin"
+type = "file"
+mft_record = 69
+sequence = 1
+state = "live"
+size = 204800
+sha256 = "9d0251348f2794bda450fc59ee4bd08780156ddee392eed1bf128f17dcd9f37c"
+resident = false
+runs = [[0, 4628, 2], [2, 4636, 2], [4, 4644, 2], [6, 4652, 2], [8, 4660, 2], [10, 4668, 2], [12, 4676, 2], [14, 4684, 2], [16, 4691, 2], [18, 4697, 2], [20, 4703, 2], [22, 4709, 2], [24, 4713, 2], [26, 4717, 2], [28, 4721, 2], [30, 4725, 20]]
+recoverable = "full"

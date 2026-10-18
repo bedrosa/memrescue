@@ -1,0 +1,189 @@
+# Generado por tests/generators/ntfs/build_manifests.py con The Sleuth Kit como oráculo: no editar a mano.
+# Esquema en docs/PRUEBAS.md (§1.2). Los runs son [vcn, lcn, clusters] y los dispersos [vcn, clusters].
+schema_version = 1
+name = "ntfs_sparse_ads"
+file = "ntfs_sparse_ads.img"
+scenario = "Ficheros dispersos (hueco inicial, intermedio, final, varios huecos y solo hueco) y flujos alternativos en ficheros y en un directorio"
+generator = "tests/generators/ntfs/generate.sh"
+tools = ["libfaketime 0.9.10-2.1", "ntfs-3g 1:2022.10.3-1.2ubuntu3.2", "sleuthkit 4.12.1+dfsg-1.1ubuntu2", "util-linux 2.39.3-9ubuntu6.6"]
+fake_time = "2026-01-01 00:00:00 UTC"
+image_size = 33554432
+image_sha256 = "acb98c78dc627dbddcd7d072309172c717e621042c53480e089b7bc68e73ebfe"
+byte_reproducible = true
+entries_live = 11
+entries_deleted = 0
+entries_overwritten = 0
+
+[volume]
+offset = 0
+serial = "34f5ee1202469ff7"
+label = "MR_SPARSE"
+version = "Windows XP"
+mft_lcn = 4
+mftmirr_lcn = 4095
+mft_record_size = 1024
+index_record_size = 4096
+mft_entries = 76
+sector_size = 512
+cluster_size = 4096
+total_sectors = 65535
+mft_runs = [[0, 4, 19]]
+backup_boot_offset = 33553920
+
+[[files]]
+path = "/disperso"
+type = "dir"
+mft_record = 64
+sequence = 1
+state = "live"
+
+[[files]]
+path = "/disperso/hueco_final.bin"
+type = "file"
+mft_record = 69
+sequence = 1
+state = "live"
+size = 1048576
+sha256 = "0386aafd75aeea4014e44ff57470d29dc28ba1168c3b8030551397cc827108c7"
+resident = false
+runs = [[0, 4768, 16]]
+sparse = [[16, 240]]
+init_size = 65536
+recoverable = "full"
+
+[[files]]
+path = "/disperso/hueco_inicial.bin"
+type = "file"
+mft_record = 67
+sequence = 1
+state = "live"
+size = 851968
+sha256 = "93698d5805452f15c377c900c38c7ea232a72b5fd110ca43ab675cafa359995e"
+resident = false
+runs = [[192, 4608, 16]]
+sparse = [[0, 192]]
+recoverable = "full"
+
+[[files]]
+path = "/disperso/hueco_medio.bin"
+type = "file"
+mft_record = 68
+sequence = 1
+state = "live"
+size = 589824
+sha256 = "804112f5a97ced99cc4771264abd32af48f57f279186a5981252abb10665c0ac"
+resident = false
+runs = [[0, 4624, 16], [128, 4752, 16]]
+sparse = [[16, 112]]
+recoverable = "full"
+
+[[files]]
+path = "/disperso/solo_hueco.bin"
+type = "file"
+mft_record = 71
+sequence = 1
+state = "live"
+size = 524288
+sha256 = "07854d2fef297a06ba81685e660c332de36d5d18d546927d30daad6d7fda1541"
+resident = false
+runs = []
+sparse = [[0, 128]]
+init_size = 0
+recoverable = "full"
+
+[[files]]
+path = "/disperso/varios_huecos.bin"
+type = "file"
+mft_record = 70
+sequence = 1
+state = "live"
+size = 1024000
+sha256 = "2b625b97cecca7df9da164cb737d39685e5c4fd16ef26c175eaff12bf441c2f9"
+resident = false
+runs = [[16, 4784, 3], [64, 4832, 1], [128, 4896, 25], [225, 4993, 1]]
+sparse = [[0, 16], [19, 45], [65, 63], [153, 72], [226, 24]]
+init_size = 922600
+recoverable = "full"
+
+[[files]]
+path = "/flujos"
+type = "dir"
+mft_record = 65
+sequence = 1
+state = "live"
+
+[[files]]
+path = "/flujos/carpeta_con_flujo"
+type = "dir"
+mft_record = 66
+sequence = 1
+state = "live"
+
+[[files.ads]]
+name = "etiqueta"
+size = 100
+sha256 = "158276b270e3228eb8696d229dc5a252433cedf6659d3c40bd5b0ed21c59f7d3"
+resident = true
+
+[[files]]
+path = "/flujos/con_flujos.txt"
+type = "file"
+mft_record = 72
+sequence = 1
+state = "live"
+size = 2048
+sha256 = "76c8754c83c491b02ea9d4cfe1327b6c86013f516d4bb82604b96ef0b1a183c4"
+resident = false
+runs = [[0, 4995, 1]]
+recoverable = "full"
+
+[[files.ads]]
+name = "Zone.Identifier"
+size = 26
+sha256 = "1736db1d5d9d86a455e0bbb80143392700e4a110a1b56c913e614412fa07cebe"
+resident = true
+
+[[files.ads]]
+name = "resumen"
+size = 20000
+sha256 = "306bc46e47eaa9bbcf2abba00f2cf9428dcd08b8f59fc7ec951340359753a9bb"
+resident = false
+runs = [[0, 4996, 5]]
+
+[[files]]
+path = "/flujos/disperso_con_flujo.bin"
+type = "file"
+mft_record = 74
+sequence = 1
+state = "live"
+size = 393216
+sha256 = "3be3cf385f71f39a00e4f956e2a26702ab85a2bed0f7b1d7b7203ca6a4bdfe41"
+resident = false
+runs = [[80, 5003, 16]]
+sparse = [[0, 80]]
+recoverable = "full"
+
+[[files.ads]]
+name = "miniatura"
+size = 3000
+sha256 = "19eddbfc042df5d6c8c1fc3f7593e16415f56626a719e7e15a0bb011d9dda24c"
+resident = false
+runs = [[0, 5019, 1]]
+
+[[files]]
+path = "/flujos/solo_flujo.dat"
+type = "file"
+mft_record = 73
+sequence = 1
+state = "live"
+size = 0
+sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+resident = true
+recoverable = "full"
+
+[[files.ads]]
+name = "datos"
+size = 5000
+sha256 = "389a6873fed0be4015b4674c1605b1fe7617064f0134a6e5e12444e01615a4a1"
+resident = false
+runs = [[0, 5001, 2]]

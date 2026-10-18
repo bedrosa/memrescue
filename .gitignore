@@ -13,6 +13,8 @@ obj/
 
 # Imágenes generadas (se regeneran de forma determinista)
 /tests/corpus/generated/
+# Corpus NTFS descargado del artefacto del workflow ntfs-corpus.yml (tools/fetch_ntfs_corpus.py)
+/tests/corpus/ntfs/generated/
 
 # Bases de datos de trabajo locales
 *.mrdb
