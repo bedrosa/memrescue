@@ -110,7 +110,7 @@ Una fila de `PARIDAD_DMDE_PRO.md` pasa a **Paridad** solo si:
 ```powershell
 # Desde la raíz del repositorio (no requiere administrador)
 powershell -ExecutionPolicy Bypass -File scripts\build.ps1                 # compila todo (Debug)
-powershell -ExecutionPolicy Bypass -File scripts\test.ps1                  # 14 pasos (-SkipGui, -SkipQemu)
+powershell -ExecutionPolicy Bypass -File scripts\test.ps1                  # 15 pasos (-SkipGui, -SkipQemu)
 powershell -ExecutionPolicy Bypass -File scripts\build.ps1 -Configuration Release -Publish   # exe autocontenido
 ```
 
@@ -197,6 +197,19 @@ muestra los picos). Además, pruebas unitarias en `mr-image` del recorrido en fl
 solapes (un millón de zonas idénticas, parada en el primer error), del registro de daños como mapa de
 bits, del fallo inmediato en modo estricto y del contador de presupuesto (límite, liberación y fallo
 de asignación informado como error).
+
+Analizador GPT (issue #13, `formatos/gpt.md`): 21 pruebas unitarias en `core/mr-part/src/gpt.rs` con
+discos GPT sintéticos en memoria (una o más por regla: CRC-32 de cabecera y entradas, tamaño de
+cabecera, revisión, `MyLBA`/`AlternateLBA`, rango utilizable, ubicación de la tabla, límites de
+entradas, solapes, GUID repetidos, nombres, copias en desacuerdo, 4Kn y el otro tamaño de sector,
+desplazamiento y truncado, `FaultyDevice`) y un fuzzing determinista de 3000 iteraciones sin pánicos
+ni bloqueos y con memoria acotada. `core/mr-part/tests/gpt_corpus.rs` (4 pruebas ignoradas por defecto;
+`cargo test -p mr-part --test gpt_corpus -- --ignored` con el corpus generado) compara `read_gpt`
+con los 13 manifiestos que tienen estado GPT (estados de cada copia, copia elegida, desplazamiento,
+sectores finales ausentes, particiones con su marcador y el conjunto exacto de códigos GPT; los de
+MBR/EBR se ignoran), comprueba que las imágenes sin GPT no producen ninguna (las de
+`unreadable_lbas` envueltas en `FaultyDevice`), abre `gpt_4kn` con 512 B y `gpt_basic` con 4096 B y
+simula sectores GPT ilegibles sobre el corpus.
 
 **Integración continua** (`.github/workflows/ci.yml`, detalle en `CONTRIBUTING.md`): las mismas
 comprobaciones se ejecutan en GitHub Actions en cada rama `feat/` o `fix/` y en cada PR, más la auditoría

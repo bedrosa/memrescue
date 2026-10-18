@@ -259,6 +259,7 @@ dependencies = [
 name = "mr-part"
 version = "0.2.0"
 dependencies = [
+ "crc32fast",
  "mr-common",
  "mr-io",
  "tempfile",
