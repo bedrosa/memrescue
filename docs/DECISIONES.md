@@ -501,3 +501,59 @@ una sola evidencia (los sectores ocultos de las lógicas pueden ser relativos al
 al final de un MiB no se encuentran (lo cubrirá el escaneo completo). Las tablas encontradas se
 interpretan con el sector del dispositivo. La comparación manual con DMDE sigue pendiente (ADR-002,
 opcional).
+
+---
+
+## ADR-024 · Corpus NTFS generado en un ejecutor desechable de GitHub Actions con TSK como oráculo (Aceptada, 2026-10-18)
+
+**Contexto.** Issue #19. Ninguna funcionalidad NTFS (M3, M4) puede declararse sin un corpus con verdad
+conocida (ADR-002). `PLAN_CORPUS_NTFS.md` recomendaba generarlo con `mkntfs`/`ntfs-3g` y verificarlo con
+The Sleuth Kit en WSL2, lo que exigía instalar WSL2 con administrador en el equipo del desarrollador.
+
+**Decisión del propietario (2026-10-18).**
+1. El corpus NTFS se genera en un **ejecutor Ubuntu desechable de GitHub Actions** (workflow
+   `ntfs-corpus.yml`): `mkntfs` y `ntfs-3g` (paquetes de Ubuntu, versiones registradas) crean y pueblan
+   las imágenes; **The Sleuth Kit** (`fls`, `istat`, `icat`, `ffind`, además de `mmls`, `fsstat` e `ifind`)
+   es el oráculo independiente que rellena los manifiestos semánticos (rutas, tamaños, SHA-256 vía
+   `icat`, registros MFT, estado borrado, runs, ADS, rangos dispersos).
+2. Nada se instala en el equipo del desarrollador y nada requiere administrador local. Las imágenes se
+   publican como artefacto del workflow con su SHA-256 y un script local (`tools/fetch_ntfs_corpus.py`)
+   las descarga y las verifica contra los manifiestos versionados.
+3. La compresión LZNT1 creada por Windows queda fuera de alcance por ahora (pendiente de una VM Windows
+   desechable).
+
+**Decisión de diseño.**
+- **Reproducibilidad byte a byte** (conseguida y comprobada en cada ejecución): `mkntfs --zero-time`
+  (marcas de tiempo y número de serie fijos), ntfs-3g bajo libfaketime con la hora congelada, montaje
+  directo del fichero en primer plano, contenido derivado de SHAKE-256 con semilla, orden de operaciones
+  fijo e identificadores MBR/GPT fijos. El workflow genera dos veces desde cero y compara; además, el
+  `image_sha256` de los manifiestos versionados obliga a que cada ejecución reproduzca exactamente las
+  imágenes publicadas. La reproducibilidad semántica (manifiestos idénticos) es el criterio de respaldo
+  si una actualización de Ubuntu cambiara los bytes.
+- **Verdad desde TSK, no desde MemRescue ni desde el generador**: `build_manifests.py` recorre todos los
+  registros MFT con `istat`, resuelve las rutas con la cadena de padres de `$FILE_NAME` y obtiene el
+  contenido con `icat`. La intención del generador solo sirve para exigir que TSK vea exactamente lo que
+  se hizo (rutas, inodos de ntfs-3g, tamaños, hashes, marcas de tiempo) y para clasificar los
+  sobrescritos cluster a cluster (`full`, `partial`, `none`, con los ficheros que ocupan ahora los
+  clusters).
+- **Tres validaciones sin código común**: `build_manifests.py` (TSK), `verify_tsk.py` (TSK por otras
+  vías) y `validate_ntfs_images.py` (Python puro: tablas, arranque, `$MFT`, `$MFTMirr`, registros con su
+  secuencia de actualización, mapping pairs y SHA-256 de los datos leídos siguiendo los runs), con 20
+  pruebas negativas. Un segundo job las repite sobre el artefacto descargado en un ejecutor nuevo.
+- Manifiestos versionados en `tests/corpus/ntfs/manifests/` (esquema en `PRUEBAS.md` §1.2); imágenes
+  fuera de git, en `tests/corpus/ntfs/generated/` (ignorado). Acciones fijadas por SHA de commit
+  (`checkout` v7.0.1, `upload-artifact` v7.0.1, `download-artifact` v8.0.1), `permissions: contents:
+  read`, artefacto con retención explícita de 90 días.
+- La CI obligatoria no descarga el corpus hasta que las pruebas del lector NTFS (#20 en adelante) lo
+  usen; entonces lo obtendrán con `fetch_ntfs_corpus.py` o en un job que dependa del workflow.
+
+**Alternativas.** WSL2 en el equipo del desarrollador (requiere administrador y cambia el sistema); VM
+Windows (mejor fidelidad, pendiente para LZNT1); versionar las imágenes en git (≈330 MiB, contrario a la
+política de binarios de la auditoría de higiene); un generador NTFS propio (descartado por ADR-001 y
+por el principio de independencia).
+
+**Consecuencias.** Los NTFS del corpus son de ntfs-3g, no de Windows: sin nombres DOS 8.3, sin huecos
+perforados (ntfs-3g no implementa `fallocate`), sin `$UsnJrnl` y con el mismo número de serie en todas las
+imágenes. Para usar el corpus en local hace falta `gh` autenticado y una ejecución del workflow con
+artefacto vigente (si caduca, se relanza y produce los mismos bytes). Una actualización de ntfs-3g, TSK o
+del núcleo del ejecutor puede obligar a revisar y versionar manifiestos nuevos.

@@ -12,6 +12,8 @@ discos virtuales. Todas las fuentes se abren en solo lectura.
   borrados y su recuperabilidad esperada).
 - Generación con herramientas **independientes** de MemRescue (oráculos de creación):
   - Windows: `diskpart`/`Format-Volume` sobre VHD/VHDX (NTFS, FAT32, exFAT, ReFS si el SO lo permite).
+  - NTFS: `mkntfs` y `ntfs-3g` en un ejecutor Ubuntu desechable de GitHub Actions, con The Sleuth Kit
+    como oráculo (§1.2, ADR-024).
   - Linux (WSL o VM): `sfdisk`, `mkfs.fat`, `mkfs.exfat`, `mkfs.ext2/3/4`, `mkfs.btrfs`, `mkfs.hfsplus`,
     `mdadm` (RAID), `qemu-img` (VMDK/VHD), `xorriso` (ISO).
   - APFS y E01: ver INV-10 e INV-11.
@@ -69,6 +71,63 @@ Tablas:
   `boot_lba`, `backup_boot_lba`, `primary_boot` / `backup_boot` (`valid`, `damaged`, `unreadable`,
   `outside_image`), `evidence` (copias válidas: `boot`, `backup_boot`), `partial` (empieza antes de la
   imagen), `serial` y `suggested_mbr_type`.
+
+### 1.2 Corpus NTFS (issue #19, ADR-024) y su manifiesto semántico (versión 1)
+
+Las imágenes NTFS **no se generan en local**: las crea el workflow `NTFS corpus`
+(`.github/workflows/ntfs-corpus.yml`) en un ejecutor Ubuntu desechable con `mkntfs` y `ntfs-3g`, y la
+verdad de cada manifiesto la obtiene **The Sleuth Kit** (`build_manifests.py`). Los manifiestos están
+versionados en `tests/corpus/ntfs/manifests/*.manifest.toml`; las imágenes se publican como artefacto
+`ntfs-corpus` (90 días) y se regeneran byte a byte (`docs/PLAN_CORPUS_NTFS.md` §4.2).
+
+```powershell
+python -I -X utf8 tools\fetch_ntfs_corpus.py                      # última ejecución con éxito (main o, si no hay, cualquier rama)
+python -I -X utf8 tools\fetch_ntfs_corpus.py --run-id 123456789   # o una ejecución concreta / --branch <rama>
+python -I -X utf8 tests\generators\validate_ntfs_images.py tests\corpus\ntfs\generated tests\corpus\ntfs\manifests
+python -I -X utf8 tests\generators\test_ntfs_validator.py tests\corpus\ntfs\generated tests\corpus\ntfs\manifests
+```
+
+`fetch_ntfs_corpus.py` necesita `gh` autenticado, descarga en un directorio temporal nuevo, exige que
+cada imagen tenga el tamaño y el SHA-256 de su manifiesto versionado y solo entonces la copia a
+`tests/corpus/ntfs/generated/` (ignorado por git). Si el artefacto ha caducado, se relanza el workflow
+(`gh workflow run ntfs-corpus.yml --ref <rama>`): como la generación es byte a byte, los SHA-256 no
+cambian.
+
+**Uso por las pruebas de M3 (#20 en adelante).** Las pruebas de corpus NTFS de Rust serán
+`#[ignore]` y leerán imágenes y manifiestos de esas rutas (variable `MR_NTFS_CORPUS` para otra
+ubicación); en CI, un paso los obtendrá con `tools/fetch_ntfs_corpus.py --branch main` (el token de
+Actions con `actions: read` basta) o se ejecutarán en un job que dependa del workflow del corpus. Mientras
+ninguna prueba los use, la CI obligatoria no descarga el corpus: el workflow `NTFS corpus` ya valida las
+imágenes con TSK, con el validador estructural y con sus pruebas negativas en cada cambio del generador.
+
+**Validación independiente.** Tres comprobaciones que no comparten código entre sí:
+`build_manifests.py` (TSK; además exige que lo que ve TSK coincida con la intención del generador: rutas,
+inodos de ntfs-3g, tamaños, hashes y marcas de tiempo fijadas), `verify_tsk.py` (otra vez TSK, por otras
+vías: `ifind -n`, `ffind`, `fls -u`, `istat`, `icat`, `mmls`) y `validate_ntfs_images.py` (Python puro,
+sin TSK ni generador: tablas MBR/GPT, arranque y su copia, `$MFT`/`$MFTMirr`, cada registro MFT con su
+secuencia de actualización y los runs decodificados de los mapping pairs, y el SHA-256 de cada flujo
+leído de la imagen siguiendo esos runs). `test_ntfs_validator.py` aplica 20 alteraciones (imagen o
+manifiesto, con el SHA-256 recalculado) y exige que el validador detecte cada una.
+
+**Esquema.** Claves de nivel superior: `schema_version` (1), `name`, `file`, `scenario`, `generator`,
+`tools` (paquetes de Ubuntu con versión), `fake_time` (hora congelada de las marcas de tiempo de los
+ficheros de usuario), `image_size`, `image_sha256`, `byte_reproducible` (dos generaciones de la misma
+ejecución con el mismo SHA-256), `base` (escenario del que deriva), `entries_live`, `entries_deleted`,
+`entries_overwritten`.
+
+| Tabla | Claves |
+|---|---|
+| `[partition]` (solo `ntfs_mbr`, `ntfs_gpt`) | `scheme`, `index`, `start_lba`, `sectors` (de `mmls`), `tsk_table`, `tsk_description`; MBR: `disk_signature`, `mbr_type`, `active`; GPT: `disk_guid`, `gpt_type`, `unique_guid`, `gpt_name` |
+| `[volume]` (de `fsstat` e `istat` del registro 0) | `offset` (byte del volumen en la imagen), `serial`, `label`, `version`, `mft_lcn`, `mftmirr_lcn`, `mft_record_size`, `index_record_size`, `mft_entries`, `sector_size`, `cluster_size`, `total_sectors` (campo del arranque), `mft_runs` (`[vcn, lcn, clusters]`), `backup_boot_offset` (byte de la copia del arranque) |
+| `[[damage]]` (solo `ntfs_damaged_*`) | `kind` (`boot`, `mft`, `mftmirr`), `regions` (`[byte, longitud]` sobrescritos), `description`, `expected` (comportamiento esperado de un lector tolerante), `tsk_opens`; `mft`: `records` y `tsk_unreadable_records` |
+| `[[files]]` (entradas de usuario, ordenadas por ruta) | `path` (desde la raíz del volumen, `/` como separador, UTF-8), `type` (`file`, `dir`), `mft_record`, `sequence` (la actual del registro; ntfs-3g la incrementa al borrar), `state` (`live`, `deleted`, `overwritten`); ficheros: `size`, `sha256` (contenido original), `resident`, `runs` (`[vcn, lcn, clusters]`, contiguos fusionados), `sparse` (`[vcn, clusters]`), `init_size` (si difiere de `size`), `recoverable` (`full`, `partial`, `none`); sobrescritos: `recovered_sha256` (lo que devuelve `icat`), `clusters`, `overwritten_clusters`, `reason`; dañados: `mft_damaged` |
+| `[[files.ads]]` | `name`, `size`, `sha256`, `resident`, `runs`, `sparse`, `init_size` del flujo alternativo |
+
+`state = "overwritten"` se decide comparando cluster a cluster lo que devuelve `icat` con el contenido
+original; `reason` nombra los ficheros que ocupan ahora esos clusters según los runs de TSK. En
+`ntfs_damaged_boot`, TSK no abre la imagen y la verdad de `[[files]]` sale de TSK sobre una copia
+temporal con el arranque restaurado desde `backup_boot_offset`; en `ntfs_damaged_mft` las entradas con
+`mft_damaged = true` conservan los datos de `ntfs_basic` (su registro ya no es legible).
 
 ## 2. Corrupción determinista
 
