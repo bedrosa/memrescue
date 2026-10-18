@@ -31,6 +31,11 @@
  * mr_partition_anomaly, mr_partition_anomaly_text, mr_partition_open, mr_partitions_free)
  * con estructuras versionadas por struct_size; con GPT integrada: copia en uso, desplazamiento,
  * nombres y GUID (mr_partition_name, mr_partition_open_ex con MR_PARTITION_OPEN_APPLY_SHIFT).
+ * Añadido sin cambiar la ABI 3 (M2, issue #15): búsqueda exprés de particiones perdidas como tarea
+ * (mr_source_partition_search_start con mr_partition_search_options versionada; resultado por
+ * índice: mr_partition_search_result, mr_found_volume_get, mr_found_volume_origin,
+ * mr_found_volume_anomaly, mr_found_volume_anomaly_text, mr_found_table_get; apertura con
+ * mr_found_volume_open). mr_task_status_get, mr_task_cancel y mr_task_free admiten la tarea.
  */
 #ifndef MEMRESCUE_CORE_H
 #define MEMRESCUE_CORE_H
@@ -396,6 +401,154 @@ mr_status mr_partition_open(uint64_t table, uint32_t index, uint64_t *out_source
 mr_status mr_partition_open_ex(uint64_t table, uint32_t index, uint32_t flags,
                                uint64_t *out_source);
 mr_status mr_partitions_free(uint64_t table);
+
+/*
+ * Búsqueda exprés de particiones perdidas (M2, issue #15, ADR-023). Solo a petición. La tarea lee
+ * la tabla del origen y sondea un número acotado de posiciones candidatas (nunca recorre el disco):
+ * progreso de mr_task_status_get = lecturas hechas / max_reads. Al cancelar, la tarea termina en
+ * estado cancelado (4) CON resultado parcial (status = MR_SEARCH_CANCELLED). Los sectores
+ * ilegibles nunca son evidencia: el indicador queda MR_CHECK_UNVERIFIABLE.
+ */
+#define MR_SEARCH_FAMILY_NTFS    1u
+#define MR_SEARCH_FAMILY_FAT     2u   /* FAT12, FAT16 y FAT32 */
+#define MR_SEARCH_FAMILY_EXFAT   4u
+#define MR_SEARCH_FAMILY_MBR     8u   /* tablas MBR/EBR en posiciones candidatas (modo estricto) */
+#define MR_SEARCH_FAMILY_GPT    16u   /* cabeceras GPT en posiciones candidatas */
+
+typedef struct mr_partition_search_options {  /* 64 bytes; un campo a 0 = valor por defecto */
+    uint32_t struct_size;        /* = sizeof(mr_partition_search_options) */
+    uint32_t families;           /* MR_SEARCH_FAMILY_*; 0 = todas */
+    uint64_t max_reads;          /* lecturas físicas máximas (4096) */
+    uint64_t max_bytes;          /* bytes leídos máximos (32 MiB) */
+    uint64_t start_grid_bytes;   /* ventana inicial con múltiplos de 1 MiB (64 MiB) */
+    uint64_t end_grid_bytes;     /* ventana final con finales de MiB (16 MiB) */
+    uint32_t max_volumes;        /* volúmenes tras los que se deja de buscar (256) */
+    uint32_t probe_window;       /* bytes leídos por candidato, múltiplo de 512 (8192) */
+    uint32_t cylinders;          /* límites de cilindro CHS (64) */
+    uint32_t probes_per_gap;     /* candidatos por hueco sin explicar (8) */
+    uint32_t flags;              /* reservado: 0 */
+    uint32_t reserved;           /* 0 */
+} mr_partition_search_options;
+
+#define MR_SEARCH_COMPLETE          1u
+#define MR_SEARCH_BUDGET_EXHAUSTED  2u   /* presupuesto, cupo de un nivel o max_volumes: parcial */
+#define MR_SEARCH_CANCELLED         3u
+#define MR_SEARCH_HAS_SHIFT         1u   /* mr_partition_search_info.flags: shift_bytes válido */
+#define MR_SEARCH_VOLUME_LIMIT      2u
+
+typedef struct mr_partition_search_info {  /* 96 bytes */
+    uint32_t struct_size;        /* = sizeof(mr_partition_search_info) */
+    uint32_t status;             /* MR_SEARCH_COMPLETE / _BUDGET_EXHAUSTED / _CANCELLED */
+    uint32_t volume_count;
+    uint32_t table_count;        /* tablas encontradas fuera de la tabla principal */
+    uint32_t anomaly_count;      /* de la búsqueda: volume_index = MR_PARTITION_TABLE */
+    uint32_t flags;              /* MR_SEARCH_HAS_SHIFT | MR_SEARCH_VOLUME_LIMIT */
+    int64_t  shift_bytes;        /* posición en la imagen - posición en el disco */
+    uint64_t reads;
+    uint64_t max_reads;
+    uint64_t bytes_read;
+    uint64_t unverifiable_sectors;
+    uint64_t probed;             /* candidatos sondeados */
+    uint64_t pending;            /* candidatos sin sondear */
+    uint32_t sector_size;
+    uint32_t reserved;
+    uint64_t sectors;
+} mr_partition_search_info;
+
+#define MR_FS_NTFS   1u
+#define MR_FS_FAT12  2u
+#define MR_FS_FAT16  3u
+#define MR_FS_FAT32  4u
+#define MR_FS_EXFAT  5u
+/* Indicadores (mr_found_volume.primary ... aligned). */
+#define MR_CHECK_YES            1u   /* + */
+#define MR_CHECK_NO             2u   /* x: ausente o dañada */
+#define MR_CHECK_UNVERIFIABLE   3u   /* ?: sector ilegible, no se interpretó */
+#define MR_CHECK_OUTSIDE        4u   /* o: fuera de la imagen */
+#define MR_CHECK_NOT_APPLICABLE 5u   /* -: no aplica */
+#define MR_FOUND_PARTIAL        1u   /* empieza antes de la imagen: no se puede abrir */
+#define MR_FOUND_LISTED         2u   /* una partición de la tabla lo describe (table_index) */
+#define MR_FOUND_REQUIRES_SHIFT 4u   /* abrirlo exige MR_PARTITION_OPEN_APPLY_SHIFT */
+#define MR_FOUND_HAS_BACKUP     8u   /* backup_byte válido */
+#define MR_ANOMALY_LBA_SIGNED   8u   /* mr_partition_anomaly.flags: lba es int64_t */
+/* Anomalías de la búsqueda (mr_found_volume_anomaly.code). */
+#define MR_ANOMALY_FOUND_PRIMARY_DAMAGED      301u  /* restaurable desde la copia */
+#define MR_ANOMALY_FOUND_PRIMARY_UNREADABLE   302u
+#define MR_ANOMALY_FOUND_PRIMARY_OUTSIDE      303u  /* volumen parcial */
+#define MR_ANOMALY_FOUND_BACKUP_MISSING       304u
+#define MR_ANOMALY_FOUND_BACKUP_UNREADABLE    305u
+#define MR_ANOMALY_FOUND_BACKUP_OUTSIDE       306u
+#define MR_ANOMALY_FOUND_BACKUP_MISMATCH      307u
+#define MR_ANOMALY_FOUND_BEYOND_IMAGE_END     308u  /* value = bytes que faltan */
+#define MR_ANOMALY_FOUND_SECTOR_SIZE_MISMATCH 309u  /* value = sector del FS */
+#define MR_ANOMALY_FOUND_UNALIGNED            310u
+#define MR_ANOMALY_FOUND_SHIFT_DETECTED       311u  /* value = desplazamiento en bytes */
+#define MR_ANOMALY_FOUND_SELF_LOCATION        312u  /* value = byte declarado */
+#define MR_ANOMALY_FOUND_OVERLAP              313u
+#define MR_ANOMALY_FOUND_UNCONFIRMED          314u
+#define MR_ANOMALY_SEARCH_IMAGE_SHIFTED       320u  /* lba = LBA 0 del disco; value = sectores que faltan */
+#define MR_ANOMALY_SEARCH_MBR_DISPLACED       321u  /* lba = tabla encontrada */
+
+typedef struct mr_found_volume {  /* 136 bytes */
+    uint32_t struct_size;        /* = sizeof(mr_found_volume) */
+    uint32_t fs;                 /* MR_FS_* */
+    int64_t  start_byte;         /* negativo si empieza antes de la imagen */
+    uint64_t length_bytes;
+    int64_t  start_lba;          /* sectores del origen, redondeo hacia abajo */
+    uint64_t sector_count;
+    uint32_t fs_sector_size;
+    uint32_t confidence;         /* MR_CONFIDENCE_* */
+    uint32_t primary;            /* MR_CHECK_*: principal (P) */
+    uint32_t backup;             /* copia coherente (C) */
+    uint32_t structures;         /* estructuras básicas (S) */
+    uint32_t entry;              /* entrada de tabla (E) */
+    uint32_t self_location;      /* inicio declarado coherente (U) */
+    uint32_t aligned;            /* alineado a 1 MiB o CHS (A) */
+    uint32_t tier;               /* 0-4 = P0-P4 */
+    uint32_t flags;              /* MR_FOUND_* */
+    uint32_t table_index;        /* partición de la tabla, o MR_PARTITION_TABLE */
+    uint32_t found_table_index;  /* tabla encontrada, o MR_PARTITION_TABLE */
+    uint32_t anomaly_count;
+    uint32_t suggested_mbr_type;
+    int64_t  primary_byte;
+    int64_t  backup_byte;        /* con MR_FOUND_HAS_BACKUP */
+    uint64_t declared_start;     /* inicio declarado por el FS en sus sectores (0 = no) */
+    uint64_t serial;
+    uint32_t score;
+    uint32_t reserved;
+} mr_found_volume;
+
+#define MR_FOUND_TABLE_MBR 1u
+#define MR_FOUND_TABLE_GPT 2u
+typedef struct mr_found_table {  /* 32 bytes */
+    uint32_t struct_size;
+    uint32_t kind;               /* MR_FOUND_TABLE_* */
+    uint64_t lba;
+    uint64_t declared_lba;       /* MyLBA de la cabecera GPT; 0 en MBR */
+    uint32_t entry_count;
+    uint32_t reserved;
+} mr_found_table;
+
+/* options puede ser NULL (valores por defecto). */
+mr_status mr_source_partition_search_start(uint64_t source,
+                                           const mr_partition_search_options *options,
+                                           uint64_t *out_task);
+mr_status mr_partition_search_result(uint64_t task, mr_partition_search_info *out);
+mr_status mr_found_volume_get(uint64_t task, uint32_t index, mr_found_volume *out);
+/* Qué candidato propuso el volumen (texto). */
+mr_status mr_found_volume_origin(uint64_t task, uint32_t index,
+                                 uint8_t *buf, size_t cap, size_t *out_len);
+/* volume_index = MR_PARTITION_TABLE para las anomalías de la búsqueda. */
+mr_status mr_found_volume_anomaly(uint64_t task, uint32_t volume_index, uint32_t anomaly_index,
+                                  mr_partition_anomaly *out);
+mr_status mr_found_volume_anomaly_text(uint64_t task, uint32_t volume_index,
+                                       uint32_t anomaly_index,
+                                       uint8_t *buf, size_t cap, size_t *out_len);
+mr_status mr_found_table_get(uint64_t task, uint32_t index, mr_found_table *out);
+/* Volumen como origen. Parcial o desalineado: MR_ERR_INVALID_ARGUMENT siempre; con
+ * MR_FOUND_REQUIRES_SHIFT solo con MR_PARTITION_OPEN_APPLY_SHIFT. Se cierra con mr_source_close. */
+mr_status mr_found_volume_open(uint64_t task, uint32_t index, uint32_t flags,
+                               uint64_t *out_source);
 
 mr_status mr_task_status_get(uint64_t task, mr_task_status *out);
 mr_status mr_task_cancel(uint64_t task);

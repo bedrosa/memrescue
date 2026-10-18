@@ -14,6 +14,7 @@
 
 pub mod gpt;
 pub mod mbr;
+pub mod search;
 pub mod sector;
 pub mod table;
 

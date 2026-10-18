@@ -408,6 +408,30 @@ public sealed class Source : EngineHandle
         return new PartitionTable(h, this);
     }
 
+    /// <summary>
+    /// Lanza la búsqueda exprés de particiones perdidas (solo a petición). Lee la tabla del origen y
+    /// sondea un número acotado de posiciones candidatas; nunca recorre el disco entero.
+    /// </summary>
+    public PartitionSearchTask StartPartitionSearch(PartitionSearchOptions? options = null)
+    {
+        var o = options ?? new PartitionSearchOptions();
+        var native = new MrPartitionSearchOptions
+        {
+            StructSize = (uint)Marshal.SizeOf<MrPartitionSearchOptions>(),
+            Families = (uint)o.Families,
+            MaxReads = o.MaxReads,
+            MaxBytes = o.MaxBytes,
+            StartGridBytes = o.StartGridBytes,
+            EndGridBytes = o.EndGridBytes,
+            MaxVolumes = o.MaxVolumes,
+            ProbeWindow = o.ProbeWindow,
+            Cylinders = o.Cylinders,
+            ProbesPerGap = o.ProbesPerGap,
+        };
+        Engine.Check(NativeMethods.mr_source_partition_search_start(Handle, in native, out var h));
+        return new PartitionSearchTask(h, this);
+    }
+
     public HashTask StartHash(HashAlgorithms algorithms, string? storePath = null)
     {
         var s = storePath is null ? null : Engine.Utf8(storePath);

@@ -11,6 +11,9 @@
 //! - [`read_sectors`]: lectura estricta de un rango de sectores; [`read_sectors_mapped`]: lectura
 //!   tolerante con el estado de cada sector (visor hexadecimal); [`read_sectors_mapped_with`]: la
 //!   misma con salto y patrones de relleno configurables.
+//! - [`start_partition_search_task`]: búsqueda exprés de particiones perdidas (cancelable, con
+//!   progreso respecto al presupuesto de lecturas); [`open_found_volume`]: un volumen encontrado
+//!   como origen.
 //! - [`start_hash_task`]: hashes del fichero completo en segundo plano.
 //! - [`start_verify_task`]: lectura completa tolerante a errores con mapa de validez por sector.
 
@@ -29,6 +32,7 @@ use thiserror::Error;
 pub use mr_common::ENGINE_VERSION;
 pub use mr_image::OpenOptions;
 pub use mr_part;
+pub use mr_part::search::{SearchOptions, SearchResult};
 pub use mr_part::{Partition, PartitionTable};
 
 #[derive(Debug, Error)]
@@ -282,6 +286,139 @@ pub fn open_partition(
             d.push_str(&format!(
                 "; recortada: faltan {} sectores al final del origen",
                 c.missing_at_end
+            ));
+        }
+        d
+    })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Búsqueda exprés de particiones perdidas (#15, ADR-023)
+// ---------------------------------------------------------------------------------------------
+
+/// Resultado de la búsqueda junto con la tabla con la que se comparó.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionSearch {
+    pub table: PartitionTable,
+    pub result: SearchResult,
+}
+
+impl mr_part::search::SearchObserver for TaskContext {
+    fn cancelled(&self) -> bool {
+        self.is_cancelled()
+    }
+    fn progress(&self, p: &mr_part::search::SearchProgress) {
+        self.set_done(p.reads);
+    }
+}
+
+/// Lee la tabla del origen y busca volúmenes perdidos (`mr_part::search::search`). El progreso
+/// se expresa en lecturas respecto a `max_reads` (la búsqueda no recorre el disco). Al cancelar
+/// devuelve el resultado parcial con estado `Cancelled` y marca la tarea como cancelada.
+pub fn search_partitions(
+    src: &dyn BlockDevice,
+    opts: &SearchOptions,
+    ctx: &TaskContext,
+) -> Result<PartitionSearch> {
+    opts.validate().map_err(ApiError::InvalidArgument)?;
+    ctx.set_total(opts.max_reads);
+    let table = mr_part::read_partition_table(src)?;
+    let result =
+        mr_part::search::search(src, Some(&table), opts, ctx).map_err(ApiError::InvalidArgument)?;
+    if result.status == mr_part::search::SearchStatus::Cancelled {
+        ctx.finish_cancelled_with_result();
+    }
+    Ok(PartitionSearch { table, result })
+}
+
+/// Lanza la búsqueda en segundo plano. Las opciones se validan antes de lanzarla.
+pub fn start_partition_search_task(
+    src: Source,
+    opts: SearchOptions,
+) -> Result<Arc<Task<PartitionSearch>>> {
+    opts.validate().map_err(ApiError::InvalidArgument)?;
+    Task::spawn(move |ctx| search_partitions(src.as_ref(), &opts, ctx))
+}
+
+/// Abre el volumen encontrado `index` de `found` (buscado en `parent`) como origen independiente.
+///
+/// Reglas (ADR-022 y ADR-023): un volumen parcial (empieza antes de la imagen) o cuyo inicio no es
+/// múltiplo del sector del origen se rechaza siempre; uno cuya posición depende del desplazamiento
+/// detectado ([`mr_part::search::FoundVolume::requires_shift`]) solo se abre con `apply_shift`, y
+/// la descripción lo dice; si termina fuera del origen se abre la parte que existe.
+pub fn open_found_volume(
+    parent: &Source,
+    found: &SearchResult,
+    index: usize,
+    apply_shift: bool,
+) -> Result<Source> {
+    let info = parent.info();
+    let v = found.volumes.get(index).ok_or_else(|| {
+        ApiError::InvalidArgument(format!("no existe el volumen encontrado {}", index + 1))
+    })?;
+    if found.sector_size != info.sector_size || found.sectors != info.sector_count {
+        return Err(ApiError::InvalidArgument(
+            "la búsqueda se hizo sobre otro origen o con otro tamaño de sector".into(),
+        ));
+    }
+    if v.partial() {
+        return Err(ApiError::InvalidArgument(format!(
+            "el volumen empieza {} bytes antes del inicio de la imagen: es parcial y no se puede abrir",
+            -v.start_byte
+        )));
+    }
+    let ss = u64::from(info.sector_size);
+    let start = v.start_byte as u64;
+    if !start.is_multiple_of(ss) {
+        return Err(ApiError::InvalidArgument(format!(
+            "el volumen empieza en el byte {start}, que no es múltiplo del sector del origen ({ss} B)"
+        )));
+    }
+    let delta = found.shift_bytes.unwrap_or(0);
+    if v.requires_shift() && !apply_shift {
+        return Err(ApiError::InvalidArgument(format!(
+            "la imagen está desplazada {} sectores respecto al disco y el volumen declara otro inicio: \
+             ábralo pidiendo explícitamente aplicar el desplazamiento",
+            delta.div_euclid(ss as i64)
+        )));
+    }
+    let lba = start / ss;
+    if lba >= info.sector_count {
+        return Err(ApiError::InvalidArgument(format!(
+            "el volumen empieza en la LBA {lba}, fuera del origen ({} sectores)",
+            info.sector_count
+        )));
+    }
+    let wanted = v.sector_count(info.sector_size);
+    let count = wanted.min(info.sector_count - lba);
+    open_view(parent, lba, count, |end| {
+        let mut d = format!(
+            "Volumen encontrado {} LBA {lba}–{end} ({}) de: {}",
+            v.fs.name(),
+            if v.listed() {
+                "partición de la tabla"
+            } else {
+                "fuera de la tabla"
+            },
+            info.description
+        );
+        if v.requires_shift() {
+            d.push_str(&format!(
+                "; desplazamiento detectado aplicado: el volumen declara la LBA {} del disco ({} sectores)",
+                v.declared_start,
+                delta.div_euclid(ss as i64)
+            ));
+        }
+        if u64::from(v.fs_sector_size) != ss {
+            d.push_str(&format!(
+                "; el sistema de archivos usa sectores de {} B",
+                v.fs_sector_size
+            ));
+        }
+        if count < wanted {
+            d.push_str(&format!(
+                "; recortado: faltan {} sectores al final del origen",
+                wanted - count
             ));
         }
         d
@@ -841,6 +978,104 @@ mod tests {
             t.anomalies,
             vec![mr_part::Anomaly::UnreadableSector { lba: 0 }]
         );
+    }
+
+    /// Disco de 6160 sectores con un NTFS sintético en la LBA 2048 (copia en su último sector).
+    fn lost_ntfs() -> Vec<u8> {
+        let mut d = vec![0u8; 6160 * 512];
+        let mut b = vec![0u8; 512];
+        b[..3].copy_from_slice(&[0xEB, 0x52, 0x90]);
+        b[3..11].copy_from_slice(b"NTFS    ");
+        b[0x0B..0x0D].copy_from_slice(&512u16.to_le_bytes());
+        b[0x0D] = 8;
+        b[0x15] = 0xF8;
+        b[0x1C..0x20].copy_from_slice(&2048u32.to_le_bytes());
+        b[0x28..0x30].copy_from_slice(&2047u64.to_le_bytes());
+        b[0x30..0x38].copy_from_slice(&4u64.to_le_bytes());
+        b[0x38..0x40].copy_from_slice(&128u64.to_le_bytes());
+        b[0x40] = 0xF6;
+        b[0x44] = 1;
+        b[0x1FE] = 0x55;
+        b[0x1FF] = 0xAA;
+        d[2048 * 512..2049 * 512].copy_from_slice(&b);
+        d[4095 * 512..4096 * 512].copy_from_slice(&b);
+        d
+    }
+
+    #[test]
+    fn partition_search_task_finds_and_opens_volumes() {
+        let src = source_from_device(Arc::new(MemDevice::new(lost_ntfs(), 512).unwrap()), "disco");
+        let task = start_partition_search_task(Arc::clone(&src), SearchOptions::default()).unwrap();
+        let out = task.wait().unwrap();
+        assert_eq!(task.state(), TaskState::Completed);
+        let (done, total) = task.progress();
+        assert_eq!((done, total), (out.result.stats.reads, 4096));
+        assert_eq!(out.result.volumes.len(), 1);
+        let v = open_found_volume(&src, &out.result, 0, false).unwrap();
+        assert_eq!(v.info().range, Some((2048, 2048)));
+        assert!(v
+            .info()
+            .description
+            .starts_with("Volumen encontrado NTFS LBA 2048–4095 (fuera de la tabla)"));
+        assert!(read_sectors(v.as_ref(), 0, 1)
+            .unwrap()
+            .starts_with(&[0xEB, 0x52, 0x90]));
+        assert!(open_found_volume(&src, &out.result, 1, false).is_err());
+        // Parcial y desalineado: nunca.
+        let mut r = out.result.clone();
+        r.volumes[0].start_byte = -512;
+        assert!(open_found_volume(&src, &r, 0, true).is_err());
+        r.volumes[0].start_byte = 2048 * 512 + 7;
+        assert!(open_found_volume(&src, &r, 0, true).is_err());
+        // Desplazado: solo pidiéndolo, y la descripción lo dice.
+        let mut r = out.result.clone();
+        r.shift_bytes = Some(16 * 512);
+        r.volumes[0]
+            .anomalies
+            .push(mr_part::search::VolumeAnomaly::ShiftDetected {
+                delta_bytes: 16 * 512,
+            });
+        let err = open_found_volume(&src, &r, 0, false)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("desplazada 16 sectores"), "{err}");
+        let v = open_found_volume(&src, &r, 0, true).unwrap();
+        assert!(v
+            .info()
+            .description
+            .contains("desplazamiento detectado aplicado"));
+        // Búsqueda hecha sobre otro origen.
+        let other = source_from_device(Arc::new(MemDevice::new(vec![0; 4096], 512).unwrap()), "x");
+        assert!(open_found_volume(&other, &out.result, 0, false).is_err());
+        // Opciones no válidas: error síncrono.
+        let bad = SearchOptions {
+            max_reads: 0,
+            ..SearchOptions::default()
+        };
+        assert!(matches!(
+            start_partition_search_task(src, bad),
+            Err(ApiError::InvalidArgument(_))
+        ));
+    }
+
+    /// Cancelación: la tarea termina cancelada y entrega el resultado parcial sin leer más.
+    #[test]
+    fn partition_search_cancellation_returns_partial_result() {
+        let dev = MemDevice::new(lost_ntfs(), 512).unwrap();
+        let task = Task::spawn(move |c| {
+            while !c.is_cancelled() {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            search_partitions(&dev, &SearchOptions::default(), c)
+        })
+        .unwrap();
+        task.cancel();
+        let out = task.wait().unwrap();
+        assert_eq!(task.state(), TaskState::Cancelled);
+        assert_eq!(out.result.status, mr_part::search::SearchStatus::Cancelled);
+        assert_eq!(out.result.stats.reads, 0);
+        assert!(out.result.volumes.is_empty());
     }
 
     #[test]

@@ -6,7 +6,10 @@
 
 use mr_api::mr_part::{self, Anomaly, Confidence, Origin, PartitionKind, PartitionTable, Scheme};
 use mr_api::task::{Task, TaskState};
-use mr_api::{ApiError, HashOptions, HashResult, OpenOptions, Source, VerifyOptions};
+use mr_api::{
+    ApiError, HashOptions, HashResult, OpenOptions, PartitionSearch, SearchOptions, Source,
+    VerifyOptions,
+};
 use mr_common::HashAlgorithm;
 use mr_io::resilient::{OnError, ReadPolicy, ReadReport};
 use mr_io::{BlockDevice, IoError, SectorState};
@@ -417,6 +420,15 @@ enum Entry {
         parent: Source,
         table: Box<PartitionTable>,
     },
+    /// Búsqueda de particiones perdidas (el origen se conserva para abrir los volúmenes).
+    Search(Box<SearchEntry>),
+}
+
+/// Tarea de búsqueda de particiones con su resultado y el origen en que se hizo.
+struct SearchEntry {
+    task: Arc<Task<PartitionSearch>>,
+    outcome: Outcome<PartitionSearch>,
+    parent: Source,
 }
 
 /// Tramos no fiables y códigos de error de un informe de verificación, en orden.
@@ -1862,6 +1874,590 @@ pub extern "C" fn mr_partitions_free(table_h: u64) -> i32 {
     })
 }
 
+// ---------- Búsqueda exprés de particiones perdidas (#15, ADR-023) ----------
+
+/// Opciones de `mr_source_partition_search_start` (64 bytes). `struct_size` lo escribe el
+/// llamador; un campo a 0 toma el valor por defecto documentado.
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MrPartitionSearchOptions {
+    pub struct_size: u32,
+    /// `MR_SEARCH_FAMILY_*`; 0 = todas.
+    pub families: u32,
+    /// Lecturas físicas máximas (0 = 4096).
+    pub max_reads: u64,
+    /// Bytes leídos máximos (0 = 32 MiB).
+    pub max_bytes: u64,
+    /// Ventana inicial con múltiplos de 1 MiB (0 = 64 MiB).
+    pub start_grid_bytes: u64,
+    /// Ventana final con finales de MiB (0 = 16 MiB).
+    pub end_grid_bytes: u64,
+    /// Volúmenes tras los que se deja de buscar (0 = 256).
+    pub max_volumes: u32,
+    /// Bytes leídos por candidato (0 = 8192; múltiplo de 512).
+    pub probe_window: u32,
+    /// Límites de cilindro CHS (0 = 64).
+    pub cylinders: u32,
+    /// Candidatos por hueco (0 = 8).
+    pub probes_per_gap: u32,
+    /// Reservado: debe ser 0.
+    pub flags: u32,
+    pub reserved: u32,
+}
+
+/// Resumen del resultado de una búsqueda (96 bytes).
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MrPartitionSearchInfo {
+    pub struct_size: u32,
+    /// `MR_SEARCH_COMPLETE` / `MR_SEARCH_BUDGET_EXHAUSTED` / `MR_SEARCH_CANCELLED`.
+    pub status: u32,
+    pub volume_count: u32,
+    /// Tablas encontradas fuera de la posición de la tabla principal.
+    pub table_count: u32,
+    /// Anomalías de la búsqueda (`volume_index = MR_PARTITION_TABLE`).
+    pub anomaly_count: u32,
+    /// `MR_SEARCH_HAS_SHIFT | MR_SEARCH_VOLUME_LIMIT`.
+    pub flags: u32,
+    /// Desplazamiento aceptado en bytes (`posición imagen - posición disco`); 0 si no hay.
+    pub shift_bytes: i64,
+    pub reads: u64,
+    pub max_reads: u64,
+    pub bytes_read: u64,
+    pub unverifiable_sectors: u64,
+    /// Candidatos sondeados.
+    pub probed: u64,
+    /// Candidatos que quedaron sin sondear.
+    pub pending: u64,
+    pub sector_size: u32,
+    pub reserved: u32,
+    pub sectors: u64,
+}
+
+/// Un volumen encontrado (136 bytes).
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MrFoundVolume {
+    pub struct_size: u32,
+    /// `MR_FS_*`.
+    pub fs: u32,
+    /// Primer byte en la imagen (negativo: empieza antes de la imagen).
+    pub start_byte: i64,
+    pub length_bytes: u64,
+    /// LBA del origen (redondeo hacia abajo; negativa si es parcial).
+    pub start_lba: i64,
+    pub sector_count: u64,
+    pub fs_sector_size: u32,
+    /// `MR_CONFIDENCE_*`.
+    pub confidence: u32,
+    /// Indicadores `MR_CHECK_*`: principal, copia, estructuras, entrada, autoubicación, alineación.
+    pub primary: u32,
+    pub backup: u32,
+    pub structures: u32,
+    pub entry: u32,
+    pub self_location: u32,
+    pub aligned: u32,
+    /// Nivel del candidato que lo encontró (0 a 4 = P0 a P4).
+    pub tier: u32,
+    /// `MR_FOUND_*`.
+    pub flags: u32,
+    /// Partición de la tabla del origen que lo describe (`MR_PARTITION_TABLE` si ninguna).
+    pub table_index: u32,
+    /// Tabla encontrada que lo describe (`MR_PARTITION_TABLE` si ninguna).
+    pub found_table_index: u32,
+    pub anomaly_count: u32,
+    pub suggested_mbr_type: u32,
+    pub primary_byte: i64,
+    /// Posición de la copia usada o esperada (válida con `MR_FOUND_HAS_BACKUP`).
+    pub backup_byte: i64,
+    /// Inicio declarado por el volumen en sus sectores (0 = no declarado).
+    pub declared_start: u64,
+    pub serial: u64,
+    pub score: u32,
+    pub reserved: u32,
+}
+
+/// Una tabla encontrada (32 bytes).
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MrFoundTable {
+    pub struct_size: u32,
+    /// `MR_FOUND_TABLE_MBR` / `MR_FOUND_TABLE_GPT`.
+    pub kind: u32,
+    pub lba: u64,
+    /// `MyLBA` de una cabecera GPT (0 en MBR).
+    pub declared_lba: u64,
+    pub entry_count: u32,
+    pub reserved: u32,
+}
+
+pub const MR_SEARCH_FAMILY_NTFS: u32 = mr_part::search::family::NTFS;
+pub const MR_SEARCH_FAMILY_FAT: u32 = mr_part::search::family::FAT;
+pub const MR_SEARCH_FAMILY_EXFAT: u32 = mr_part::search::family::EXFAT;
+pub const MR_SEARCH_FAMILY_MBR: u32 = mr_part::search::family::MBR;
+pub const MR_SEARCH_FAMILY_GPT: u32 = mr_part::search::family::GPT;
+pub const MR_SEARCH_COMPLETE: u32 = 1;
+pub const MR_SEARCH_BUDGET_EXHAUSTED: u32 = 2;
+pub const MR_SEARCH_CANCELLED: u32 = 3;
+pub const MR_SEARCH_HAS_SHIFT: u32 = 1;
+pub const MR_SEARCH_VOLUME_LIMIT: u32 = 2;
+pub const MR_FS_NTFS: u32 = 1;
+pub const MR_FS_FAT12: u32 = 2;
+pub const MR_FS_FAT16: u32 = 3;
+pub const MR_FS_FAT32: u32 = 4;
+pub const MR_FS_EXFAT: u32 = 5;
+pub const MR_FOUND_PARTIAL: u32 = 1;
+pub const MR_FOUND_LISTED: u32 = 2;
+pub const MR_FOUND_REQUIRES_SHIFT: u32 = 4;
+pub const MR_FOUND_HAS_BACKUP: u32 = 8;
+pub const MR_FOUND_TABLE_MBR: u32 = 1;
+pub const MR_FOUND_TABLE_GPT: u32 = 2;
+/// `mr_partition_anomaly.flags` de una anomalía de búsqueda: `lba` es `int64_t`.
+pub const MR_ANOMALY_LBA_SIGNED: u32 = 8;
+
+fn fs_code(fs: mr_part::search::FsKind) -> u32 {
+    use mr_part::search::FsKind::*;
+    match fs {
+        Ntfs => MR_FS_NTFS,
+        Fat12 => MR_FS_FAT12,
+        Fat16 => MR_FS_FAT16,
+        Fat32 => MR_FS_FAT32,
+        ExFat => MR_FS_EXFAT,
+    }
+}
+
+/// Convierte las opciones C (0 = por defecto) y las valida.
+fn search_options(o: &MrPartitionSearchOptions) -> Result<SearchOptions, i32> {
+    if o.flags != 0 || o.reserved != 0 {
+        return Err(fail(
+            MR_ERR_INVALID_ARGUMENT,
+            "opciones de búsqueda no válidas (flags y reserved deben ser 0)",
+        ));
+    }
+    let d = SearchOptions::default();
+    let pick64 = |v: u64, def: u64| if v == 0 { def } else { v };
+    let pick32 = |v: u32, def: u32| if v == 0 { def } else { v };
+    let opts = SearchOptions {
+        max_reads: pick64(o.max_reads, d.max_reads),
+        max_bytes: pick64(o.max_bytes, d.max_bytes),
+        max_volumes: pick32(o.max_volumes, d.max_volumes),
+        probe_window: pick32(o.probe_window, d.probe_window),
+        start_grid_bytes: pick64(o.start_grid_bytes, d.start_grid_bytes),
+        end_grid_bytes: pick64(o.end_grid_bytes, d.end_grid_bytes),
+        cylinders: pick32(o.cylinders, d.cylinders),
+        probes_per_gap: pick32(o.probes_per_gap, d.probes_per_gap),
+        families: pick32(o.families, d.families),
+    };
+    opts.validate().map_err(|e| {
+        fail(
+            MR_ERR_INVALID_ARGUMENT,
+            format!("opciones de búsqueda: {e}"),
+        )
+    })?;
+    Ok(opts)
+}
+
+/// Lanza la búsqueda exprés de particiones perdidas sobre el origen (lee antes su tabla). Solo se
+/// ejecuta a petición. `options` puede ser nulo (valores por defecto); si no, su `struct_size`
+/// debe ser `sizeof(mr_partition_search_options)`. Progreso de la tarea: lecturas hechas respecto a
+/// `max_reads`. Al cancelar, la tarea termina en estado cancelado **con** resultado parcial.
+///
+/// # Safety
+/// `options` debe ser nulo o válido; `out_task` debe ser un puntero válido.
+#[no_mangle]
+pub unsafe extern "C" fn mr_source_partition_search_start(
+    source_h: u64,
+    options: *const MrPartitionSearchOptions,
+    out_task: *mut u64,
+) -> i32 {
+    guard(|| {
+        if out_task.is_null() {
+            return fail(MR_ERR_INVALID_ARGUMENT, "puntero de salida nulo");
+        }
+        let opts = if options.is_null() {
+            SearchOptions::default()
+        } else {
+            // SAFETY: no nulo; se lee primero solo `struct_size`.
+            let size = unsafe { options.cast::<u32>().read_unaligned() };
+            let expected = std::mem::size_of::<MrPartitionSearchOptions>();
+            if size as usize != expected {
+                return fail(
+                    MR_ERR_INVALID_ARGUMENT,
+                    format!(
+                        "tamaño de mr_partition_search_options no válido: {size} (se esperaba {expected})"
+                    ),
+                );
+            }
+            // SAFETY: el tamaño declarado coincide con el de la estructura.
+            let o = unsafe { options.read_unaligned() };
+            match search_options(&o) {
+                Ok(v) => v,
+                Err(c) => return c,
+            }
+        };
+        let src = match source(source_h) {
+            Ok(s) => s,
+            Err(c) => return c,
+        };
+        match mr_api::start_partition_search_task(Arc::clone(&src), opts) {
+            // SAFETY: `out_task` no es nulo.
+            Ok(task) => unsafe {
+                write_out(
+                    out_task,
+                    insert(Entry::Search(Box::new(SearchEntry {
+                        task,
+                        outcome: None,
+                        parent: src,
+                    }))),
+                )
+            },
+            Err(e) => api_fail(&e),
+        }
+    })
+}
+
+/// Ejecuta `f` sobre el resultado de una búsqueda terminada (también si se canceló con
+/// resultado parcial).
+fn with_search<R>(task: u64, f: impl FnOnce(&Source, &PartitionSearch) -> R) -> Result<R, i32> {
+    let r = with_entry(task, |e| match e {
+        Entry::Search(e) => settle(&e.task, &mut e.outcome).map(|()| match &e.outcome {
+            Some(Ok(s)) => Some(f(&e.parent, s)),
+            _ => None,
+        }),
+        _ => Err((
+            MR_ERR_INVALID_HANDLE,
+            format!("la tarea {task} no es una búsqueda de particiones"),
+        )),
+    });
+    match r {
+        None => Err(bad_task(task)),
+        Some(Err((c, m))) => Err(fail(c, m)),
+        Some(Ok(Some(v))) => Ok(v),
+        Some(Ok(None)) => Err(fail(MR_ERR_NOT_FINISHED, "resultado no disponible")),
+    }
+}
+
+/// Resumen del resultado (estado, recuentos, presupuesto gastado, desplazamiento).
+///
+/// # Safety
+/// `out` debe apuntar a un `MrPartitionSearchInfo` escribible con `struct_size` ya escrito.
+#[no_mangle]
+pub unsafe extern "C" fn mr_partition_search_result(
+    task: u64,
+    out: *mut MrPartitionSearchInfo,
+) -> i32 {
+    guard(|| {
+        // SAFETY: contrato del llamador.
+        if let Err(c) = unsafe { check_struct_size(out, "mr_partition_search_info") } {
+            return c;
+        }
+        match with_search(task, |_, s| {
+            let r = &s.result;
+            let mut flags = 0;
+            if r.shift_bytes.is_some() {
+                flags |= MR_SEARCH_HAS_SHIFT;
+            }
+            if r.volume_limit_reached {
+                flags |= MR_SEARCH_VOLUME_LIMIT;
+            }
+            MrPartitionSearchInfo {
+                struct_size: std::mem::size_of::<MrPartitionSearchInfo>() as u32,
+                status: r.status.number(),
+                volume_count: r.volumes.len() as u32,
+                table_count: r.tables.len() as u32,
+                anomaly_count: r.anomalies.len() as u32,
+                flags,
+                shift_bytes: r.shift_bytes.unwrap_or(0),
+                reads: r.stats.reads,
+                max_reads: r.options.max_reads,
+                bytes_read: r.stats.bytes,
+                unverifiable_sectors: r.stats.unverifiable_sectors,
+                probed: r.probed,
+                pending: r.pending.iter().sum(),
+                sector_size: r.sector_size,
+                reserved: 0,
+                sectors: r.sectors,
+            }
+        }) {
+            // SAFETY: `out` comprobado.
+            Ok(v) => unsafe { write_out(out, v) },
+            Err(c) => c,
+        }
+    })
+}
+
+/// Volumen encontrado número `index` (orden por posición).
+///
+/// # Safety
+/// `out` debe apuntar a un `MrFoundVolume` escribible con `struct_size` ya escrito.
+#[no_mangle]
+pub unsafe extern "C" fn mr_found_volume_get(
+    task: u64,
+    index: u32,
+    out: *mut MrFoundVolume,
+) -> i32 {
+    guard(|| {
+        // SAFETY: contrato del llamador.
+        if let Err(c) = unsafe { check_struct_size(out, "mr_found_volume") } {
+            return c;
+        }
+        let r = with_search(task, |_, s| {
+            let r = &s.result;
+            let v = r.volumes.get(index as usize)?;
+            let mut flags = 0;
+            if v.partial() {
+                flags |= MR_FOUND_PARTIAL;
+            }
+            if v.listed() {
+                flags |= MR_FOUND_LISTED;
+            }
+            if v.requires_shift() {
+                flags |= MR_FOUND_REQUIRES_SHIFT;
+            }
+            if v.backup_byte.is_some() {
+                flags |= MR_FOUND_HAS_BACKUP;
+            }
+            let idx = |i: Option<usize>| i.map_or(MR_PARTITION_TABLE, |i| i as u32);
+            Some(MrFoundVolume {
+                struct_size: std::mem::size_of::<MrFoundVolume>() as u32,
+                fs: fs_code(v.fs),
+                start_byte: v.start_byte,
+                length_bytes: v.length_bytes,
+                start_lba: v.start_lba(r.sector_size),
+                sector_count: v.sector_count(r.sector_size),
+                fs_sector_size: v.fs_sector_size,
+                confidence: confidence_code(&v.confidence),
+                primary: v.primary.number(),
+                backup: v.backup.number(),
+                structures: v.structures.number(),
+                entry: v.entry.number(),
+                self_location: v.self_location.number(),
+                aligned: v.aligned.number(),
+                tier: v.tier.index() as u32,
+                flags,
+                table_index: idx(v.table_partition),
+                found_table_index: idx(v.found_table),
+                anomaly_count: u32::try_from(v.anomalies.len()).unwrap_or(u32::MAX),
+                suggested_mbr_type: u32::from(v.fs.suggested_mbr_type()),
+                primary_byte: v.primary_byte,
+                backup_byte: v.backup_byte.unwrap_or(0),
+                declared_start: v.declared_start,
+                serial: v.serial,
+                score: v.score,
+                reserved: 0,
+            })
+        });
+        match r {
+            // SAFETY: `out` comprobado.
+            Ok(Some(v)) => unsafe { write_out(out, v) },
+            Ok(None) => index_error("volumen encontrado", u64::from(index)),
+            Err(c) => c,
+        }
+    })
+}
+
+/// Origen del volumen: qué candidato lo propuso (texto legible).
+///
+/// # Safety
+/// Ver contrato de cadenas de salida.
+#[no_mangle]
+pub unsafe extern "C" fn mr_found_volume_origin(
+    task: u64,
+    index: u32,
+    buf: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> i32 {
+    guard(|| {
+        let r = with_search(task, |_, s| {
+            s.result
+                .volumes
+                .get(index as usize)
+                .map(|v| v.origin.clone())
+        });
+        match r {
+            // SAFETY: contrato del llamador.
+            Ok(Some(t)) => unsafe { write_str(&t, buf, cap, out_len) },
+            Ok(None) => index_error("volumen encontrado", u64::from(index)),
+            Err(c) => c,
+        }
+    })
+}
+
+/// Anomalía de búsqueda como `(código, gravedad, lba con signo, valor con signo, texto)`.
+type SearchAnomalyRow = (u32, mr_part::Severity, Option<i64>, Option<i64>, String);
+
+fn search_anomaly_at(s: &PartitionSearch, vi: u32, ai: u32) -> Option<SearchAnomalyRow> {
+    let r = &s.result;
+    let ss = i64::from(r.sector_size);
+    if vi == MR_PARTITION_TABLE {
+        let a = r.anomalies.get(ai as usize)?;
+        return Some((
+            a.number(),
+            a.severity(),
+            Some(a.lba()),
+            a.value(),
+            format!("{}\n{a}", a.code()),
+        ));
+    }
+    let a = r.volumes.get(vi as usize)?.anomalies.get(ai as usize)?;
+    let lba = a
+        .lba()
+        .map(|l| l as i64)
+        .or_else(|| a.byte().map(|b| b.div_euclid(ss)));
+    Some((
+        a.number(),
+        a.severity(),
+        lba,
+        a.value(),
+        format!("{}\n{a}", a.code()),
+    ))
+}
+
+/// Anomalía `anomaly_index` del volumen `volume_index` o, con `MR_PARTITION_TABLE`, de la búsqueda
+/// (`image_shifted`, `mbr_displaced`). `lba` es `int64_t` (`MR_ANOMALY_LBA_SIGNED`) y `value`
+/// también (`MR_ANOMALY_VALUE_SIGNED`).
+///
+/// # Safety
+/// `out` debe apuntar a un `MrPartitionAnomaly` escribible con `struct_size` ya escrito.
+#[no_mangle]
+pub unsafe extern "C" fn mr_found_volume_anomaly(
+    task: u64,
+    volume_index: u32,
+    anomaly_index: u32,
+    out: *mut MrPartitionAnomaly,
+) -> i32 {
+    guard(|| {
+        // SAFETY: contrato del llamador.
+        if let Err(c) = unsafe { check_struct_size(out, "mr_partition_anomaly") } {
+            return c;
+        }
+        let r = with_search(task, |_, s| {
+            search_anomaly_at(s, volume_index, anomaly_index).map(|(code, sev, lba, value, _)| {
+                let mut flags = MR_ANOMALY_LBA_SIGNED;
+                if value.is_some() {
+                    flags |= MR_ANOMALY_HAS_VALUE | MR_ANOMALY_VALUE_SIGNED;
+                }
+                MrPartitionAnomaly {
+                    struct_size: std::mem::size_of::<MrPartitionAnomaly>() as u32,
+                    code,
+                    severity: severity_code(sev),
+                    flags,
+                    lba: lba.unwrap_or(0) as u64,
+                    target_lba: 0,
+                    value: value.unwrap_or(0) as u64,
+                }
+            })
+        });
+        match r {
+            // SAFETY: `out` comprobado.
+            Ok(Some(v)) => unsafe { write_out(out, v) },
+            Ok(None) => index_error("anomalía", u64::from(anomaly_index)),
+            Err(c) => c,
+        }
+    })
+}
+
+/// `"<código>\n<descripción>"` de una anomalía de volumen o de la búsqueda.
+///
+/// # Safety
+/// Ver contrato de cadenas de salida.
+#[no_mangle]
+pub unsafe extern "C" fn mr_found_volume_anomaly_text(
+    task: u64,
+    volume_index: u32,
+    anomaly_index: u32,
+    buf: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> i32 {
+    guard(|| {
+        let r = with_search(task, |_, s| {
+            search_anomaly_at(s, volume_index, anomaly_index).map(|a| a.4)
+        });
+        match r {
+            // SAFETY: contrato del llamador.
+            Ok(Some(t)) => unsafe { write_str(&t, buf, cap, out_len) },
+            Ok(None) => index_error("anomalía", u64::from(anomaly_index)),
+            Err(c) => c,
+        }
+    })
+}
+
+/// Tabla encontrada número `index`.
+///
+/// # Safety
+/// `out` debe apuntar a un `MrFoundTable` escribible con `struct_size` ya escrito.
+#[no_mangle]
+pub unsafe extern "C" fn mr_found_table_get(task: u64, index: u32, out: *mut MrFoundTable) -> i32 {
+    guard(|| {
+        // SAFETY: contrato del llamador.
+        if let Err(c) = unsafe { check_struct_size(out, "mr_found_table") } {
+            return c;
+        }
+        let r = with_search(task, |_, s| {
+            s.result.tables.get(index as usize).map(|t| MrFoundTable {
+                struct_size: std::mem::size_of::<MrFoundTable>() as u32,
+                kind: match t.kind {
+                    mr_part::search::FoundTableKind::Mbr => MR_FOUND_TABLE_MBR,
+                    mr_part::search::FoundTableKind::Gpt => MR_FOUND_TABLE_GPT,
+                },
+                lba: t.lba,
+                declared_lba: t.declared_lba,
+                entry_count: t.entries.len() as u32,
+                reserved: 0,
+            })
+        });
+        match r {
+            // SAFETY: `out` comprobado.
+            Ok(Some(v)) => unsafe { write_out(out, v) },
+            Ok(None) => index_error("tabla encontrada", u64::from(index)),
+            Err(c) => c,
+        }
+    })
+}
+
+/// Abre el volumen encontrado `index` como origen (vista acotada del origen de la búsqueda). Un
+/// volumen parcial o desalineado se rechaza siempre; uno que depende del desplazamiento detectado
+/// solo con `MR_PARTITION_OPEN_APPLY_SHIFT`. Se cierra con `mr_source_close`.
+///
+/// # Safety
+/// `out_source` debe ser un puntero válido.
+#[no_mangle]
+pub unsafe extern "C" fn mr_found_volume_open(
+    task: u64,
+    index: u32,
+    flags: u32,
+    out_source: *mut u64,
+) -> i32 {
+    guard(|| {
+        if out_source.is_null() {
+            return fail(MR_ERR_INVALID_ARGUMENT, "puntero de salida nulo");
+        }
+        if flags & !MR_PARTITION_OPEN_APPLY_SHIFT != 0 {
+            return fail(
+                MR_ERR_INVALID_ARGUMENT,
+                "opciones de apertura de volumen no válidas",
+            );
+        }
+        let r = with_search(task, |parent, s| {
+            ((index as usize) < s.result.volumes.len())
+                .then(|| (Arc::clone(parent), s.result.clone()))
+        });
+        let (parent, result) = match r {
+            Ok(Some(v)) => v,
+            Ok(None) => return index_error("volumen encontrado", u64::from(index)),
+            Err(c) => return c,
+        };
+        let apply = flags & MR_PARTITION_OPEN_APPLY_SHIFT != 0;
+        match mr_api::open_found_volume(&parent, &result, index as usize, apply) {
+            // SAFETY: `out_source` no es nulo.
+            Ok(src) => unsafe { write_out(out_source, insert(Entry::Source(src))) },
+            Err(e) => api_fail(&e),
+        }
+    })
+}
+
 // ---------- Tareas: comunes ----------
 
 /// # Safety
@@ -1876,6 +2472,7 @@ pub unsafe extern "C" fn mr_task_status_get(task: u64, out: *mut MrTaskStatus) -
             let (state, (done, total)) = match e {
                 Entry::Hash { task, .. } => (task.state(), task.progress()),
                 Entry::Verify { task, .. } => (task.state(), task.progress()),
+                Entry::Search(e) => (e.task.state(), e.task.progress()),
                 Entry::Source(_) | Entry::Partitions { .. } => return None,
             };
             Some(MrTaskStatus {
@@ -1905,6 +2502,10 @@ pub extern "C" fn mr_task_cancel(task: u64) -> i32 {
                 task.cancel();
                 true
             }
+            Entry::Search(e) => {
+                e.task.cancel();
+                true
+            }
             Entry::Source(_) | Entry::Partitions { .. } => false,
         });
         if cancelled == Some(true) {
@@ -1920,13 +2521,14 @@ pub extern "C" fn mr_task_free(task: u64) -> i32 {
     guard(|| {
         let mut map = registry().lock().unwrap_or_else(|e| e.into_inner());
         match map.get(&task) {
-            Some(Entry::Hash { .. } | Entry::Verify { .. }) => {}
+            Some(Entry::Hash { .. } | Entry::Verify { .. } | Entry::Search(_)) => {}
             _ => return bad_task(task),
         }
         // Si sigue en marcha se cancela; el hilo termina por su cuenta.
         match map.remove(&task) {
             Some(Entry::Hash { task, .. }) => task.cancel(),
             Some(Entry::Verify { task, .. }) => task.cancel(),
+            Some(Entry::Search(e)) => e.task.cancel(),
             _ => {}
         }
         MR_OK

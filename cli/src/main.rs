@@ -3,10 +3,12 @@
 //! Todas las operaciones son de solo lectura y solo aceptan ficheros de imagen.
 
 use mr_api::mr_part::gpt::GptCopy;
+use mr_api::mr_part::search::{Check, FoundTableKind, FoundVolume, SearchStatus};
 use mr_api::mr_part::{Anomaly, Confidence, Origin, PartitionKind, Scheme, Severity};
 use mr_api::task::TaskState;
 use mr_api::{
-    HashOptions, ImageInfo, OpenOptions, Partition, PartitionTable, Source, VerifyOptions,
+    HashOptions, ImageInfo, OpenOptions, Partition, PartitionTable, SearchOptions, SearchResult,
+    Source, VerifyOptions,
 };
 use mr_common::HashAlgorithm;
 use mr_io::resilient::{OnError, ReadPolicy};
@@ -26,6 +28,7 @@ USO:
   memrescue-cli image-info <imagen> [ORIGEN] [--json]
   memrescue-cli split-list <imagen.001>
   memrescue-cli partitions <imagen> [ORIGEN] [--json]
+  memrescue-cli find-partitions <imagen> [ORIGEN] [--json] [--max-reads N]
   memrescue-cli sectors <imagen> --lba N [--count M] [--retries N] [--jump N] [--read-back]
                         [--bad-fill PATRÓN] [--skip-fill PATRÓN] [ORIGEN]
   memrescue-cli verify <imagen> [--retries N] [--jump N] [--read-back]
@@ -46,7 +49,11 @@ ORIGEN (opcional):
                      no se combina con --range
   --apply-shift      con --partition en una imagen desplazada (GPT): abrir la partición en
                      LBA del disco - desplazamiento (sin esta opción se rechaza; nunca se aplica
-                     en silencio)
+                     en silencio); con --found, abrir un volumen cuya posición depende del
+                     desplazamiento detectado por la búsqueda
+  --found N          trabajar solo con el volumen N encontrado por la búsqueda exprés
+                     (numeración de «find-partitions», desde 1; la búsqueda se repite con las
+                     mismas opciones); no se combina con --partition ni con --range
 
 POLÍTICA DE ERRORES (verify):
   --skip-codes LISTA códigos de error del sistema que no se reintentan (p. ej. 23,1117)
@@ -66,6 +73,16 @@ PARTICIONES (partitions):
   anomalías; con --json, códigos estables. Con GPT (MBR protector o híbrido, o firma GPT sin MBR)
   se listan las particiones GPT con nombre y GUID de tipo, la copia en uso (primaria o de
   respaldo) y el desplazamiento de la imagen si lo hay (las LBA son las del disco).
+
+BÚSQUEDA DE PARTICIONES PERDIDAS (find-partitions):
+  Búsqueda exprés acotada (nunca recorre el disco): sondea las posiciones que declara la tabla,
+  las derivadas de lo encontrado, rejillas de alineación (CHS y 1 MiB) al inicio y al final y los
+  huecos sin explicar, y reconoce NTFS, FAT12/16/32 y exFAT (principal, copia y estructuras
+  básicas) y tablas MBR/EBR o GPT en esas posiciones. Solo se ejecuta a petición.
+  --max-reads N      presupuesto de lecturas (por defecto 4096); al agotarse, resultado parcial
+  Indicadores: E entrada de tabla, P principal, C copia coherente, S estructuras básicas,
+  U inicio declarado coherente, A alineación; + sí, x no o dañada, ? no verificable (sector
+  ilegible: nunca se interpreta su relleno), o fuera de la imagen, - no aplica.
 
 Formatos: RAW, VHD (fijo/dinámico), VHDX (fijo/dinámico), VMDK monolithicSparse e imágenes
 divididas. Tamaños de sector habituales: 512, 1024, 2048, 4096.
@@ -90,6 +107,10 @@ struct Args {
     partition: Option<usize>,
     /// Aplicar explícitamente el desplazamiento de la imagen al abrir una partición GPT.
     apply_shift: bool,
+    /// Volumen encontrado (desde 1) con el que trabajar.
+    found: Option<usize>,
+    /// Presupuesto de lecturas de la búsqueda.
+    max_reads: Option<u64>,
     jump: u64,
     read_back: bool,
     /// Política de omisión de errores (`verify`).
@@ -154,6 +175,8 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
         range: None,
         partition: None,
         apply_shift: false,
+        found: None,
+        max_reads: None,
         jump: 0,
         read_back: false,
         skip_codes: Vec::new(),
@@ -207,6 +230,20 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
                 a.partition = Some(n);
             }
             "--apply-shift" => a.apply_shift = true,
+            "--found" => {
+                let n: usize = num(&mut it, "--found")?;
+                if n == 0 {
+                    return Err("--found empieza en 1".into());
+                }
+                a.found = Some(n);
+            }
+            "--max-reads" => {
+                let n: u64 = num(&mut it, "--max-reads")?;
+                if n == 0 || n > mr_api::mr_part::search::LIMIT_MAX_READS {
+                    return Err("--max-reads debe estar entre 1 y 1048576".into());
+                }
+                a.max_reads = Some(n);
+            }
             "--algo" => {
                 let v = it.next().ok_or("falta el valor de --algo")?;
                 a.algos = v
@@ -268,6 +305,20 @@ fn open_src(a: &Args, p: &str) -> Result<Source, mr_api::ApiError> {
         let part = mr_api::open_partition(&src, &t, n - 1, a.apply_shift)?;
         eprintln!("Partición {n}: {}", part.info().description);
         return Ok(part);
+    }
+    if let Some(n) = a.found {
+        let ctx = mr_api::task::TaskContext::detached();
+        let found = mr_api::search_partitions(src.as_ref(), &search_options(a), &ctx)?;
+        let r = &found.result;
+        if n > r.volumes.len() {
+            return Err(mr_api::ApiError::InvalidArgument(format!(
+                "no existe el volumen encontrado {n} (la búsqueda encontró {})",
+                r.volumes.len()
+            )));
+        }
+        let v = mr_api::open_found_volume(&src, r, n - 1, a.apply_shift)?;
+        eprintln!("Volumen encontrado {n}: {}", v.info().description);
+        return Ok(v);
     }
     match a.range {
         Some((start, count)) => mr_api::open_range(&src, start, count),
@@ -595,6 +646,14 @@ fn run(args: Vec<String>) -> Result<(), (u8, String)> {
     if a.partition.is_some() && a.range.is_some() {
         return Err(usage("--partition y --range no se pueden combinar"));
     }
+    if a.found.is_some() && (a.partition.is_some() || a.range.is_some()) {
+        return Err(usage(
+            "--found no se puede combinar con --partition ni con --range",
+        ));
+    }
+    if a.found.is_some() && cmd == "find-partitions" {
+        return Err(usage("--found no se aplica a find-partitions"));
+    }
     if cmd != "sectors" && (a.bad_fill.is_some() || a.skip_fill.is_some()) {
         return Err(usage("--bad-fill y --skip-fill solo se aplican a sectors"));
     }
@@ -811,6 +870,31 @@ fn run(args: Vec<String>) -> Result<(), (u8, String)> {
                 ));
             }
         }
+        "find-partitions" => {
+            let p = one(&a)?;
+            let src = open_src(&a, &p).map_err(|e| op(&e))?;
+            let task =
+                mr_api::start_partition_search_task(src, search_options(&a)).map_err(|e| op(&e))?;
+            while task.state() == TaskState::Running {
+                let (d, t) = task.progress();
+                if !a.json && t > 0 {
+                    eprint!("\r{d}/{t} lecturas");
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            if !a.json {
+                eprintln!();
+            }
+            let found = task.wait().map_err(|e| op(&e))?;
+            print_search(&found.result, a.json);
+            let bad = found.result.stats.unverifiable_sectors;
+            if bad > 0 {
+                return Err((
+                    3,
+                    format!("{bad} sectores ilegibles durante la búsqueda: no se interpretaron"),
+                ));
+            }
+        }
         "image-info" => {
             let p = one(&a)?;
             let src = open_src(&a, &p).map_err(|e| op(&e))?;
@@ -885,6 +969,242 @@ fn run(args: Vec<String>) -> Result<(), (u8, String)> {
         other => return Err(usage(&format!("comando desconocido: {other}"))),
     }
     Ok(())
+}
+
+/// Opciones de la búsqueda según los argumentos (presupuesto de lecturas).
+fn search_options(a: &Args) -> SearchOptions {
+    SearchOptions {
+        max_reads: a
+            .max_reads
+            .unwrap_or(mr_api::mr_part::search::DEFAULT_MAX_READS),
+        ..SearchOptions::default()
+    }
+}
+
+fn check_label(c: Check) -> &'static str {
+    match c {
+        Check::Yes => "sí",
+        Check::No => "no o dañada",
+        Check::Unverifiable => "NO VERIFICABLE (sector ilegible)",
+        Check::Outside => "fuera de la imagen",
+        Check::NotApplicable => "no aplica",
+    }
+}
+
+fn opt_i64_json(v: Option<i64>) -> String {
+    v.map_or_else(|| "null".into(), |x| x.to_string())
+}
+
+fn volume_json(i: usize, v: &FoundVolume, ss: u32) -> String {
+    let lba = |b: i64| b.div_euclid(i64::from(ss));
+    let anomalies: Vec<String> = v
+        .anomalies
+        .iter()
+        .map(|an| {
+            format!(
+                "{{\"code\":{},\"severity\":\"{}\",\"lba\":{},\"value\":{},\"message\":{}}}",
+                json_str(an.code()),
+                severity_name(an.severity()),
+                opt_i64_json(an.lba().map(|l| l as i64).or(an.byte().map(lba))),
+                opt_i64_json(an.value()),
+                json_str(&an.to_string())
+            )
+        })
+        .collect();
+    let evidence: Vec<String> = v.evidence().iter().map(|e| json_str(e)).collect();
+    format!(
+        "{{\"number\":{},\"fs\":\"{}\",\"start_byte\":{},\"length_bytes\":{},\"start_lba\":{},\"sectors\":{},\"end_lba\":{},\"fs_sector_size\":{},\
+\"entry\":\"{}\",\"primary\":\"{}\",\"backup\":\"{}\",\"structures\":\"{}\",\"self_location\":\"{}\",\"aligned\":\"{}\",\"indicators\":{},\
+\"evidence\":[{}],\"partial\":{},\"listed\":{},\"table_partition\":{},\"found_table\":{},\"requires_shift\":{},\"tier\":\"{}\",\"origin\":{},\
+\"boot_lba\":{},\"backup_boot_lba\":{},\"hidden_sectors\":{},\"serial\":\"{:0width$x}\",\"suggested_mbr_type\":{},\"confidence\":\"{}\",\"score\":{},\"anomalies\":[{}]}}",
+        i + 1,
+        v.fs.code(),
+        v.start_byte,
+        v.length_bytes,
+        v.start_lba(ss),
+        v.sector_count(ss),
+        v.start_lba(ss) + v.sector_count(ss) as i64 - 1,
+        v.fs_sector_size,
+        v.entry.code(),
+        v.primary.code(),
+        v.backup.code(),
+        v.structures.code(),
+        v.self_location.code(),
+        v.aligned.code(),
+        json_str(&v.indicators()),
+        evidence.join(","),
+        v.partial(),
+        v.listed(),
+        opt_json(v.table_partition.map(|x| x as u64 + 1)),
+        opt_json(v.found_table.map(|x| x as u64 + 1)),
+        v.requires_shift(),
+        v.tier.code(),
+        json_str(&v.origin),
+        lba(v.primary_byte),
+        opt_i64_json(v.backup_byte.map(lba)),
+        v.declared_start,
+        v.serial,
+        v.fs.suggested_mbr_type(),
+        confidence_name(&v.confidence),
+        v.score,
+        anomalies.join(","),
+        width = v.fs.serial_digits()
+    )
+}
+
+/// Imprime el resultado de la búsqueda (texto o JSON).
+fn print_search(r: &SearchResult, json: bool) {
+    let ss = r.sector_size;
+    if json {
+        let volumes: Vec<String> = r
+            .volumes
+            .iter()
+            .enumerate()
+            .map(|(i, v)| volume_json(i, v, ss))
+            .collect();
+        let tables: Vec<String> = r
+            .tables
+            .iter()
+            .map(|t| {
+                let entries: Vec<String> = t
+                    .entries
+                    .iter()
+                    .map(|e| {
+                        format!(
+                            "{{\"start_byte\":{},\"length_bytes\":{},\"mbr_type\":{},\"extended\":{}}}",
+                            e.start_byte, e.length_bytes, e.mbr_type, e.extended
+                        )
+                    })
+                    .collect();
+                format!(
+                    "{{\"kind\":\"{}\",\"lba\":{},\"declared_lba\":{},\"entries\":[{}]}}",
+                    match t.kind {
+                        FoundTableKind::Mbr => "mbr",
+                        FoundTableKind::Gpt => "gpt",
+                    },
+                    t.lba,
+                    t.declared_lba,
+                    entries.join(",")
+                )
+            })
+            .collect();
+        let anomalies: Vec<String> = r
+            .anomalies
+            .iter()
+            .map(|an| {
+                format!(
+                    "{{\"code\":{},\"severity\":\"{}\",\"lba\":{},\"value\":{},\"message\":{}}}",
+                    json_str(an.code()),
+                    severity_name(an.severity()),
+                    an.lba(),
+                    opt_i64_json(an.value()),
+                    json_str(&an.to_string())
+                )
+            })
+            .collect();
+        let pending: Vec<String> = r.pending.iter().map(u64::to_string).collect();
+        println!(
+            "{{\"status\":\"{}\",\"sector_size\":{ss},\"sectors\":{},\"reads\":{},\"max_reads\":{},\"bytes_read\":{},\"unverifiable_sectors\":{},\"probed\":{},\"pending\":[{}],\"volume_limit_reached\":{},\"shift_bytes\":{},\"anomalies\":[{}],\"tables\":[{}],\"volumes\":[{}]}}",
+            r.status.code(),
+            r.sectors,
+            r.stats.reads,
+            r.options.max_reads,
+            r.stats.bytes,
+            r.stats.unverifiable_sectors,
+            r.probed,
+            pending.join(","),
+            r.volume_limit_reached,
+            opt_i64_json(r.shift_bytes),
+            anomalies.join(","),
+            tables.join(","),
+            volumes.join(",")
+        );
+        return;
+    }
+    let status = match r.status {
+        SearchStatus::Complete => "completa",
+        SearchStatus::BudgetExhausted => "PRESUPUESTO AGOTADO (resultado parcial)",
+        SearchStatus::Cancelled => "CANCELADA (resultado parcial)",
+    };
+    println!("Búsqueda exprés: {status}");
+    println!(
+        "Lecturas:        {} de {} ({} bytes); candidatos sondeados {}, pendientes {}",
+        r.stats.reads,
+        r.options.max_reads,
+        r.stats.bytes,
+        r.probed,
+        r.pending.iter().sum::<u64>()
+    );
+    if r.stats.unverifiable_sectors > 0 {
+        println!(
+            "Sectores no verificables: {} (ilegibles: su relleno no se interpretó)",
+            r.stats.unverifiable_sectors
+        );
+    }
+    for an in &r.anomalies {
+        println!(
+            "  - [{}] {}: {an}",
+            severity_label(an.severity()),
+            an.code()
+        );
+    }
+    for t in &r.tables {
+        let kind = match t.kind {
+            FoundTableKind::Mbr => "MBR/EBR",
+            FoundTableKind::Gpt => "cabecera GPT",
+        };
+        println!(
+            "Tabla encontrada: {kind} en la LBA {} con {} entradas",
+            t.lba,
+            t.entries.len()
+        );
+    }
+    if r.volumes.is_empty() {
+        println!("(no se encontró ningún volumen)");
+        return;
+    }
+    println!(
+        "{:>3}  {:<11} {:<6} {:>12}  {:>12}  {:>12}  {:<18} {:<11} Origen",
+        "N", "Estado", "FS", "LBA inicial", "LBA final", "Sectores", "Indicadores", "Confianza"
+    );
+    for (i, v) in r.volumes.iter().enumerate() {
+        let state = match v.table_partition {
+            Some(p) => format!("tabla #{}", p + 1),
+            None if v.partial() => "parcial".to_string(),
+            None => "encontrada".to_string(),
+        };
+        let start = v.start_lba(ss);
+        println!(
+            "{:>3}  {:<11} {:<6} {:>12}  {:>12}  {:>12}  {:<18} {:<11} {}",
+            i + 1,
+            state,
+            v.fs.name(),
+            start,
+            start + v.sector_count(ss) as i64 - 1,
+            v.sector_count(ss),
+            v.indicators(),
+            confidence_label(&v.confidence),
+            v.origin
+        );
+        println!(
+            "       principal: {}; copia: {}; estructuras: {}",
+            check_label(v.primary),
+            check_label(v.backup),
+            check_label(v.structures)
+        );
+        for an in &v.anomalies {
+            println!(
+                "       - [{}] {}: {an}",
+                severity_label(an.severity()),
+                an.code()
+            );
+        }
+    }
+    println!(
+        "Indicadores: E entrada de tabla, P principal, C copia, S estructuras, U inicio declarado, \
+         A alineación (+ sí, x no, ? no verificable, o fuera de la imagen, - no aplica)."
+    );
+    println!("Para abrir un volumen: --found N (y --apply-shift si depende del desplazamiento).");
 }
 
 fn main() -> ExitCode {

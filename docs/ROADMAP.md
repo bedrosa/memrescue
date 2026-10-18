@@ -97,8 +97,11 @@ confirmación explícita del usuario o descomprimir; hoy se rechazan con errores
   - **GPT con copia y tolerancias: hecho (#13)** e **integrado (#12)**: particiones GPT, copia de respaldo
     en uso y desplazamiento en API, ABI, CLI (`--apply-shift`) e interfaz (ADR-022, adenda).
   - APM: #17 (opcional).
-- Búsqueda exprés de particiones perdidas (boot sectors/superbloques en ubicaciones típicas).
-- Indicadores de estructuras.
+- **Búsqueda exprés de particiones perdidas: hecha (#15)**: candidatos por niveles con presupuesto
+  acotado, NTFS/FAT/exFAT con sus copias, tablas encontradas, hipótesis de desplazamiento, API, ABI 3
+  ampliada, CLI `find-partitions` / `--found N` y acción en la pestaña «Particiones» (ADR-023).
+- **Indicadores de estructuras: hechos (#15)**: E, P, C, S, U, A con estado «no verificable»
+  (`formatos/busqueda-particiones.md`).
 - **Paridad objetivo**: PT-01…PT-06, PT-10 (lectura/guardar).
 
 ## M3 · NTFS lectura

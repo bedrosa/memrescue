@@ -100,6 +100,12 @@ public sealed record PartitionAnomaly(uint Code, string Name, AnomalySeverity Se
     /// <summary><see cref="Value"/> interpretado con signo.</summary>
     public long? SignedValue => Value is { } v ? unchecked((long)v) : null;
 
+    /// <summary><see cref="Lba"/> es un entero con signo (anomalías de la búsqueda de particiones).</summary>
+    public bool LbaSigned { get; init; }
+
+    /// <summary><see cref="Lba"/> interpretada con signo.</summary>
+    public long SignedLba => unchecked((long)Lba);
+
     public override string ToString() => $"[{Severity.Label()}] {Name}: {Message}";
 }
 

@@ -249,29 +249,82 @@
                         <ListBox x:Name="PartitionAnomaliesList" DockPanel.Dock="Bottom" Height="110"
                                  AutomationProperties.AutomationId="PartitionAnomaliesList"
                                  AutomationProperties.LabeledBy="{Binding ElementName=PartitionAnomaliesHeader}" />
-                        <ListView x:Name="PartitionsList" SelectionMode="Single" AutomationProperties.AutomationId="PartitionsList"
-                                  SelectionChanged="PartitionsList_SelectionChanged" MouseDoubleClick="PartitionsList_MouseDoubleClick">
-                            <ListView.ItemContainerStyle>
-                                <Style TargetType="ListViewItem">
-                                    <Setter Property="AutomationProperties.Name" Value="{Binding AutomationName}" />
-                                    <Setter Property="AutomationProperties.AutomationId" Value="{Binding AutomationId}" />
-                                    <Setter Property="ToolTip" Value="{Binding Details}" />
-                                </Style>
-                            </ListView.ItemContainerStyle>
-                            <ListView.View>
-                                <GridView>
-                                    <GridViewColumn Header="N" Width="32" DisplayMemberBinding="{Binding Number}" />
-                                    <GridViewColumn Header="Origen" Width="130" DisplayMemberBinding="{Binding Origin}" />
-                                    <GridViewColumn Header="Activa" Width="48" DisplayMemberBinding="{Binding ActiveText}" />
-                                    <GridViewColumn Header="LBA inicial" Width="90" DisplayMemberBinding="{Binding StartText}" />
-                                    <GridViewColumn Header="LBA final" Width="90" DisplayMemberBinding="{Binding EndText}" />
-                                    <GridViewColumn Header="Tamaño" Width="80" DisplayMemberBinding="{Binding SizeText}" />
-                                    <GridViewColumn Header="Tipo" Width="190" DisplayMemberBinding="{Binding Type}" />
-                                    <GridViewColumn Header="Nombre" Width="110" DisplayMemberBinding="{Binding Name}" />
-                                    <GridViewColumn Header="Confianza" Width="100" DisplayMemberBinding="{Binding ConfidenceText}" />
-                                </GridView>
-                            </ListView.View>
-                        </ListView>
+                        <Grid>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="*" MinHeight="80" />
+                                <RowDefinition Height="*" MinHeight="120" />
+                            </Grid.RowDefinitions>
+                            <ListView x:Name="PartitionsList" Grid.Row="0" SelectionMode="Single" VirtualizingPanel.IsVirtualizing="False" AutomationProperties.AutomationId="PartitionsList"
+                                      SelectionChanged="PartitionsList_SelectionChanged" MouseDoubleClick="PartitionsList_MouseDoubleClick">
+                                <ListView.ItemContainerStyle>
+                                    <Style TargetType="ListViewItem">
+                                        <Setter Property="AutomationProperties.Name" Value="{Binding AutomationName}" />
+                                        <Setter Property="AutomationProperties.AutomationId" Value="{Binding AutomationId}" />
+                                        <Setter Property="ToolTip" Value="{Binding Details}" />
+                                    </Style>
+                                </ListView.ItemContainerStyle>
+                                <ListView.View>
+                                    <GridView>
+                                        <GridViewColumn Header="N" Width="32" DisplayMemberBinding="{Binding Number}" />
+                                        <GridViewColumn Header="Origen" Width="130" DisplayMemberBinding="{Binding Origin}" />
+                                        <GridViewColumn Header="Activa" Width="48" DisplayMemberBinding="{Binding ActiveText}" />
+                                        <GridViewColumn Header="LBA inicial" Width="90" DisplayMemberBinding="{Binding StartText}" />
+                                        <GridViewColumn Header="LBA final" Width="90" DisplayMemberBinding="{Binding EndText}" />
+                                        <GridViewColumn Header="Tamaño" Width="80" DisplayMemberBinding="{Binding SizeText}" />
+                                        <GridViewColumn Header="Tipo" Width="190" DisplayMemberBinding="{Binding Type}" />
+                                        <GridViewColumn Header="Nombre" Width="110" DisplayMemberBinding="{Binding Name}" />
+                                        <GridViewColumn Header="Confianza" Width="100" DisplayMemberBinding="{Binding ConfidenceText}" />
+                                    </GridView>
+                                </ListView.View>
+                            </ListView>
+                            <!-- Búsqueda exprés de particiones perdidas (#15): solo a petición, con progreso y cancelación. -->
+                            <DockPanel Grid.Row="1" Margin="0,8,0,0">
+                                <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Margin="0,0,0,4">
+                                    <Button x:Name="FindPartitionsButton" Content="Buscar particiones perdidas" IsEnabled="False"
+                                            AutomationProperties.AutomationId="FindPartitionsButton" Click="FindPartitions_Click"
+                                            ToolTip="Búsqueda exprés acotada (nunca recorre el disco): sondea las posiciones declaradas, las rejillas de alineación y los huecos, y reconoce NTFS, FAT y exFAT con sus copias" />
+                                    <Button x:Name="CancelSearchButton" Content="Cancelar búsqueda" Margin="6,0,0,0" IsEnabled="False"
+                                            AutomationProperties.AutomationId="CancelSearchButton" Click="CancelSearch_Click" />
+                                    <Button x:Name="OpenFoundVolumeButton" Content="Abrir volumen en el visor" Margin="6,0,0,0" IsEnabled="False"
+                                            AutomationProperties.AutomationId="OpenFoundVolumeButton" Click="OpenFoundVolume_Click"
+                                            ToolTip="Abre el volumen encontrado seleccionado como un origen independiente (solo lectura)" />
+                                    <ProgressBar x:Name="SearchProgressBar" Width="140" Height="14" Margin="10,0,0,0" Minimum="0" Maximum="100"
+                                                 AutomationProperties.AutomationId="SearchProgressBar"
+                                                 AutomationProperties.Name="Progreso de la búsqueda (lecturas respecto al presupuesto)" />
+                                </StackPanel>
+                                <TextBlock x:Name="SearchStatusText" DockPanel.Dock="Top" Margin="0,0,0,4" TextWrapping="Wrap"
+                                           Text="Volúmenes encontrados: pulse «Buscar particiones perdidas» (la búsqueda solo se hace a petición)."
+                                           AutomationProperties.AutomationId="SearchStatusText" />
+                                <TextBlock x:Name="IndicatorsLegendText" DockPanel.Dock="Bottom" Margin="0,2,0,0" TextWrapping="Wrap"
+                                           Foreground="{StaticResource MutedBrush}" AutomationProperties.AutomationId="IndicatorsLegendText"
+                                           Text="Indicadores: E entrada de tabla, P principal, C copia coherente, S estructuras, U inicio declarado, A alineación. + sí · x no o dañada · ? no verificable (sector ilegible, nunca se interpreta su relleno) · o fuera de la imagen · - no aplica." />
+                                <ListView x:Name="FoundVolumesList" MinHeight="60" SelectionMode="Single" VirtualizingPanel.IsVirtualizing="False"
+                                          AutomationProperties.AutomationId="FoundVolumesList"
+                                          AutomationProperties.Name="Volúmenes encontrados"
+                                          SelectionChanged="FoundVolumesList_SelectionChanged" MouseDoubleClick="FoundVolumesList_MouseDoubleClick">
+                                    <ListView.ItemContainerStyle>
+                                        <Style TargetType="ListViewItem">
+                                            <Setter Property="AutomationProperties.Name" Value="{Binding AutomationName}" />
+                                            <Setter Property="AutomationProperties.AutomationId" Value="{Binding AutomationId}" />
+                                            <Setter Property="ToolTip" Value="{Binding Details}" />
+                                        </Style>
+                                    </ListView.ItemContainerStyle>
+                                    <ListView.View>
+                                        <GridView>
+                                            <GridViewColumn Header="N" Width="32" DisplayMemberBinding="{Binding Number}" />
+                                            <GridViewColumn Header="Estado" Width="80" DisplayMemberBinding="{Binding State}" />
+                                            <GridViewColumn Header="FS" Width="55" DisplayMemberBinding="{Binding FileSystem}" />
+                                            <GridViewColumn Header="LBA inicial" Width="90" DisplayMemberBinding="{Binding StartText}" />
+                                            <GridViewColumn Header="LBA final" Width="90" DisplayMemberBinding="{Binding EndText}" />
+                                            <GridViewColumn Header="Tamaño" Width="80" DisplayMemberBinding="{Binding SizeText}" />
+                                            <GridViewColumn Header="Indicadores" Width="130" DisplayMemberBinding="{Binding Indicators}" />
+                                            <GridViewColumn Header="Confianza" Width="100" DisplayMemberBinding="{Binding ConfidenceText}" />
+                                            <GridViewColumn Header="Origen" Width="300" DisplayMemberBinding="{Binding Origin}" />
+                                        </GridView>
+                                    </ListView.View>
+                                </ListView>
+                            </DockPanel>
+                        </Grid>
                     </DockPanel>
                 </TabItem>
 

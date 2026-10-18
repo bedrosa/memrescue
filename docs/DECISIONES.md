@@ -451,3 +451,53 @@ identificadores públicos; un tipo que no figura se informa como desconocido.
    disco) y `mr_partition_info` a 96 B (GUID único y atributos) antes de publicarse; funciones nuevas
    `mr_partition_name` y `mr_partition_open_ex`; códigos GPT 201-241 en el bloque reservado y
    `MR_ANOMALY_VALUE_SIGNED` para el valor de `image_shifted`.
+
+
+---
+
+## ADR-023 · Búsqueda exprés de particiones perdidas: candidatos por niveles con presupuesto acotado (Aceptada, 2026-10-18)
+
+**Contexto.** Issue #15 (PT-05, PT-06). INV-05b §8 propone un algoritmo propio (sala limpia) para
+generar candidatos, sondearlos y graduar la evidencia; §10 dejaba preguntas abiertas que el
+propietario ha respondido.
+
+**Decisiones del propietario.**
+1. La búsqueda se ejecuta **solo a petición** en M2 (no automáticamente al abrir un origen).
+2. Reconocedores en M2: NTFS, FAT12/16/32 y exFAT, más tablas MBR/EBR (modo estricto) y cabeceras GPT
+   encontradas en posiciones candidatas. ext, XFS, HFS+, APFS, Btrfs y ReFS quedan para hitos
+   posteriores; el rasgo `Recognizer` permite añadirlos sin cambiar la búsqueda. Sin copias lejanas
+   de otros sistemas de archivos por ahora.
+3. Copia NTFS en el último sector del volumen y variante `+1` (INV-05b §4); la de NT 3.51 no.
+4. Un volumen que empieza antes del inicio de la imagen se informa como **parcial** y no se puede abrir.
+5. Presupuestos por defecto de INV-05b (4096 lecturas, 32 MiB, rejillas de 64 y 16 MiB, 64 cilindros,
+   8 candidatos por hueco, 256 volúmenes, ventana de 8 KiB), configurables en API, ABI, CLI
+   (`--max-reads`) y C#.
+
+**Decisión de diseño** (`formatos/busqueda-particiones.md`):
+- Candidatos P0 (tabla y byte 0), P1 (derivados: encadenado, tablas encontradas, desplazamiento),
+  P2 (rejilla inicial), P3 (huecos) y P4 (rejilla final), en una cola determinista deduplicada; el
+  trabajo no crece con el tamaño del disco. Reservas: P2 a P4 como mucho el 40 % cada uno y nunca la
+  reserva del 25 % para P0 y P1. Estado `BudgetExhausted` con los pendientes por nivel.
+- Cada estructura encontrada propone las hipótesis «principal» y «copia»; se elige la de mejor
+  evidencia. Un sector ilegible nunca es evidencia ni llega a un reconocedor: indicador «?».
+- Indicadores propios E, P, C, S, U, A con cinco estados (`+ x ? o -`) y confianza por reglas
+  explicables (válida: principal + copia coherente, principal + estructuras sin copia en el formato, o
+  principal + estructuras + entrada; el resto, sospechosa con sus motivos).
+- Los volúmenes que coinciden con una partición de la tabla se marcan con ella (`tabla #N`), no se
+  duplican.
+- Desplazamiento de la imagen: hipótesis aceptada solo con **dos evidencias independientes** que
+  coinciden; se informa (`image_shifted`, `mbr_displaced`) y abrir un volumen que depende de ella
+  exige la misma petición explícita que ADR-022 (`apply_shift`).
+- La tarea de `mr-api` comprueba la cancelación antes de cada lectura física; cancelada, termina en
+  estado cancelado **con** resultado parcial (`TaskContext::finish_cancelled_with_result`).
+- ABI: ampliación compatible de la ABI 3 (opciones de 64 B, resumen de 96 B, volumen de 136 B, tabla de
+  32 B, todas versionadas por `struct_size`; códigos 301-314 y 320-321; `MR_ANOMALY_LBA_SIGNED`).
+
+**Alternativas.** Búsqueda automática al abrir con presupuesto reducido (INV-05b §10.8; descartada
+por el propietario para M2); barrido completo (es el escaneo de M6); aceptar un desplazamiento con
+una sola evidencia (los sectores ocultos de las lógicas pueden ser relativos al EBR).
+
+**Consecuencias.** Volúmenes en posiciones fuera de rejillas, sin tabla ni vecinos confirmados ni copia
+al final de un MiB no se encuentran (lo cubrirá el escaneo completo). Las tablas encontradas se
+interpretan con el sector del dispositivo. La comparación manual con DMDE sigue pendiente (ADR-002,
+opcional).
