@@ -1,0 +1,55 @@
+# Generado por tests/generators/gen_partition_images.py: no editar a mano.
+# Esquema en docs/PRUEBAS.md (§1.1). Las LBA de [[partitions]], de la GPT y hidden_sectors son las
+# declaradas (disco original); las demás, de la imagen: LBA imagen = LBA disco - leading_sectors_missing.
+schema_version = 2
+generator_version = 2
+name = "gpt_primary_header_bad"
+file = "gpt_primary_header_bad.img"
+scenario = "Cabecera GPT primaria con CRC32 incorrecta; respaldo sano"
+scheme = "gpt"
+sector_size = 512
+total_sectors = 4096
+size_bytes = 2097152
+sha256 = "cf6c520a77dbb25bf73ae4ae0e4e786f35e4f0a0c8ab277214ad5bb9546e01e4"
+leading_sectors_missing = 0
+trailing_sectors_missing = 0
+disk_guid = "83090c79-5a19-5d9d-8840-048becccc415"
+first_usable_lba = 34
+last_usable_lba = 4062
+entries_lba = 2
+backup_entries_lba = 4063
+backup_header_lba = 4095
+entry_count = 128
+entry_size = 128
+entries_crc32 = "36076d17"
+gpt_primary_header = "crc"
+gpt_primary_header_image_lba = 1
+gpt_primary_entries = "unchecked"
+gpt_backup_header = "valid"
+gpt_backup_header_image_lba = 4095
+gpt_backup_entries = "valid"
+gpt_selected = "backup"
+
+[[partitions]]
+label = "D1"
+start_lba = 2048
+sectors = 1024
+end_lba = 3071
+gpt_type = "ebd0a0a2-b9e5-4433-87c0-68b6b72699c7"
+gpt_name = "MR-DATA"
+unique_guid = "12185a76-259e-5a88-b099-c0799e995fca"
+marker = "MEMRESCUE-TEST|gpt_primary_header_bad|D1|LBA=2048|"
+
+[[partitions]]
+label = "L1"
+start_lba = 3072
+sectors = 512
+end_lba = 3583
+gpt_type = "0fc63daf-8483-4772-8e79-3d69d8477de4"
+gpt_name = "MR-LINUX"
+unique_guid = "637a26d3-4b8d-5a24-8670-57f6a2cb0605"
+marker = "MEMRESCUE-TEST|gpt_primary_header_bad|L1|LBA=3072|"
+
+[[anomalies]]
+code = "gpt_primary_header_crc"
+lba = 1

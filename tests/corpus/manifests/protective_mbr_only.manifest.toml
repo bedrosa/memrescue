@@ -1,0 +1,28 @@
+# Generado por tests/generators/gen_partition_images.py: no editar a mano.
+# Esquema en docs/PRUEBAS.md (§1.1). Las LBA de [[partitions]], de la GPT y hidden_sectors son las
+# declaradas (disco original); las demás, de la imagen: LBA imagen = LBA disco - leading_sectors_missing.
+schema_version = 2
+generator_version = 2
+name = "protective_mbr_only"
+file = "protective_mbr_only.img"
+scenario = "MBR protector (0xEE) sin cabeceras GPT en LBA 1 ni en el último sector"
+scheme = "gpt"
+sector_size = 512
+total_sectors = 2048
+size_bytes = 1048576
+sha256 = "2a3557cbf1aaa92878b91efd7a2b18aa08467cb2df705e15cb256faec2b653b4"
+leading_sectors_missing = 0
+trailing_sectors_missing = 0
+gpt_primary_header = "missing"
+gpt_primary_entries = "unchecked"
+gpt_backup_header = "missing"
+gpt_backup_entries = "unchecked"
+gpt_selected = "none"
+
+[[anomalies]]
+code = "gpt_primary_header_missing"
+lba = 1
+
+[[anomalies]]
+code = "gpt_backup_header_missing"
+lba = 2047

@@ -1,0 +1,34 @@
+# Generado por tests/generators/gen_partition_images.py: no editar a mano.
+# Esquema en docs/PRUEBAS.md (§1.1). Las LBA de [[partitions]], de la GPT y hidden_sectors son las
+# declaradas (disco original); las demás, de la imagen: LBA imagen = LBA disco - leading_sectors_missing.
+schema_version = 2
+generator_version = 2
+name = "superfloppy"
+file = "superfloppy.img"
+scenario = "Sin tabla: volumen NTFS que empieza en LBA 0"
+scheme = "none"
+sector_size = 512
+total_sectors = 2048
+size_bytes = 1048576
+sha256 = "043c42b91776107503504834f6298772861fd06d9550a62eac240adadeeb0d73"
+leading_sectors_missing = 0
+trailing_sectors_missing = 0
+
+[[anomalies]]
+code = "superfloppy"
+lba = 0
+
+[[found_volumes]]
+fs = "ntfs"
+start_lba = 0
+sectors = 2048
+end_lba = 2047
+hidden_sectors = 0
+boot_lba = 0
+backup_boot_lba = 2047
+primary_boot = "valid"
+backup_boot = "valid"
+evidence = ["boot", "backup_boot"]
+partial = false
+serial = "4d5253000000100f"
+suggested_mbr_type = 7

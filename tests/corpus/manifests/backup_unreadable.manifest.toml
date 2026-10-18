@@ -1,0 +1,35 @@
+# Generado por tests/generators/gen_partition_images.py: no editar a mano.
+# Esquema en docs/PRUEBAS.md (§1.1). Las LBA de [[partitions]], de la GPT y hidden_sectors son las
+# declaradas (disco original); las demás, de la imagen: LBA imagen = LBA disco - leading_sectors_missing.
+schema_version = 2
+generator_version = 2
+name = "backup_unreadable"
+file = "backup_unreadable.img"
+scenario = "NTFS cuya copia del arranque se debe simular ilegible; contiene un relleno que imita NTFS y 0x55AA"
+scheme = "none"
+sector_size = 512
+total_sectors = 4096
+size_bytes = 2097152
+sha256 = "9efce14c7eb752168d1421f08e7810c764001444abc4d566ed55b61973c21d62"
+leading_sectors_missing = 0
+trailing_sectors_missing = 0
+unreadable_lbas = [4095]
+
+[[anomalies]]
+code = "mbr_missing"
+lba = 0
+
+[[found_volumes]]
+fs = "ntfs"
+start_lba = 2048
+sectors = 2048
+end_lba = 4095
+hidden_sectors = 2048
+boot_lba = 2048
+backup_boot_lba = 4095
+primary_boot = "valid"
+backup_boot = "unreadable"
+evidence = ["boot"]
+partial = false
+serial = "4d5253000000100a"
+suggested_mbr_type = 7

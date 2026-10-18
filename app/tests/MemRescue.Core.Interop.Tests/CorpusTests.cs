@@ -38,15 +38,33 @@ public sealed class CorpusTests
             .Where(p => p.Length == 2)
             .ToDictionary(p => p[0].Trim(), p => p[1].Trim().Trim('"'));
 
+    /// <summary>
+    /// (LBA de la imagen, marcador) de cada <c>[[partitions]]</c>. En una imagen desplazada el marcador
+    /// está en <c>marker_lba</c> (coordenadas de la imagen) en vez de en <c>start_lba</c>.
+    /// </summary>
     private static List<(ulong Lba, string Marker)> Markers(string manifest)
     {
         var res = new List<(ulong, string)>();
         ulong? lba = null;
+        var inPartition = false;
         foreach (var l in File.ReadLines(manifest))
         {
-            if (l.StartsWith("start_lba = ", StringComparison.Ordinal))
+            if (l.StartsWith('['))
+            {
+                inPartition = l == "[[partitions]]";
+                lba = null;
+            }
+            else if (!inPartition)
+            {
+                continue;
+            }
+            else if (l.StartsWith("start_lba = ", StringComparison.Ordinal))
             {
                 lba = ulong.Parse(l["start_lba = ".Length..]);
+            }
+            else if (l.StartsWith("marker_lba = ", StringComparison.Ordinal))
+            {
+                lba = ulong.Parse(l["marker_lba = ".Length..]);
             }
             else if (l.StartsWith("marker = ", StringComparison.Ordinal) && lba is { } v)
             {
@@ -94,11 +112,13 @@ public sealed class CorpusTests
             var sector = src.ReadSectors(lba, 1);
             Assert.Equal(marker, Encoding.ASCII.GetString(sector, 0, marker.Length));
         }
-        if (m["scheme"] == "gpt")
+        // Cabeceras GPT presentes en la imagen (válidas o con CRC incorrecta), donde las declara el manifiesto.
+        foreach (var key in new[] { "gpt_primary_header_image_lba", "gpt_backup_header_image_lba" })
         {
-            Assert.Equal("EFI PART", Encoding.ASCII.GetString(src.ReadSectors(1, 1), 0, 8));
-            var last = src.ReadSectors(src.Info.SectorCount - 1, 1);
-            Assert.Equal("EFI PART", Encoding.ASCII.GetString(last, 0, 8));
+            if (m.TryGetValue(key, out var hdr))
+            {
+                Assert.Equal("EFI PART", Encoding.ASCII.GetString(src.ReadSectors(ulong.Parse(hdr), 1), 0, 8));
+            }
         }
         using var v = src.StartVerify();
         Assert.Equal(EngineTaskState.Completed, await v.WaitAsync());

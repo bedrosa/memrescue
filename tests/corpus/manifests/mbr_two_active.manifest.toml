@@ -1,0 +1,41 @@
+# Generado por tests/generators/gen_partition_images.py: no editar a mano.
+# Esquema en docs/PRUEBAS.md (§1.1). Las LBA de [[partitions]], de la GPT y hidden_sectors son las
+# declaradas (disco original); las demás, de la imagen: LBA imagen = LBA disco - leading_sectors_missing.
+schema_version = 2
+generator_version = 2
+name = "mbr_two_active"
+file = "mbr_two_active.img"
+scenario = "MBR con dos entradas marcadas como activas (0x80)"
+scheme = "mbr"
+sector_size = 512
+total_sectors = 4096
+size_bytes = 2097152
+sha256 = "4f2ada2da5680cb3b17b93b205b2004bd7b883746b2a14818f71f5e4be5c7d1f"
+leading_sectors_missing = 0
+trailing_sectors_missing = 0
+disk_signature = "4d520102"
+
+[[partitions]]
+label = "P1"
+start_lba = 2048
+sectors = 1024
+end_lba = 3071
+mbr_type = 7
+active = true
+logical = false
+marker = "MEMRESCUE-TEST|mbr_two_active|P1|LBA=2048|"
+
+[[partitions]]
+label = "P2"
+start_lba = 3072
+sectors = 1024
+end_lba = 4095
+mbr_type = 131
+active = true
+logical = false
+marker = "MEMRESCUE-TEST|mbr_two_active|P2|LBA=3072|"
+
+[[anomalies]]
+code = "mbr_multiple_active"
+lba = 0
+partitions = ["P1", "P2"]

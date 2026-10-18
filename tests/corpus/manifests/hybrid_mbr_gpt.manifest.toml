@@ -1,0 +1,80 @@
+# Generado por tests/generators/gen_partition_images.py: no editar a mano.
+# Esquema en docs/PRUEBAS.md (§1.1). Las LBA de [[partitions]], de la GPT y hidden_sectors son las
+# declaradas (disco original); las demás, de la imagen: LBA imagen = LBA disco - leading_sectors_missing.
+schema_version = 2
+generator_version = 2
+name = "hybrid_mbr_gpt"
+file = "hybrid_mbr_gpt.img"
+scenario = "GPT sana con MBR híbrido: 0xEE hasta la primera partición y dos entradas espejo"
+scheme = "hybrid"
+sector_size = 512
+total_sectors = 4096
+size_bytes = 2097152
+sha256 = "fa0a3a23cc02dbbc3de1a3ba058dcc1f34da9183ea47ec441acd381983d3e8e4"
+leading_sectors_missing = 0
+trailing_sectors_missing = 0
+disk_signature = "4d520201"
+disk_guid = "2cb602c7-6a63-5cb4-947f-327d489dc2f4"
+first_usable_lba = 34
+last_usable_lba = 4062
+entries_lba = 2
+backup_entries_lba = 4063
+backup_header_lba = 4095
+entry_count = 128
+entry_size = 128
+entries_crc32 = "acba3605"
+gpt_primary_header = "valid"
+gpt_primary_header_image_lba = 1
+gpt_primary_entries = "valid"
+gpt_backup_header = "valid"
+gpt_backup_header_image_lba = 4095
+gpt_backup_entries = "valid"
+gpt_selected = "primary"
+
+[[partitions]]
+label = "D1"
+start_lba = 2048
+sectors = 1024
+end_lba = 3071
+gpt_type = "ebd0a0a2-b9e5-4433-87c0-68b6b72699c7"
+gpt_name = "MR-DATA"
+unique_guid = "b6609ffe-98b4-56da-9b97-a05ad788a7c0"
+marker = "MEMRESCUE-TEST|hybrid_mbr_gpt|D1|LBA=2048|"
+
+[[partitions]]
+label = "L1"
+start_lba = 3072
+sectors = 512
+end_lba = 3583
+gpt_type = "0fc63daf-8483-4772-8e79-3d69d8477de4"
+gpt_name = "MR-LINUX"
+unique_guid = "7edb74ed-e0b2-5428-8a17-9a442417543b"
+marker = "MEMRESCUE-TEST|hybrid_mbr_gpt|L1|LBA=3072|"
+
+[[hybrid_mbr_entries]]
+index = 0
+mbr_type = 238
+active = false
+start_lba = 1
+sectors = 2047
+gpt_label = ""
+
+[[hybrid_mbr_entries]]
+index = 1
+mbr_type = 7
+active = true
+start_lba = 2048
+sectors = 1024
+gpt_label = "D1"
+
+[[hybrid_mbr_entries]]
+index = 2
+mbr_type = 131
+active = false
+start_lba = 3072
+sectors = 512
+gpt_label = "L1"
+
+[[anomalies]]
+code = "hybrid_mbr"
+lba = 0

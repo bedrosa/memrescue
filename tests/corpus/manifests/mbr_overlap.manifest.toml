@@ -1,0 +1,41 @@
+# Generado por tests/generators/gen_partition_images.py: no editar a mano.
+# Esquema en docs/PRUEBAS.md (§1.1). Las LBA de [[partitions]], de la GPT y hidden_sectors son las
+# declaradas (disco original); las demás, de la imagen: LBA imagen = LBA disco - leading_sectors_missing.
+schema_version = 2
+generator_version = 2
+name = "mbr_overlap"
+file = "mbr_overlap.img"
+scenario = "MBR con dos entradas primarias solapadas"
+scheme = "mbr"
+sector_size = 512
+total_sectors = 4096
+size_bytes = 2097152
+sha256 = "a6e9db892f829b3f27863c87a8f04bd6d53722e544c7dd13dd98867facfc8b8c"
+leading_sectors_missing = 0
+trailing_sectors_missing = 0
+disk_signature = "4d520103"
+
+[[partitions]]
+label = "P1"
+start_lba = 2048
+sectors = 1024
+end_lba = 3071
+mbr_type = 7
+active = false
+logical = false
+marker = "MEMRESCUE-TEST|mbr_overlap|P1|LBA=2048|"
+
+[[partitions]]
+label = "P2"
+start_lba = 2560
+sectors = 1024
+end_lba = 3583
+mbr_type = 12
+active = false
+logical = false
+marker = "MEMRESCUE-TEST|mbr_overlap|P2|LBA=2560|"
+
+[[anomalies]]
+code = "mbr_overlap"
+lba = 0
+partitions = ["P1", "P2"]

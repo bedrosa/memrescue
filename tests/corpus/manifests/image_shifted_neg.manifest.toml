@@ -1,0 +1,54 @@
+# Generado por tests/generators/gen_partition_images.py: no editar a mano.
+# Esquema en docs/PRUEBAS.md (§1.1). Las LBA de [[partitions]], de la GPT y hidden_sectors son las
+# declaradas (disco original); las demás, de la imagen: LBA imagen = LBA disco - leading_sectors_missing.
+schema_version = 2
+generator_version = 2
+name = "image_shifted_neg"
+file = "image_shifted_neg.img"
+scenario = "Imagen a la que faltan los 2100 primeros sectores: MBR y arranque NTFS perdidos"
+scheme = "none"
+sector_size = 512
+total_sectors = 4044
+size_bytes = 2070528
+sha256 = "c698f1e341912ded16e7824c6d34beabf1a589726f1638c891211df12cbe752e"
+leading_sectors_missing = 2100
+trailing_sectors_missing = 0
+
+[[anomalies]]
+code = "mbr_missing"
+lba = 0
+
+[[anomalies]]
+code = "image_shifted"
+lba = -2100
+value = 2100
+
+[[found_volumes]]
+fs = "ntfs"
+start_lba = -52
+sectors = 2048
+end_lba = 1995
+hidden_sectors = 2048
+boot_lba = -52
+backup_boot_lba = 1995
+primary_boot = "outside_image"
+backup_boot = "valid"
+evidence = ["backup_boot"]
+partial = true
+serial = "4d5253000000100b"
+suggested_mbr_type = 7
+
+[[found_volumes]]
+fs = "exfat"
+start_lba = 1996
+sectors = 2048
+end_lba = 4043
+hidden_sectors = 4096
+boot_lba = 1996
+backup_boot_lba = 2008
+primary_boot = "valid"
+backup_boot = "valid"
+evidence = ["boot", "backup_boot"]
+partial = false
+serial = "4d52300c"
+suggested_mbr_type = 7

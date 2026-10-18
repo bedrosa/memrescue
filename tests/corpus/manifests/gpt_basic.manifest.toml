@@ -1,12 +1,18 @@
 # Generado por tests/generators/gen_partition_images.py: no editar a mano.
-generator_version = 1
+# Esquema en docs/PRUEBAS.md (§1.1). Las LBA de [[partitions]], de la GPT y hidden_sectors son las
+# declaradas (disco original); las demás, de la imagen: LBA imagen = LBA disco - leading_sectors_missing.
+schema_version = 2
+generator_version = 2
 name = "gpt_basic"
 file = "gpt_basic.img"
+scenario = "GPT sana: MBR protector, cabecera y entradas primarias y de respaldo, 3 particiones"
 scheme = "gpt"
 sector_size = 512
 total_sectors = 32768
 size_bytes = 16777216
 sha256 = "0592a94c5691170863986c382902d54fa71789953b13536f7ddfb3299fc4197b"
+leading_sectors_missing = 0
+trailing_sectors_missing = 0
 disk_guid = "3735644a-4f8f-56fa-b75e-d808ec421dbb"
 first_usable_lba = 34
 last_usable_lba = 32734
@@ -16,6 +22,13 @@ backup_header_lba = 32767
 entry_count = 128
 entry_size = 128
 entries_crc32 = "d473052d"
+gpt_primary_header = "valid"
+gpt_primary_header_image_lba = 1
+gpt_primary_entries = "valid"
+gpt_backup_header = "valid"
+gpt_backup_header_image_lba = 32767
+gpt_backup_entries = "valid"
+gpt_selected = "primary"
 
 [[partitions]]
 label = "D1"

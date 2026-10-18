@@ -1,0 +1,45 @@
+# Generado por tests/generators/gen_partition_images.py: no editar a mano.
+# Esquema en docs/PRUEBAS.md (§1.1). Las LBA de [[partitions]], de la GPT y hidden_sectors son las
+# declaradas (disco original); las demás, de la imagen: LBA imagen = LBA disco - leading_sectors_missing.
+schema_version = 2
+generator_version = 2
+name = "gpt_4kn_primary_bad"
+file = "gpt_4kn_primary_bad.img"
+scenario = "GPT 4Kn con la cabecera primaria dañada; respaldo sano"
+scheme = "gpt"
+sector_size = 4096
+total_sectors = 512
+size_bytes = 2097152
+sha256 = "acd323568e06a439f814f385684b2b2cb54ddf1ab843d3596514e59bad4fbb0f"
+leading_sectors_missing = 0
+trailing_sectors_missing = 0
+disk_guid = "874a4a63-c623-569b-9d4f-248d6a3897e5"
+first_usable_lba = 6
+last_usable_lba = 506
+entries_lba = 2
+backup_entries_lba = 507
+backup_header_lba = 511
+entry_count = 128
+entry_size = 128
+entries_crc32 = "cf96b202"
+gpt_primary_header = "crc"
+gpt_primary_header_image_lba = 1
+gpt_primary_entries = "unchecked"
+gpt_backup_header = "valid"
+gpt_backup_header_image_lba = 511
+gpt_backup_entries = "valid"
+gpt_selected = "backup"
+
+[[partitions]]
+label = "D1"
+start_lba = 256
+sectors = 128
+end_lba = 383
+gpt_type = "ebd0a0a2-b9e5-4433-87c0-68b6b72699c7"
+gpt_name = "MR-4KN"
+unique_guid = "85380f7b-00e0-5164-aed5-d28e441049ac"
+marker = "MEMRESCUE-TEST|gpt_4kn_primary_bad|D1|LBA=256|"
+
+[[anomalies]]
+code = "gpt_primary_header_crc"
+lba = 1
