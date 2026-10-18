@@ -145,7 +145,8 @@ def verify(image: Path, m: dict) -> list[str]:
                 if not got or int(got.group(1)) != rec:
                     errs.append(f"{where}: ifind -n da {text(r).strip()!r}, manifiesto {rec}")
                 r = tsk(["ffind", "-f", "ntfs", "-o", str(off), str(src), str(rec)])
-                if f["path"] not in [ln.strip() for ln in text(r).splitlines()]:
+                # TSK 4.12 escribe las entradas de la raíz como «//nombre»: se normalizan las barras.
+                if f["path"] not in [re.sub(r"/+", "/", ln.strip()) for ln in text(r).splitlines()]:
                     errs.append(f"{where}: ffind da {text(r).strip()!r}")
             attrs = data_attrs(out)
             main = [a for a in attrs if not a["name"]]
