@@ -76,7 +76,7 @@ jobs:
             dpkg-query -W -f '  ${Package} ${Version} ${Architecture}\n' ntfs-3g libntfs-3g89t64 libfaketime sleuthkit libtsk19t64 util-linux fuse3 2>/dev/null || true
             echo
             echo "tool versions:"
-            echo "  mkntfs: $(/usr/sbin/mkntfs --version 2>&1 | head -n 1)"
+            echo "  mkntfs: $(/usr/sbin/mkntfs --version 2>&1 | grep -m 1 .)"
             echo "  ntfs-3g: $(ntfs-3g --version 2>&1 | head -n 1)"
             echo "  fls: $(fls -V 2>&1 | head -n 1)"
             echo "  sfdisk: $(sfdisk --version 2>&1 | head -n 1)"

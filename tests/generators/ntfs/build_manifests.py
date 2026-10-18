@@ -126,6 +126,7 @@ class Tsk:
 def mmls(image: Path, dump: Path | None) -> dict:
     out = subprocess.run(["mmls", str(image)], capture_output=True, check=True).stdout.decode("utf-8", "replace")
     if dump:
+        dump.mkdir(parents=True, exist_ok=True)
         (dump / "mmls.txt").write_text(out, encoding="utf-8")
     rows = []
     for line in out.splitlines():
@@ -150,11 +151,9 @@ def parse_istat(text: str, runs_mode: bool) -> dict:
         if m:
             info["entry"], info["sequence"] = int(m.group(1)), int(m.group(2))
             continue
-        if re.match(r"^Not Allocated", line):
-            info["allocated"] = False
-            continue
-        if re.match(r"^Allocated", line):
-            info["allocated"] = True
+        m = re.match(r"^(Not )?Allocated (File|Directory)\s*$", line)
+        if m and section is None:
+            info["allocated"] = m.group(1) is None
             continue
         if line.startswith("$STANDARD_INFORMATION Attribute Values"):
             section = "si"
@@ -589,8 +588,8 @@ def main() -> int:
     for name in SCENARIOS:
         try:
             m = build_one(name, gen, other, dump / name if dump else None, done, tools)
-        except Fail as e:
-            print(f"ERROR {e}", file=sys.stderr)
+        except Exception as e:  # noqa: BLE001  (se informa y se sigue con el resto para depurar)
+            print(f"ERROR {name}: {type(e).__name__}: {e}", file=sys.stderr)
             failed = True
             continue
         done[name] = m

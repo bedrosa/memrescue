@@ -132,7 +132,8 @@ def verify(image: Path, m: dict) -> list[str]:
                 errs.append(f"{where}: istat {rec} falla")
                 continue
             out = text(ist)
-            allocated = re.search(r"^Allocated", out, re.M) is not None
+            state = re.search(r"^(Not )?Allocated (File|Directory)\s*$", out, re.M)
+            allocated = state is not None and state.group(1) is None
             if allocated != (f["state"] == "live"):
                 errs.append(f"{where}: asignado={allocated}, estado={f['state']}")
             mm = re.search(r"^Entry:\s*(\d+)\s+Sequence:\s*(\d+)", out, re.M)
