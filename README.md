@@ -18,7 +18,7 @@ versionado); los scripts lo usan si existe.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\build.ps1     # compila motor, CLI, DLL y WPF
-powershell -ExecutionPolicy Bypass -File scripts\test.ps1      # 14 pasos de verificación
+powershell -ExecutionPolicy Bypass -File scripts\test.ps1      # 15 pasos de verificación
 powershell -ExecutionPolicy Bypass -File scripts\build.ps1 -Configuration Release -Publish
 #   → artifacts\MemRescue\MemRescue.exe (autocontenido, no necesita .NET instalado)
 ```
@@ -52,7 +52,7 @@ Flujo de trabajo, ramas, issues, integración continua y normas del repositorio:
 | [docs/DECISIONES.md](docs/DECISIONES.md) | ADR (tecnología, seguridad, sala limpia) |
 | [docs/PRUEBAS.md](docs/PRUEBAS.md) | Corpus, simulador, criterios de paridad, cómo ejecutar |
 | [docs/PRUEBAS_UI.md](docs/PRUEBAS_UI.md) | Pruebas automáticas de la interfaz (UI Automation) |
-| [docs/formatos/](docs/formatos/) | VHD, VHDX, VMDK, imágenes divididas y rangos, mapa de validez |
+| [docs/formatos/](docs/formatos/) | VHD, VHDX, VMDK, imágenes divididas y rangos, mapa de validez, GPT |
 | [docs/HERRAMIENTAS_TERCEROS.md](docs/HERRAMIENTAS_TERCEROS.md) | qemu-img portable como referencia de pruebas (procedencia y licencias) |
 | [docs/PLAN_CORPUS_NTFS.md](docs/PLAN_CORPUS_NTFS.md) | Plan de imágenes NTFS con ficheros borrados |
 | [docs/investigacion/](docs/investigacion/README.md) | Ingeniería inversa de DMDE y manual oficial |
