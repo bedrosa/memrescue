@@ -280,11 +280,16 @@ def check_files(r: Report, vol: Volume, m: dict) -> None:
 
 
 def validate(img_path: Path, m: dict) -> Report:
+    if not img_path.is_file():
+        r = Report()
+        r.check(False, f"falta {img_path.name}")
+        return r
+    return validate_bytes(img_path.read_bytes(), m)
+
+
+def validate_bytes(img: bytes, m: dict) -> Report:
     r = Report()
     r.check(m.get("schema_version") == SCHEMA_VERSION, f"schema_version {m.get('schema_version')}")
-    if not r.check(img_path.is_file(), f"falta {img_path.name}"):
-        return r
-    img = img_path.read_bytes()
     r.check(len(img) == m["image_size"], f"tamaño {len(img)} != {m['image_size']}")
     r.check(hashlib.sha256(img).hexdigest() == m["image_sha256"], "SHA-256 de la imagen distinto del manifiesto")
     v = m["volume"]
