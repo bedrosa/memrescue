@@ -1,12 +1,18 @@
 # Generado por tests/generators/gen_partition_images.py: no editar a mano.
-generator_version = 1
+# Esquema en docs/PRUEBAS.md (§1.1). Las LBA de [[partitions]], de la GPT y hidden_sectors son las
+# declaradas (disco original); las demás, de la imagen: LBA imagen = LBA disco - leading_sectors_missing.
+schema_version = 2
+generator_version = 2
 name = "mbr_basic"
 file = "mbr_basic.img"
+scenario = "MBR sano: 2 primarias (una activa) y extendida 0x0F con cadena de 2 EBR"
 scheme = "mbr"
 sector_size = 512
 total_sectors = 32768
 size_bytes = 16777216
 sha256 = "95b3a659574ae5f17007c7d62c9d6f24361945494afd0dabf8db7fa52629964d"
+leading_sectors_missing = 0
+trailing_sectors_missing = 0
 disk_signature = "4d520001"
 extended_start_lba = 14336
 extended_sectors = 18432

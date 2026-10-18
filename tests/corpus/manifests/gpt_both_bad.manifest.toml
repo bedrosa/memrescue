@@ -1,0 +1,38 @@
+# Generado por tests/generators/gen_partition_images.py: no editar a mano.
+# Esquema en docs/PRUEBAS.md (§1.1). Las LBA de [[partitions]], de la GPT y hidden_sectors son las
+# declaradas (disco original); las demás, de la imagen: LBA imagen = LBA disco - leading_sectors_missing.
+schema_version = 2
+generator_version = 2
+name = "gpt_both_bad"
+file = "gpt_both_bad.img"
+scenario = "Cabecera primaria con CRC32 incorrecta y respaldo borrado"
+scheme = "gpt"
+sector_size = 512
+total_sectors = 4096
+size_bytes = 2097152
+sha256 = "32b91191c454cebf2599b29f531170be8cdf6b735a69b2e67b01a80c32510875"
+leading_sectors_missing = 0
+trailing_sectors_missing = 0
+disk_guid = "71538c46-d6d6-5538-8bb2-314b25240f9f"
+first_usable_lba = 34
+last_usable_lba = 4062
+entries_lba = 2
+backup_entries_lba = 4063
+backup_header_lba = 4095
+entry_count = 128
+entry_size = 128
+entries_crc32 = "b2bfc911"
+gpt_primary_header = "crc"
+gpt_primary_header_image_lba = 1
+gpt_primary_entries = "unchecked"
+gpt_backup_header = "missing"
+gpt_backup_entries = "unchecked"
+gpt_selected = "none"
+
+[[anomalies]]
+code = "gpt_primary_header_crc"
+lba = 1
+
+[[anomalies]]
+code = "gpt_backup_header_missing"
+lba = 4095

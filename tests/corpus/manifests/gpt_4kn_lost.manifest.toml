@@ -1,0 +1,49 @@
+# Generado por tests/generators/gen_partition_images.py: no editar a mano.
+# Esquema en docs/PRUEBAS.md (§1.1). Las LBA de [[partitions]], de la GPT y hidden_sectors son las
+# declaradas (disco original); las demás, de la imagen: LBA imagen = LBA disco - leading_sectors_missing.
+schema_version = 2
+generator_version = 2
+name = "gpt_4kn_lost"
+file = "gpt_4kn_lost.img"
+scenario = "Disco 4Kn con GPT y MBR protector borrados; NTFS y exFAT de 4096 B/sector"
+scheme = "none"
+sector_size = 4096
+total_sectors = 1024
+size_bytes = 4194304
+sha256 = "1e0100ee8ae02c582bfaa8b71d7006feb70939e6663f16808dba46fb147dfa27"
+leading_sectors_missing = 0
+trailing_sectors_missing = 0
+
+[[anomalies]]
+code = "mbr_missing"
+lba = 0
+
+[[found_volumes]]
+fs = "ntfs"
+start_lba = 256
+sectors = 256
+end_lba = 511
+hidden_sectors = 256
+boot_lba = 256
+backup_boot_lba = 511
+primary_boot = "valid"
+backup_boot = "valid"
+evidence = ["boot", "backup_boot"]
+partial = false
+serial = "4d5253000000100d"
+suggested_mbr_type = 7
+
+[[found_volumes]]
+fs = "exfat"
+start_lba = 512
+sectors = 256
+end_lba = 767
+hidden_sectors = 512
+boot_lba = 512
+backup_boot_lba = 524
+primary_boot = "valid"
+backup_boot = "valid"
+evidence = ["boot", "backup_boot"]
+partial = false
+serial = "4d52300e"
+suggested_mbr_type = 7

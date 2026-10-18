@@ -83,13 +83,26 @@ fn engine_size_and_sha256_match_independent_generator() {
     }
 }
 
-/// (start_lba, marcador) de cada `[[partitions]]` del manifiesto.
+/// (LBA de la imagen, marcador) de cada `[[partitions]]` del manifiesto. Si la imagen está
+/// desplazada, el marcador está en `marker_lba` (coordenadas de la imagen) en vez de en `start_lba`.
 fn partition_markers(manifest: &Path) -> Vec<(u64, String)> {
     let text = std::fs::read_to_string(manifest).unwrap();
     let mut out = Vec::new();
+    let mut in_partition = false;
     let mut lba = None;
     for l in text.lines() {
-        if let Some(v) = l.strip_prefix("start_lba = ") {
+        if l.starts_with('[') {
+            in_partition = l == "[[partitions]]";
+            lba = None;
+            continue;
+        }
+        if !in_partition {
+            continue;
+        }
+        if let Some(v) = l
+            .strip_prefix("start_lba = ")
+            .or_else(|| l.strip_prefix("marker_lba = "))
+        {
             lba = Some(v.parse().unwrap());
         }
         if let Some(v) = l.strip_prefix("marker = ") {
@@ -97,6 +110,21 @@ fn partition_markers(manifest: &Path) -> Vec<(u64, String)> {
         }
     }
     out
+}
+
+/// LBA de la imagen donde el manifiesto declara una cabecera GPT con firma (válida o con CRC
+/// incorrecta) y su estado (`valid` o `crc`).
+fn gpt_headers(m: &HashMap<String, String>) -> Vec<(usize, String)> {
+    ["primary", "backup"]
+        .iter()
+        .filter_map(|tag| {
+            let lba = m.get(&format!("gpt_{tag}_header_image_lba"))?;
+            Some((
+                lba.parse().unwrap(),
+                m[&format!("gpt_{tag}_header")].clone(),
+            ))
+        })
+        .collect()
 }
 
 #[test]
@@ -118,12 +146,12 @@ fn sector_reads_land_on_the_exact_lba_for_every_sector_size() {
             );
             checked += 1;
         }
-        if m["scheme"] == "gpt" {
-            let out = cli(&["sectors", p, "--lba", "1", "--sector-size", ss]);
-            let off: u64 = ss.parse().unwrap();
+        for (lba, _) in gpt_headers(&m) {
+            let out = cli(&["sectors", p, "--lba", &lba.to_string(), "--sector-size", ss]);
+            let off: u64 = ss.parse::<u64>().unwrap() * lba as u64;
             assert!(
                 out.contains(&format!("{off:012X}  45 46 49 20 50 41 52 54")),
-                "{}: la LBA 1 debe empezar por 'EFI PART'\n{out}",
+                "{}: la LBA {lba} debe empezar por 'EFI PART'\n{out}",
                 m["name"]
             );
         }
@@ -136,44 +164,57 @@ fn sector_reads_land_on_the_exact_lba_for_every_sector_size() {
             "{v}"
         );
     }
-    assert_eq!(checked, 8, "4 particiones MBR + 3 GPT + 1 GPT 4Kn");
+    assert_eq!(
+        checked, 44,
+        "marcadores de las particiones declaradas en los manifiestos"
+    );
 }
 
 #[test]
 #[ignore = "requiere el corpus generado; lo ejecuta scripts/test.ps1"]
 fn engine_crc32_validates_gpt_headers_written_by_python() {
-    let mut checked = 0;
+    let (mut valid, mut damaged, mut tables) = (0, 0, 0);
     for mf in manifests() {
         let m = top_level(&mf);
-        if m["scheme"] != "gpt" {
+        let headers = gpt_headers(&m);
+        if headers.is_empty() {
             continue;
         }
         let ss: usize = m["sector_size"].parse().unwrap();
-        let total: usize = m["total_sectors"].parse().unwrap();
         let data = std::fs::read(image_path(&m)).unwrap();
-        for lba in [1, total - 1] {
+        for (lba, state) in headers {
             let mut hdr = data[lba * ss..lba * ss + 92].to_vec();
             let stored = u32::from_le_bytes(hdr[16..20].try_into().unwrap());
             hdr[16..20].fill(0);
-            assert_eq!(
-                mr_common::hash::crc32(&hdr),
-                stored,
-                "{} LBA {lba}",
-                m["name"]
-            );
-            checked += 1;
+            let ok = mr_common::hash::crc32(&hdr) == stored;
+            match state.as_str() {
+                "valid" => valid += 1,
+                "crc" => damaged += 1,
+                other => panic!("{}: estado inesperado {other}", m["name"]),
+            }
+            assert_eq!(ok, state == "valid", "{} LBA {lba} ({state})", m["name"]);
         }
-        let entries_lba: usize = m["entries_lba"].parse().unwrap();
+        // Tabla de entradas de la copia elegida, en coordenadas de la imagen.
+        let entries_key = match m["gpt_selected"].as_str() {
+            "primary" => "entries_lba",
+            "backup" => "backup_entries_lba",
+            _ => continue,
+        };
+        let shift: usize = m["leading_sectors_missing"].parse().unwrap();
+        let at = (m[entries_key].parse::<usize>().unwrap() - shift) * ss;
         let n: usize = m["entry_count"].parse().unwrap();
         let es: usize = m["entry_size"].parse().unwrap();
-        let table = &data[entries_lba * ss..entries_lba * ss + n * es];
         assert_eq!(
-            format!("{:08x}", mr_common::hash::crc32(table)),
-            m["entries_crc32"]
+            format!("{:08x}", mr_common::hash::crc32(&data[at..at + n * es])),
+            m["entries_crc32"],
+            "{}",
+            m["name"]
         );
+        tables += 1;
     }
     assert_eq!(
-        checked, 4,
-        "se esperaban 2 imágenes GPT con 2 cabeceras cada una"
+        (valid, damaged, tables),
+        (16, 4, 11),
+        "cabeceras GPT válidas, cabeceras con CRC incorrecta y tablas de entradas comprobadas"
     );
 }

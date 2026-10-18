@@ -1,0 +1,19 @@
+# Generado por tests/generators/gen_partition_images.py: no editar a mano.
+# Esquema en docs/PRUEBAS.md (§1.1). Las LBA de [[partitions]], de la GPT y hidden_sectors son las
+# declaradas (disco original); las demás, de la imagen: LBA imagen = LBA disco - leading_sectors_missing.
+schema_version = 2
+generator_version = 2
+name = "random_disk"
+file = "random_disk.img"
+scenario = "Disco de bytes pseudoaleatorios deterministas (sin tabla ni volúmenes)"
+scheme = "none"
+sector_size = 512
+total_sectors = 2048
+size_bytes = 1048576
+sha256 = "e966232376e67a22f6c7e78fe437059859ec7c96c50d3286ee0df802b98504a8"
+leading_sectors_missing = 0
+trailing_sectors_missing = 0
+
+[[anomalies]]
+code = "mbr_missing"
+lba = 0

@@ -1,0 +1,41 @@
+# Generado por tests/generators/gen_partition_images.py: no editar a mano.
+# Esquema en docs/PRUEBAS.md (§1.1). Las LBA de [[partitions]], de la GPT y hidden_sectors son las
+# declaradas (disco original); las demás, de la imagen: LBA imagen = LBA disco - leading_sectors_missing.
+schema_version = 2
+generator_version = 2
+name = "mbr_outside_disk"
+file = "mbr_outside_disk.img"
+scenario = "MBR con una entrada que empieza dentro y acaba fuera del disco"
+scheme = "mbr"
+sector_size = 512
+total_sectors = 4096
+size_bytes = 2097152
+sha256 = "e43ee1afbb78edadb035089d31e464a5eac64579c69bd2d8c75faac5db19ae0d"
+leading_sectors_missing = 0
+trailing_sectors_missing = 0
+disk_signature = "4d520105"
+
+[[partitions]]
+label = "P1"
+start_lba = 2048
+sectors = 1024
+end_lba = 3071
+mbr_type = 7
+active = false
+logical = false
+marker = "MEMRESCUE-TEST|mbr_outside_disk|P1|LBA=2048|"
+
+[[partitions]]
+label = "P2"
+start_lba = 3072
+sectors = 2048
+end_lba = 5119
+mbr_type = 131
+active = false
+logical = false
+marker = "MEMRESCUE-TEST|mbr_outside_disk|P2|LBA=3072|"
+
+[[anomalies]]
+code = "mbr_outside_disk"
+lba = 0
+partitions = ["P2"]

@@ -1,0 +1,45 @@
+# Generado por tests/generators/gen_partition_images.py: no editar a mano.
+# Esquema en docs/PRUEBAS.md (§1.1). Las LBA de [[partitions]], de la GPT y hidden_sectors son las
+# declaradas (disco original); las demás, de la imagen: LBA imagen = LBA disco - leading_sectors_missing.
+schema_version = 2
+generator_version = 2
+name = "mbr_ebr_link_outside"
+file = "mbr_ebr_link_outside.img"
+scenario = "Enlace de EBR que apunta fuera del disco"
+scheme = "mbr"
+sector_size = 512
+total_sectors = 4096
+size_bytes = 2097152
+sha256 = "f97a5402346959aca3f26932ecfc3b63184c89766d82a1dd25cfdbe44f3a494e"
+leading_sectors_missing = 0
+trailing_sectors_missing = 0
+disk_signature = "4d520108"
+extended_start_lba = 2560
+extended_sectors = 1536
+extended_type = 15
+ebr_lbas = [2560]
+
+[[partitions]]
+label = "P1"
+start_lba = 2048
+sectors = 512
+end_lba = 2559
+mbr_type = 131
+active = false
+logical = false
+marker = "MEMRESCUE-TEST|mbr_ebr_link_outside|P1|LBA=2048|"
+
+[[partitions]]
+label = "L1"
+start_lba = 2624
+sectors = 448
+end_lba = 3071
+mbr_type = 131
+active = false
+logical = true
+marker = "MEMRESCUE-TEST|mbr_ebr_link_outside|L1|LBA=2624|"
+
+[[anomalies]]
+code = "ebr_link_outside_disk"
+lba = 2560
+target_lba = 5096

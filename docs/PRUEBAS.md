@@ -18,6 +18,58 @@ discos virtuales. Todas las fuentes se abren en solo lectura.
 - Las imágenes del sistema de pruebas se crean y destruyen en carpetas temporales; nunca se montan
   sobre letras del sistema en la máquina del desarrollador sin VM.
 
+### 1.1 Esquema del manifiesto de particiones (versión 2)
+
+Lo genera `tests/generators/gen_partition_images.py` y lo leen el validador independiente, las pruebas
+cruzadas de Rust y C# y, en adelante, los analizadores de `mr-part` (#12, #13) y la búsqueda de
+particiones perdidas (#15). Es TOML; las claves de nivel superior van antes de cualquier tabla.
+
+**Coordenadas.** Las LBA de `[[partitions]]`, las claves de la GPT (`first_usable_lba`, `entries_lba`,
+`backup_header_lba`...) y `hidden_sectors` son las **declaradas** (disco original). Todas las demás
+(`*_image_lba`, `marker_lba`, `[[anomalies]].lba`, `[[found_volumes]]`, `unreadable_lbas`, `decoy_lbas`)
+son de la **imagen**: `LBA imagen = LBA disco - leading_sectors_missing`.
+
+| Clave | Significado |
+|---|---|
+| `schema_version`, `generator_version` | Versión del esquema (2) y del generador |
+| `name`, `file`, `scenario` | Identificador, fichero `.img` y descripción del escenario |
+| `scheme` | Lo que hay en LBA 0 y la GPT: `mbr`, `gpt` (incluye MBR protector), `hybrid` o `none` |
+| `sector_size`, `total_sectors`, `size_bytes`, `sha256` | Geometría de la imagen y huella determinista |
+| `leading_sectors_missing` | Sectores del disco que faltan al inicio (negativo: sectores añadidos) |
+| `trailing_sectors_missing` | Sectores del disco que faltan al final |
+| `disk_signature`, `disk_guid` | Firma de disco del MBR (`mbr`, `hybrid`) y GUID de disco GPT |
+| `extended_start_lba`, `extended_sectors`, `extended_type`, `ebr_lbas` | Extendida y cadena de EBR recorrida (cada EBR una vez) |
+| `first_usable_lba` ... `entries_crc32` | Disposición GPT sana (CRC-32 correcta de la tabla de entradas) |
+| `gpt_primary_header`, `gpt_backup_header` | `valid`, `crc` (firma presente, CRC-32 o tamaño incorrectos), `missing` (sin firma) u `outside_image` |
+| `gpt_primary_header_image_lba`, `gpt_backup_header_image_lba` | Dónde está la cabecera en la imagen (solo si tiene firma) |
+| `gpt_primary_entries`, `gpt_backup_entries` | `valid`, `crc`, `outside_image` o `unchecked` (cabecera no válida) |
+| `gpt_selected` | Copia que debe usarse según UEFI: `primary`, `backup` o `none` |
+| `unreadable_lbas` | Sectores que la prueba debe simular ilegibles (`FaultyDevice`); contienen un relleno que imita una firma |
+| `decoy_lbas` | Sectores con aspecto de tabla dentro de datos, que no deben interpretarse |
+
+Tablas:
+
+- `[[partitions]]`: particiones que debe devolver el analizador de la tabla (MBR: primarias y luego
+  lógicas en orden de cadena; GPT/híbrido: entradas de la copia elegida). Claves `label`, `start_lba`,
+  `sectors`, `end_lba`; MBR: `mbr_type`, `active`, `logical`; GPT: `gpt_type`, `gpt_name`,
+  `unique_guid`; `marker_lba` (si la imagen está desplazada) y `marker` (texto en el primer sector).
+- `[[hybrid_mbr_entries]]`: entradas del MBR híbrido (`index`, `mbr_type`, `active`, `start_lba`,
+  `sectors`, `gpt_label` de la partición GPT que reflejan, vacío para 0xEE).
+- `[[anomalies]]`: conjunto **exacto** de anomalías (`code`, `lba`; opcionales `target_lba`, `value`,
+  `partitions`). Códigos: `mbr_missing` (LBA 0 sin tabla reconocible), `mbr_empty` (firma sin entradas),
+  `mbr_signature_missing`, `mbr_multiple_active`, `mbr_overlap`, `mbr_unknown_type` (`value` = tipo),
+  `mbr_outside_disk`, `ebr_loop`, `ebr_link_outside_disk`, `ebr_link_outside_extended` (`lba` = EBR con
+  el enlace, `target_lba` = destino), `hybrid_mbr`, `protective_mbr_size_mismatch` (`value` = tamaño
+  declarado), `gpt_{primary,backup}_header_{crc,missing,outside_image}`,
+  `gpt_{primary,backup}_entries_{crc,outside_image}`, `gpt_usable_range_outside_image` (`lba` =
+  cabecera elegida), `image_shifted` (`lba` = posición en la imagen de la LBA 0 del disco, `value` =
+  `leading_sectors_missing`), `mbr_displaced` (MBR encontrado en `lba`) y `superfloppy` (volumen en LBA 0).
+- `[[found_volumes]]`: volúmenes que debe encontrar la búsqueda de particiones perdidas: `fs` (`ntfs`,
+  `fat32`, `exfat`), `start_lba`, `sectors`, `end_lba`, `hidden_sectors` (inicio declarado por el FS),
+  `boot_lba`, `backup_boot_lba`, `primary_boot` / `backup_boot` (`valid`, `damaged`, `unreadable`,
+  `outside_image`), `evidence` (copias válidas: `boot`, `backup_boot`), `partial` (empieza antes de la
+  imagen), `serial` y `suggested_mbr_type`.
+
 ## 2. Corrupción determinista
 
 Transformaciones reproducibles con semilla sobre una imagen sana:
@@ -71,7 +123,7 @@ Pasos de `test.ps1`:
 | 3 | `cargo test --workspace` | 34 pruebas unitarias/integración del motor y la CLI |
 | 4 | Generación del corpus | Las imágenes se pueden regenerar |
 | 5 | Validación independiente | Las imágenes cumplen la especificación MBR/GPT y su SHA-256 es idéntico al de los manifiestos versionados (determinismo) |
-| 6 | Pruebas negativas | El validador detecta 9 tipos de corrupción (no es un validador que siempre aprueba) |
+| 6 | Pruebas negativas | El validador detecta las corrupciones (no es un validador que siempre aprueba); desde #14, 44 de imagen y 10 de manifiesto sin apoyarse en el SHA-256 |
 | 7 | Pruebas cruzadas Rust ↔ corpus | SHA-256 y CRC-32 del motor coinciden con `hashlib`/`zlib` de Python |
 | 8 | `dotnet build` | Compilación .NET con advertencias como errores |
 | 9 | `dotnet test` | 47 pruebas de la frontera C# ↔ Rust contra la DLL real (incluye corpus) |
@@ -152,17 +204,74 @@ de higiene del repositorio (`tools/check_repo_hygiene.py`: rutas personales, cor
 material excluido, carácter U+2014 y binarios reproducibles), que también es un paso de `test.ps1`. Las
 pruebas de interfaz se lanzan a demanda con el workflow `UI tests`.
 
-Corpus actual (`tests/corpus/manifests`, imágenes en `tests/corpus/generated`, no versionadas):
+Corpus actual (`tests/corpus/manifests`, imágenes en `tests/corpus/generated`, no versionadas; 38
+imágenes, unos 207 MiB, generadas en menos de 1 s). Esquema del manifiesto en §1.1. Todo es sintético y
+se construye solo a partir de especificaciones públicas (UEFI, MBR/EBR clásico, Microsoft FAT32 y exFAT,
+estructura pública del arranque NTFS).
 
-| Imagen | Contenido |
-|---|---|
-| `mbr_basic` | 16 MiB, 512 B/sector, MBR con 2 primarias (una activa) + extendida con cadena de 2 EBR y 2 lógicas |
-| `gpt_basic` | 16 MiB, 512 B/sector, MBR protector, GPT primaria + copia, 3 particiones (datos, Linux, EFI) |
-| `gpt_4kn` | 8 MiB, 4096 B/sector, GPT con 1 partición |
+| Imagen | Tamaño | Contenido | Resultado esperado |
+|---|---|---|---|
+| `mbr_basic` | 16 MiB | MBR con 2 primarias (una activa) + extendida 0x0F con cadena de 2 EBR y 2 lógicas | 4 particiones |
+| `gpt_basic` | 16 MiB | MBR protector, GPT primaria + copia, 3 particiones (datos, Linux, EFI) | 3 particiones, primaria |
+| `gpt_4kn` | 8 MiB | GPT con 1 partición, 4096 B/sector | 1 partición |
+| `mbr_no_signature` | 2 MiB | Entradas válidas sin 0x55AA | 2 particiones, `mbr_signature_missing` |
+| `mbr_two_active` | 2 MiB | Dos entradas activas | 2 particiones, `mbr_multiple_active` |
+| `mbr_ext_0x85` | 2 MiB | Extendida de tipo 0x85 (Linux) con 2 EBR | 3 particiones, sin anomalías |
+| `mbr_ebr_loop` | 2 MiB | El enlace del segundo EBR vuelve al primero | 3 particiones, `ebr_loop` |
+| `mbr_ebr_link_outside` | 2 MiB | Enlace de EBR más allá del final del disco | 2 particiones, `ebr_link_outside_disk` |
+| `mbr_overlap` | 2 MiB | Dos primarias solapadas | `mbr_overlap` |
+| `mbr_unknown_type` | 2 MiB | Entrada de tipo 0x7F | `mbr_unknown_type` |
+| `mbr_outside_disk` | 2 MiB | Entrada que acaba fuera del disco | `mbr_outside_disk` |
+| `empty_disk` | 1 MiB | Todo a cero | Sin tabla (`mbr_missing`) |
+| `random_disk` | 1 MiB | Bytes pseudoaleatorios deterministas | Sin tabla ni volúmenes |
+| `protective_mbr_only` | 1 MiB | MBR protector sin cabeceras GPT | `gpt_selected = none` |
+| `hybrid_mbr_gpt` | 2 MiB | GPT sana + MBR híbrido (0xEE y 2 espejos) | Particiones GPT, `hybrid_mbr` |
+| `fake_mbr_in_data` | 2 MiB | MBR sano; un sector con aspecto de MBR dentro de la partición | 1 partición; el señuelo no cuenta |
+| `gpt_primary_header_bad` | 2 MiB | CRC-32 de la cabecera primaria incorrecta | Respaldo |
+| `gpt_entries_crc_bad` | 2 MiB | Tabla de entradas primaria alterada | Respaldo |
+| `gpt_backup_header_bad` | 2 MiB | CRC-32 de la cabecera de respaldo incorrecta | Primaria |
+| `gpt_backup_missing` | 2 MiB | Cabecera y entradas de respaldo borradas | Primaria |
+| `gpt_both_bad` | 2 MiB | Primaria con CRC incorrecta y respaldo borrado | Ninguna |
+| `gpt_4kn_primary_bad` | 2 MiB | 4Kn con la cabecera primaria dañada | Respaldo |
+| `gpt_shifted_start` | 2 MiB | Faltan los 63 primeros sectores (MBR, cabecera y entradas primarias) | Respaldo, desplazamiento 63 |
+| `gpt_shifted_start_1` | 2 MiB | Falta el primer sector (cabecera primaria en LBA 0) | Primaria, desplazamiento 1 |
+| `gpt_truncated_end` | 2 MiB | Faltan los 200 últimos sectores (respaldo incluido) | Primaria, 200 sectores finales ausentes |
+| `lost_ntfs_mbr_zeroed` | 2 MiB | MBR a cero; NTFS en 2048 con copia en su último sector | 1 volumen, arranque + copia |
+| `lost_fat32_chs` | 33 MiB | Entradas a cero con firma intacta; FAT32 en LBA 63 con copia en el sector 6 | 1 volumen (`mbr_empty`) |
+| `lost_exfat_1mib` | 2 MiB | MBR a cero; exFAT en 1 MiB con regiones principal y de respaldo (suma del sector 11) | 1 volumen |
+| `lost_chain_three` | 36 MiB | NTFS, FAT32 y exFAT consecutivos; el exFAT empieza en una LBA no alineada | 3 volúmenes |
+| `ntfs_primary_damaged` | 2 MiB | Arranque NTFS principal a cero | 1 volumen, solo copia |
+| `fat32_primary_damaged` | 34 MiB | Arranque FAT32 principal dañado | 1 volumen, solo copia del sector 6 |
+| `exfat_primary_damaged` | 2 MiB | Sector de arranque exFAT principal a cero | 1 volumen, solo región de respaldo |
+| `primary_unreadable` | 2 MiB | Arranque NTFS principal en `unreadable_lbas`, con relleno que imita «NTFS» y 0x55AA | 1 volumen, solo copia |
+| `backup_unreadable` | 2 MiB | Copia NTFS en `unreadable_lbas`, con el mismo relleno | 1 volumen, solo arranque |
+| `image_shifted_pos` | 3 MiB | 8 sectores añadidos al inicio; MBR en LBA 8, NTFS y exFAT | 2 volúmenes, desplazamiento -8, `mbr_displaced` |
+| `image_shifted_neg` | 2 MiB | Faltan 2100 sectores: MBR y arranque NTFS perdidos | NTFS parcial (solo copia) y exFAT, desplazamiento 2100 |
+| `gpt_4kn_lost` | 4 MiB | 4Kn sin GPT ni MBR protector; NTFS y exFAT de 4096 B/sector | 2 volúmenes |
+| `superfloppy` | 1 MiB | NTFS en LBA 0, sin tabla | 1 volumen en LBA 0 (`superfloppy`) |
 
-Limitación conocida: el validador lo ha escrito el mismo equipo que el generador (aunque son códigos
+Los nombres de los escenarios de volúmenes perdidos siguen INV-05b §9. Con 512 B/sector, un FAT32 válido
+según la especificación necesita al menos 65 525 clústeres, por eso las tres imágenes con FAT32 ocupan
+unos 33 MiB y las demás 1-4 MiB.
+
+El validador (`validate_partition_images.py`) no importa el generador: deduce desde los bytes el esquema,
+las particiones, el conjunto exacto de anomalías, el estado de cada copia GPT y la copia elegida, el
+desplazamiento de la imagen (por la cabecera GPT de respaldo o por los sectores ocultos de los volúmenes)
+y los volúmenes, recorriendo **todos** los sectores en busca de arranques NTFS, FAT32 y exFAT coherentes
+(campos del BPB, número mínimo de clústeres de FAT32, FSInfo, sectores extendidos y suma de comprobación
+de exFAT) y agrupando cada arranque con su copia. Las pruebas negativas (`test_validator.py`) aplican 44
+corrupciones de imagen y 10 alteraciones de la verdad esperada del manifiesto, **recalculando el SHA-256**
+de la copia del manifiesto para que la detección no dependa del hash, más 3 controles sin cambios que
+deben validar.
+
+Limitaciones conocidas: el validador lo ha escrito el mismo equipo que el generador (aunque son códigos
 separados). Falta un oráculo de terceros (`sgdisk`/`sfdisk`), que requiere WSL o una VM (ver
-[PLAN_CORPUS_NTFS.md](PLAN_CORPUS_NTFS.md) §4).
+[PLAN_CORPUS_NTFS.md](PLAN_CORPUS_NTFS.md) §4). Los volúmenes son sintéticos: solo contienen las
+estructuras que consulta la búsqueda (arranque, copia, FSInfo, región de arranque exFAT, cabecera de las
+FAT y etiqueta de FAT32), sin MFT ni árbol de directorios. Los sectores ilegibles no se pueden
+representar en un fichero RAW: la prueba debe envolver la imagen con `FaultyDevice` en `unreadable_lbas`.
+Quedan para #15 los casos de presupuesto, cancelación, escala (imágenes dispersas de 1 GiB y 2 TiB) y
+«todo relleno de ilegible», que dependen del motor y no del corpus.
 
 ## 7. Registro
 

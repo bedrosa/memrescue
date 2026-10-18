@@ -1,0 +1,27 @@
+# Generado por tests/generators/gen_partition_images.py: no editar a mano.
+# Esquema en docs/PRUEBAS.md (§1.1). Las LBA de [[partitions]], de la GPT y hidden_sectors son las
+# declaradas (disco original); las demás, de la imagen: LBA imagen = LBA disco - leading_sectors_missing.
+schema_version = 2
+generator_version = 2
+name = "fake_mbr_in_data"
+file = "fake_mbr_in_data.img"
+scenario = "MBR sano con una partición cuyo contenido incluye un sector con aspecto de MBR"
+scheme = "mbr"
+sector_size = 512
+total_sectors = 4096
+size_bytes = 2097152
+sha256 = "25573c98d7744f0512a3fd2116ffa4d9ed136f6258f2608d794cf646bd3b2196"
+leading_sectors_missing = 0
+trailing_sectors_missing = 0
+disk_signature = "4d520303"
+decoy_lbas = [2112]
+
+[[partitions]]
+label = "P1"
+start_lba = 2048
+sectors = 2048
+end_lba = 4095
+mbr_type = 7
+active = false
+logical = false
+marker = "MEMRESCUE-TEST|fake_mbr_in_data|P1|LBA=2048|"

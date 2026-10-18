@@ -1,0 +1,55 @@
+# Generado por tests/generators/gen_partition_images.py: no editar a mano.
+# Esquema en docs/PRUEBAS.md (§1.1). Las LBA de [[partitions]], de la GPT y hidden_sectors son las
+# declaradas (disco original); las demás, de la imagen: LBA imagen = LBA disco - leading_sectors_missing.
+schema_version = 2
+generator_version = 2
+name = "mbr_ebr_loop"
+file = "mbr_ebr_loop.img"
+scenario = "Cadena de EBR en bucle: el enlace del segundo EBR vuelve al primero"
+scheme = "mbr"
+sector_size = 512
+total_sectors = 4096
+size_bytes = 2097152
+sha256 = "1483751e76da6395ed14924bb0cf132f6210a75fe6023451e1d87e39095ac7ed"
+leading_sectors_missing = 0
+trailing_sectors_missing = 0
+disk_signature = "4d520107"
+extended_start_lba = 2560
+extended_sectors = 1536
+extended_type = 15
+ebr_lbas = [2560, 3072]
+
+[[partitions]]
+label = "P1"
+start_lba = 2048
+sectors = 512
+end_lba = 2559
+mbr_type = 131
+active = false
+logical = false
+marker = "MEMRESCUE-TEST|mbr_ebr_loop|P1|LBA=2048|"
+
+[[partitions]]
+label = "L1"
+start_lba = 2624
+sectors = 448
+end_lba = 3071
+mbr_type = 131
+active = false
+logical = true
+marker = "MEMRESCUE-TEST|mbr_ebr_loop|L1|LBA=2624|"
+
+[[partitions]]
+label = "L2"
+start_lba = 3136
+sectors = 448
+end_lba = 3583
+mbr_type = 7
+active = false
+logical = true
+marker = "MEMRESCUE-TEST|mbr_ebr_loop|L2|LBA=3136|"
+
+[[anomalies]]
+code = "ebr_loop"
+lba = 3072
+target_lba = 2560

@@ -1,0 +1,40 @@
+# Generado por tests/generators/gen_partition_images.py: no editar a mano.
+# Esquema en docs/PRUEBAS.md (§1.1). Las LBA de [[partitions]], de la GPT y hidden_sectors son las
+# declaradas (disco original); las demás, de la imagen: LBA imagen = LBA disco - leading_sectors_missing.
+schema_version = 2
+generator_version = 2
+name = "mbr_no_signature"
+file = "mbr_no_signature.img"
+scenario = "MBR con entradas válidas pero sin la firma 0x55AA"
+scheme = "mbr"
+sector_size = 512
+total_sectors = 4096
+size_bytes = 2097152
+sha256 = "6e85937818a855ebf3ee80a3f6dec877754191b04f7824b653734dce123831e3"
+leading_sectors_missing = 0
+trailing_sectors_missing = 0
+disk_signature = "4d520101"
+
+[[partitions]]
+label = "P1"
+start_lba = 2048
+sectors = 1024
+end_lba = 3071
+mbr_type = 7
+active = true
+logical = false
+marker = "MEMRESCUE-TEST|mbr_no_signature|P1|LBA=2048|"
+
+[[partitions]]
+label = "P2"
+start_lba = 3072
+sectors = 1024
+end_lba = 4095
+mbr_type = 12
+active = false
+logical = false
+marker = "MEMRESCUE-TEST|mbr_no_signature|P2|LBA=3072|"
+
+[[anomalies]]
+code = "mbr_signature_missing"
+lba = 0
