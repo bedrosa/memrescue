@@ -403,14 +403,26 @@ pub fn check_output_path(src: &Source, out: &Path) -> Result<()> {
 }
 
 /// Fichero de salida en curso de [`create_output`]: se escribe en un temporal del mismo
-/// directorio y solo [`OutputFile::commit`] lo renombra al nombre final. Si se descarta sin
-/// confirmar (error, cancelación, pánico), el temporal se borra: nunca queda un fichero parcial
-/// con el nombre final.
+/// directorio y solo [`OutputFile::commit`] lo publica con el nombre final. Si se descarta sin
+/// confirmar (error, cancelación, pánico) o la confirmación falla, el temporal se borra: nunca
+/// queda un fichero parcial con el nombre final.
 pub struct OutputFile {
     writer: Option<std::io::BufWriter<std::fs::File>>,
     tmp: PathBuf,
+    /// El temporal aún existe y es nuestro: `Drop` lo borra.
+    tmp_live: bool,
     target: PathBuf,
     overwrite: bool,
+}
+
+/// Cómo publica [`OutputFile::commit`] el temporal sin `overwrite`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Publish {
+    /// Enlace duro y, si el sistema de ficheros no los admite, copia exclusiva.
+    Link,
+    /// Solo la copia exclusiva (para probar la alternativa en cualquier volumen).
+    #[cfg(test)]
+    CopyOnly,
 }
 
 impl OutputFile {
@@ -419,26 +431,104 @@ impl OutputFile {
         &self.tmp
     }
 
-    /// Termina la escritura: vacía, sincroniza y renombra el temporal al nombre final. Sin
-    /// `overwrite`, se vuelve a comprobar que el destino no ha aparecido entretanto.
-    pub fn commit(mut self) -> Result<PathBuf> {
+    /// Termina la escritura: vacía y sincroniza el temporal y lo publica con el nombre final.
+    ///
+    /// - Con `overwrite`, `std::fs::rename` sustituye el destino de forma atómica.
+    /// - Sin `overwrite`, el paso final falla de forma atómica si el destino existe, aunque haya
+    ///   aparecido después de [`create_output`] ([`ApiError::OutputExists`]; el destino no se
+    ///   toca): enlace duro del temporal al nombre final (`std::fs::hard_link`, que nunca
+    ///   sustituye; el temporal está en el mismo directorio, luego en el mismo volumen) y borrado
+    ///   del temporal. Si el sistema de ficheros no admite enlaces duros (FAT, exFAT), se crea el
+    ///   destino en exclusiva (`create_new`) y se copia el temporal: tampoco sustituye nunca un
+    ///   fichero ajeno, pero no es atómico respecto al contenido (durante la copia el destino
+    ///   existe incompleto); si la copia falla, se borra ese destino, que creó esta llamada.
+    ///
+    /// En cualquier error el temporal se borra.
+    pub fn commit(self) -> Result<PathBuf> {
+        self.commit_with(Publish::Link)
+    }
+
+    fn commit_with(mut self, how: Publish) -> Result<PathBuf> {
+        let io = |e: std::io::Error| ApiError::Io(mr_io::IoError::Io(e));
+        // Si algo falla a partir de aquí, `Drop` borra el temporal (`tmp_live`).
         let w = self.writer.take().expect("writer presente hasta commit");
-        let f = w
-            .into_inner()
-            .map_err(|e| ApiError::Io(mr_io::IoError::Io(e.into_error())))?;
-        f.sync_all()
-            .map_err(|e| ApiError::Io(mr_io::IoError::Io(e)))?;
+        let f = w.into_inner().map_err(|e| io(e.into_error()))?;
+        f.sync_all().map_err(io)?;
         drop(f);
-        if !self.overwrite && self.target.exists() {
-            let _ = std::fs::remove_file(&self.tmp);
-            return Err(ApiError::OutputExists(self.target.clone()));
+        if self.overwrite {
+            std::fs::rename(&self.tmp, &self.target).map_err(io)?;
+            self.tmp_live = false;
+            return Ok(self.target.clone());
         }
-        if let Err(e) = std::fs::rename(&self.tmp, &self.target) {
-            let _ = std::fs::remove_file(&self.tmp);
-            return Err(ApiError::Io(mr_io::IoError::Io(e)));
+        let linked = match how {
+            Publish::Link => match std::fs::hard_link(&self.tmp, &self.target) {
+                Ok(()) => true,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return Err(ApiError::OutputExists(self.target.clone()));
+                }
+                Err(e) if hard_link_unsupported(&e) => false,
+                Err(e) => return Err(io(e)),
+            },
+            #[cfg(test)]
+            Publish::CopyOnly => false,
+        };
+        if !linked {
+            self.copy_exclusive()?;
+        }
+        // El destino ya está completo; el temporal sobra (si no se puede borrar aquí, `Drop` lo
+        // reintenta).
+        if std::fs::remove_file(&self.tmp).is_ok() {
+            self.tmp_live = false;
         }
         Ok(self.target.clone())
     }
+
+    /// Alternativa sin enlaces duros: crea el destino en exclusiva y copia el temporal. Si la
+    /// copia falla, borra el destino (solo se llega ahí si lo creó esta llamada).
+    fn copy_exclusive(&self) -> Result<()> {
+        let mut dst = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&self.target)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(ApiError::OutputExists(self.target.clone()));
+            }
+            Err(e) => return Err(ApiError::Io(mr_io::IoError::Io(e))),
+        };
+        let copied = std::fs::File::open(&self.tmp)
+            .and_then(|mut src| std::io::copy(&mut src, &mut dst))
+            .and_then(|_| dst.sync_all());
+        drop(dst);
+        if let Err(e) = copied {
+            let _ = std::fs::remove_file(&self.target);
+            return Err(ApiError::Io(mr_io::IoError::Io(e)));
+        }
+        Ok(())
+    }
+}
+
+/// `true` si el error de `std::fs::hard_link` indica que el sistema de ficheros del destino no
+/// admite enlaces duros (FAT y exFAT en Windows devuelven `ERROR_INVALID_FUNCTION`; otros,
+/// `ERROR_NOT_SUPPORTED`; en Unix, `EPERM` o `EOPNOTSUPP`). Cualquier otro error se devuelve tal
+/// cual: la copia exclusiva no se intenta a ciegas.
+fn hard_link_unsupported(e: &std::io::Error) -> bool {
+    if e.kind() == std::io::ErrorKind::Unsupported {
+        return true;
+    }
+    // ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED.
+    #[cfg(windows)]
+    const CODES: &[i32] = &[1, 50];
+    // EPERM, EOPNOTSUPP.
+    #[cfg(target_os = "linux")]
+    const CODES: &[i32] = &[1, 95];
+    // EPERM, EOPNOTSUPP (BSD, macOS).
+    #[cfg(all(unix, not(target_os = "linux")))]
+    const CODES: &[i32] = &[1, 45];
+    #[cfg(not(any(windows, unix)))]
+    const CODES: &[i32] = &[];
+    e.raw_os_error().is_some_and(|c| CODES.contains(&c))
 }
 
 impl std::io::Write for OutputFile {
@@ -459,8 +549,9 @@ impl std::io::Write for OutputFile {
 
 impl Drop for OutputFile {
     fn drop(&mut self) {
-        if let Some(w) = self.writer.take() {
-            drop(w);
+        // Se cierra antes de borrar (en Windows no se borra un fichero abierto).
+        drop(self.writer.take());
+        if self.tmp_live {
             let _ = std::fs::remove_file(&self.tmp);
         }
     }
@@ -470,7 +561,8 @@ impl Drop for OutputFile {
 /// que usará la recuperación de M4): [`check_output_path`] (nunca el origen ni un dispositivo ni un
 /// directorio); si `out` ya existe y `overwrite` es `false`, [`ApiError::OutputExists`]; la
 /// escritura va a un temporal nuevo (`.<nombre>.<pid>-<n>.mrtmp`) del mismo directorio que se
-/// renombra al confirmar ([`OutputFile::commit`]) y se borra si no se confirma.
+/// publica al confirmar ([`OutputFile::commit`], que sin `overwrite` tampoco sustituye un destino
+/// creado entretanto) y se borra si no se confirma.
 pub fn create_output(src: &Source, out: &Path, overwrite: bool) -> Result<OutputFile> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -502,6 +594,7 @@ pub fn create_output(src: &Source, out: &Path, overwrite: bool) -> Result<Output
                 return Ok(OutputFile {
                     writer: Some(std::io::BufWriter::new(f)),
                     tmp,
+                    tmp_live: true,
                     target: out.to_path_buf(),
                     overwrite,
                 })
@@ -1478,5 +1571,113 @@ mod tests {
         // El origen nunca, ni con sobrescritura.
         assert!(create_output(&src, &img, true).is_err());
         assert_eq!(std::fs::read(&img).unwrap(), vec![0u8; 4096]);
+    }
+
+    /// Issue #58: un destino creado entre `create_output` y `commit` nunca se sustituye sin
+    /// `overwrite`, ni con el enlace duro ni con la copia exclusiva.
+    #[test]
+    fn create_output_commit_never_replaces_a_concurrent_file() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("origen.img");
+        std::fs::write(&img, vec![0u8; 4096]).unwrap();
+        let src = open_source(&img, 512).unwrap();
+        let entries = || std::fs::read_dir(dir.path()).unwrap().count();
+        for how in [Publish::Link, Publish::CopyOnly] {
+            let out = dir.path().join(format!("salida-{how:?}.bin"));
+            // Camino normal: el destino aparece con el contenido y el temporal desaparece.
+            let mut o = create_output(&src, &out, false).unwrap();
+            o.write_all(&[5u8; 70_000]).unwrap();
+            let tmp = o.temp_path().to_path_buf();
+            assert_eq!(o.commit_with(how).unwrap(), out);
+            assert_eq!(std::fs::read(&out).unwrap(), vec![5u8; 70_000]);
+            assert!(!tmp.exists());
+            std::fs::remove_file(&out).unwrap();
+            // Otro proceso crea el destino después de la comprobación inicial: se rechaza, el
+            // destino ajeno no cambia y el temporal se borra.
+            let mut o = create_output(&src, &out, false).unwrap();
+            o.write_all(b"nuestro").unwrap();
+            let tmp = o.temp_path().to_path_buf();
+            std::fs::write(&out, b"ajeno").unwrap();
+            match o.commit_with(how) {
+                Err(ApiError::OutputExists(p)) => assert_eq!(p, out),
+                other => panic!("{how:?}: {other:?}"),
+            }
+            assert_eq!(std::fs::read(&out).unwrap(), b"ajeno");
+            assert!(!tmp.exists());
+            // Con `overwrite`, el mismo caso sí sustituye (rename atómico).
+            let mut o = create_output(&src, &out, true).unwrap();
+            o.write_all(b"nuevo").unwrap();
+            std::fs::write(&out, b"ajeno otra vez").unwrap();
+            o.commit_with(how).unwrap();
+            assert_eq!(std::fs::read(&out).unwrap(), b"nuevo");
+            std::fs::remove_file(&out).unwrap();
+            assert_eq!(entries(), 1, "{how:?}: solo el origen");
+        }
+        // Carrera real: otro hilo crea el destino en exclusiva mientras se confirma. Gana uno
+        // solo y el destino tiene exactamente su contenido; el temporal nunca queda.
+        for i in 0..64 {
+            let how = if i % 2 == 0 {
+                Publish::Link
+            } else {
+                Publish::CopyOnly
+            };
+            let out = dir.path().join(format!("carrera-{i}.bin"));
+            let mut o = create_output(&src, &out, false).unwrap();
+            o.write_all(&[1u8; 8192]).unwrap();
+            let tmp = o.temp_path().to_path_buf();
+            let rival = {
+                let out = out.clone();
+                std::thread::spawn(move || {
+                    match std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&out)
+                    {
+                        Ok(mut f) => {
+                            f.write_all(&[2u8; 100]).unwrap();
+                            true
+                        }
+                        Err(e) => {
+                            assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists);
+                            false
+                        }
+                    }
+                })
+            };
+            let ours = match o.commit_with(how) {
+                Ok(_) => true,
+                Err(ApiError::OutputExists(_)) => false,
+                Err(e) => panic!("{how:?}: {e:?}"),
+            };
+            let theirs = rival.join().unwrap();
+            assert!(ours != theirs, "{how:?}: exactamente un ganador");
+            let want = if ours {
+                vec![1u8; 8192]
+            } else {
+                vec![2u8; 100]
+            };
+            assert_eq!(std::fs::read(&out).unwrap(), want, "{how:?}");
+            assert!(!tmp.exists());
+            std::fs::remove_file(&out).unwrap();
+        }
+        assert_eq!(entries(), 1, "solo el origen");
+    }
+
+    #[test]
+    fn hard_link_unsupported_is_recognised_only_for_unsupported_errors() {
+        use std::io::{Error, ErrorKind};
+        assert!(hard_link_unsupported(&Error::from(ErrorKind::Unsupported)));
+        assert!(!hard_link_unsupported(&Error::from(
+            ErrorKind::AlreadyExists
+        )));
+        assert!(!hard_link_unsupported(&Error::from(ErrorKind::NotFound)));
+        #[cfg(windows)]
+        {
+            // ERROR_INVALID_FUNCTION (FAT, exFAT) y ERROR_NOT_SUPPORTED; no ERROR_ACCESS_DENIED.
+            assert!(hard_link_unsupported(&Error::from_raw_os_error(1)));
+            assert!(hard_link_unsupported(&Error::from_raw_os_error(50)));
+            assert!(!hard_link_unsupported(&Error::from_raw_os_error(5)));
+        }
     }
 }

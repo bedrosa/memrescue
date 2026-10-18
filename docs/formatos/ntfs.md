@@ -46,9 +46,16 @@ lznt1::decompress(src, límite)          // [MS-XCA] con límites estrictos
   salida no puede ser el propio origen ni uno de sus segmentos (comparación de rutas canónicas), ni
   una ruta de dispositivo (la misma lista blanca léxica que los orígenes, ADR-014), ni un
   directorio. Si la salida ya existe, se rechaza (código 2) salvo con `--overwrite`. La escritura
-  va a un temporal nuevo del mismo directorio (`.<nombre>.<pid>-<n>.mrtmp`) que se renombra al
+  va a un temporal nuevo del mismo directorio (`.<nombre>.<pid>-<n>.mrtmp`) que se publica con el
   nombre final solo al terminar bien; ante un error o una interrupción el temporal se borra, así que
-  nunca queda un fichero parcial con el nombre final (ni se pierde el anterior al sustituirlo). La
+  nunca queda un fichero parcial con el nombre final (ni se pierde el anterior al sustituirlo). Sin
+  `--overwrite`, la publicación tampoco sustituye un fichero creado por otro proceso después de la
+  comprobación inicial (#58): es un enlace duro del temporal al nombre final, que falla de forma
+  atómica si el nombre ya existe (código 2, el fichero ajeno no cambia), seguido del borrado del
+  temporal. En sistemas de ficheros sin enlaces duros (FAT, exFAT) se crea el destino en exclusiva
+  (`create_new`) y se copia el temporal: nunca sustituye nada, pero mientras dura la copia el
+  destino existe incompleto; si la copia falla se borra ese destino (lo creó la propia operación).
+  Con `--overwrite`, el renombrado sustituye el anterior de forma atómica. La
   política vive en `mr_api::create_output` / `OutputFile::commit` para que la reutilice la
   recuperación de M4. **Limitación**: no se detectan enlaces duros al origen (otra ruta al mismo
   fichero); solo se compara la ruta canónica. Los tramos no fiables se escriben con el patrón `BAD!`

@@ -86,16 +86,19 @@ pub fn cat(
     }
     let report: CopyReport = match out {
         Some(p) => {
-            // Política común de salida (mr-api): temporal en el mismo directorio y renombrado
-            // al terminar; si falla, el temporal se borra y no queda nada con el nombre final.
-            let mut w = mr_api::create_output(src, p, overwrite).map_err(|e| match e {
+            // Política común de salida (mr-api): temporal en el mismo directorio que se publica
+            // al terminar sin sustituir nunca un fichero existente (salvo --overwrite), tampoco
+            // uno creado entretanto; si falla, el temporal se borra y no queda nada con el
+            // nombre final.
+            let out_err = |e: mr_api::ApiError| match e {
                 mr_api::ApiError::OutputExists(_) => {
                     (2u8, format!("{e} (use --overwrite para sustituirla)"))
                 }
                 e => op(&e),
-            })?;
+            };
+            let mut w = mr_api::create_output(src, p, overwrite).map_err(out_err)?;
             let r = s.copy_to(&mut w).map_err(|e| op(&e))?;
-            w.commit().map_err(|e| op(&e))?;
+            w.commit().map_err(out_err)?;
             r
         }
         None => {
