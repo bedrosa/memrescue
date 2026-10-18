@@ -5,6 +5,7 @@ members = [
     "core/mr-io",
     "core/mr-store",
     "core/mr-image",
+    "core/mr-part",
     "core/mr-api",
     "core/mr-ffi",
     "cli",
@@ -23,6 +24,7 @@ mr-common = { path = "core/mr-common" }
 mr-io = { path = "core/mr-io" }
 mr-store = { path = "core/mr-store" }
 mr-image = { path = "core/mr-image" }
+mr-part = { path = "core/mr-part" }
 mr-api = { path = "core/mr-api" }
 thiserror = "2"
 crc32fast = "1"

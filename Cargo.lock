@@ -256,6 +256,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mr-part"
+version = "0.2.0"
+dependencies = [
+ "mr-common",
+ "mr-io",
+ "tempfile",
+]
+
+[[package]]
 name = "mr-store"
 version = "0.2.0"
 dependencies = [
