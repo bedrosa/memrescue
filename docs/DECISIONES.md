@@ -557,3 +557,47 @@ perforados (ntfs-3g no implementa `fallocate`), sin `$UsnJrnl` y con el mismo n�
 imágenes. Para usar el corpus en local hace falta `gh` autenticado y una ejecución del workflow con
 artefacto vigente (si caduca, se relanza y produce los mismos bytes). Una actualización de ntfs-3g, TSK o
 del núcleo del ejecutor puede obligar a revisar y versionar manifiestos nuevos.
+
+---
+
+## ADR-025 · Lector NTFS: registros por estado, fixups sin tolerancia y copia del arranque situada por su propio total (Aceptada, 2026-10-18)
+
+**Contexto.** Issue #20 (FS-01, M3): primer sistema de archivos. Hay que decidir qué se hace con
+registros dañados o ilegibles, cuándo se acepta la copia del arranque, cómo se comprueba `$MFTMirr`
+y dónde queda la frontera con #21-#23. INV F1-05 §5.3 observa en la referencia una tolerancia: un
+tramo con la secuencia de actualización incorrecta fuera del área usada no invalida el registro.
+
+**Decisión** (detalle en `formatos/ntfs.md`):
+1. **Crate `mr-fs-ntfs`** en la capa de sistemas de archivos, sobre `mr-io` y `mr-part` (usa
+   `sector::read_trusted` y la escala `Severity` de ADR-022; no conoce la API ni la interfaz).
+   `mr-api::ntfs_open` y la CLI `ntfs-info` lo exponen; FFI e interfaz llegan con el árbol (#22).
+2. **Cada registro tiene un estado** (`in_use`, `not_in_use`, `empty`, `uninitialized`,
+   `unmapped`, `outside_source`, `unreadable`, `damaged`) en lugar de un error: un registro malo
+   nunca detiene la lectura de los demás y nunca se usa como válido. Un sector no fiable dentro de
+   un registro lo deja `unreadable` sin interpretarlo (ADR-019). Los daños de registros no cambian la
+   confianza del volumen.
+3. **Secuencia de actualización sin tolerancia**: cualquier tramo que no termine en el USN marca el
+   registro dañado, también fuera de los bytes en uso (diferencia deliberada con la referencia: un
+   registro a medio escribir no se acepta en silencio; #23 podrá ofrecer una recuperación explícita
+   de esos registros con su propia confianza).
+4. **Copia del arranque**: con el principal no válido o ilegible solo se acepta una copia del último
+   (o penúltimo) sector del origen si su propio total de sectores la sitúa ahí; usarla es una
+   corrección informada (`ValidWithFixes`). Con el principal válido, la copia se comprueba y su
+   estado se informa.
+5. **`$MFTMirr`**: se compara con la MFT registro a registro, sin la matriz de la secuencia de
+   actualización; solo el registro 0 se toma de la copia (para localizar la MFT) si el de `$MFT` no
+   es utilizable. Las discrepancias son anomalías compensadas.
+6. **Frontera**: `runs` decodifica *mapping pairs* con aritmética comprobada solo para la MFT; #21 lo
+   ampliará (datos, dispersos, compresión) sin cambiar `decode_runs`. `apply_fixups` es común a
+   `FILE` e `INDX` (#22). La enumeración (`records`) es la base de #22 y #23.
+
+**Alternativas.** Aceptar tramos con fixup incorrecto fuera del área usada (como la referencia);
+tratar un registro dañado como error que aborta la enumeración; aceptar cualquier copia del arranque
+que sea un BPB válido (podría ser la de otro volumen dentro del origen); reparar en memoria todos los
+registros que `$MFTMirr` contiene.
+
+**Consecuencias.** La CLI y las pruebas de corpus informan los registros dañados exactamente
+(`ntfs_damaged_mft`) y la copia usada (`ntfs_damaged_boot`). Una MFT con extensiones
+(`$ATTRIBUTE_LIST`) se lee solo en la parte que cubre el registro 0 (`mft_incomplete`); seguirlas
+queda para #21. Si el registro 0 falla en las dos copias, el volumen no se abre (lo cubrirá el
+escaneo de M6).

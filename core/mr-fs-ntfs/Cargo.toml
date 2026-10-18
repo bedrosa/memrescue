@@ -1,0 +1,16 @@
+[package]
+name = "mr-fs-ntfs"
+description = "Lector NTFS de MemRescue: sector de arranque, localización de la MFT y registros FILE con fixups (solo lectura, tolerante a daños)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+mr-common.workspace = true
+mr-io.workspace = true
+mr-part.workspace = true
+
+[lints]
+workspace = true

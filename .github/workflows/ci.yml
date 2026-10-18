@@ -72,6 +72,42 @@ jobs:
       - name: Partition parsers and lost-partition search against the corpus
         run: cargo test -p mr-part --locked -- --ignored
 
+  ntfs:
+    name: NTFS reader against the NTFS corpus
+    runs-on: windows-latest
+    timeout-minutes: 30
+    # The corpus is the artifact of the "NTFS corpus" workflow (ADR-024): downloading it needs
+    # actions: read, granted to this job only.
+    permissions:
+      contents: read
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install && rustup show active-toolchain
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            target
+          key: rust-ntfs-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: rust-ntfs-${{ runner.os }}-
+      - name: Fetch the NTFS corpus (latest successful run, SHA-256 checked against the versioned manifests)
+        run: python -I -X utf8 tools/fetch_ntfs_corpus.py
+      - name: NTFS reader against the corpus manifests
+        run: cargo test -p mr-fs-ntfs --test ntfs_corpus --locked -- --ignored
+      - name: ntfs-info (CLI) against the corpus manifests
+        run: cargo test -p memrescue-cli --test ntfs_corpus --locked -- --ignored
+
   dotnet:
     name: .NET build and interop tests
     runs-on: windows-latest

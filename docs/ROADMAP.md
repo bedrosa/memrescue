@@ -118,6 +118,12 @@ Milestone propio para no retrasar NTFS y la recuperación.
   validado con The Sleuth Kit como oráculo independiente (decisión del propietario, 2026-10-18).
 
 - `mr-fs-ntfs`: boot, MFT, fixups, atributos, runs, índices, LZNT1, sparse, ADS, $LogFile (lectura).
+  - **Hecho (#20, ADR-025)**: arranque (estricto, con copia del último sector), localización de
+    `$MFT`, registros FILE con fixups, cabeceras de atributo, lectura y enumeración de registros con
+    estado, `$MFTMirr`; `mr_api::ntfs_open` y CLI `ntfs-info`; pruebas contra el corpus NTFS en la CI
+    (job `ntfs`). FFI e interfaz llegan con el árbol (#22).
+  - Pendiente: atributos, runs de datos, residentes, dispersos, LZNT1 y ADS (#21); índices `$I30` y
+    árbol (#22); borrados (#23); extensiones de `$MFT` por `$ATTRIBUTE_LIST`.
 - Ficheros borrados (registros MFT no en uso, entradas INDX residuales).
 - **Paridad objetivo**: FS-01…FS-04.
 
