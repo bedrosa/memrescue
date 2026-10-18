@@ -69,7 +69,7 @@ jobs:
         run: python -I -X utf8 tests/generators/test_validator.py tests/corpus/generated tests/corpus/manifests
       - name: Engine cross-checks against the corpus
         run: cargo test -p memrescue-cli --test corpus --locked -- --ignored
-      - name: Partition table parsers against the corpus
+      - name: Partition parsers and lost-partition search against the corpus
         run: cargo test -p mr-part --locked -- --ignored
 
   dotnet:

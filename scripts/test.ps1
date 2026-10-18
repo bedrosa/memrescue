@@ -36,7 +36,7 @@ $fingerprint = Get-ChildItem "$gen\*.img" | ForEach-Object {
 Step 'Corpus: validación independiente vs manifiestos versionados' { & $Python -I -X utf8 tests\generators\validate_partition_images.py $gen $refs }
 Step 'Corpus: pruebas negativas del validador' { & $Python -I -X utf8 tests\generators\test_validator.py $gen $refs }
 Step 'Rust: pruebas cruzadas con el corpus' { cargo test -p memrescue-cli --test corpus -- --ignored }
-Step 'Rust: tablas de particiones contra el corpus' { cargo test -p mr-part -- --ignored }
+Step 'Rust: tablas de particiones y búsqueda de perdidas contra el corpus' { cargo test -p mr-part -- --ignored }
 if (-not $SkipQemu) {
     # Referencia independiente: qemu-img portable verificado (docs/HERRAMIENTAS_TERCEROS.md). Solo se usa
     # sobre imágenes temporales creadas por las pruebas, con convert/info/map (nunca reparación).

@@ -38,8 +38,14 @@ public sealed class SourceEntry(Source source, ImageFormat detected, bool forced
     /// <summary>Tabla de particiones leída (se lee al seleccionar el origen por primera vez).</summary>
     public PartitionTable? Partitions { get; set; }
 
+    /// <summary>Última búsqueda de particiones perdidas (solo a petición) y su resultado.</summary>
+    public PartitionSearchTask? Search { get; set; }
+
+    public PartitionSearchResult? SearchResult { get; set; }
+
     public void Dispose()
     {
+        Search?.Dispose();
         Partitions?.Dispose();
         Source.Dispose();
     }
@@ -79,6 +85,41 @@ public sealed class PartitionRow(PartitionEntry entry, uint sectorSize)
     public string Details => Entry.Anomalies.Count == 0
         ? AutomationName
         : AutomationName + "\n" + string.Join("\n", Entry.Anomalies.Select(a => a.ToString()));
+}
+
+/// <summary>Fila de la lista de volúmenes encontrados (textos ya formateados para la vista y UI Automation).</summary>
+public sealed class FoundVolumeRow(FoundVolume volume, uint sectorSize)
+{
+    public FoundVolume Volume { get; } = volume;
+
+    public int Number => Volume.Number;
+
+    public string State => Volume.StateLabel;
+
+    public string FileSystem => Volume.FileSystem.Label();
+
+    public string StartText => Volume.StartLba.ToString("N0", CultureInfo.CurrentCulture);
+
+    public string EndText => Volume.EndLba.ToString("N0", CultureInfo.CurrentCulture);
+
+    public string SizeText => MainWindow.FormatSize(Volume.SectorCount * sectorSize);
+
+    public string Indicators => Volume.Indicators;
+
+    public string ConfidenceText => Volume.Confidence.Label();
+
+    public string Origin => $"{Volume.TierLabel}: {Volume.Origin}";
+
+    public string AutomationId => "FoundVolume" + Volume.Number.ToString(CultureInfo.InvariantCulture);
+
+    public string AutomationName =>
+        $"Volumen {Volume.Number}: {Volume.StateLabel}, {Volume.FileSystem.Label()}, LBA {Volume.StartLba}–{Volume.EndLba}, " +
+        $"{Volume.SectorCount} sectores, indicadores {Volume.Indicators}, principal {Volume.Primary.Label()}, " +
+        $"copia {Volume.Backup.Label()}, confianza {Volume.Confidence.Label()}";
+
+    public string Details => Volume.Anomalies.Count == 0
+        ? AutomationName
+        : AutomationName + "\n" + string.Join("\n", Volume.Anomalies.Select(a => a.ToString()));
 }
 
 public partial class MainWindow : Window
@@ -457,6 +498,7 @@ public partial class MainWindow : Window
         PartitionAnomaliesList.Items.Clear();
         PartitionSchemeText.Text = message;
         OpenPartitionButton.IsEnabled = false;
+        ShowFoundVolumes(Selected);
     }
 
     /// <summary>
@@ -531,6 +573,7 @@ public partial class MainWindow : Window
             PartitionAnomaliesList.Items.Add("(ninguna)");
         }
         OpenPartitionButton.IsEnabled = false;
+        ShowFoundVolumes(s);
         return t;
     }
 
@@ -591,6 +634,168 @@ public partial class MainWindow : Window
         catch (EngineException ex)
         {
             ShowError("No se pudo abrir la partición", ex);
+            return null;
+        }
+    }
+
+    // ---------- Búsqueda exprés de particiones perdidas (#15) ----------
+
+    private CancellationTokenSource? _searchCts;
+
+    /// <summary>Muestra el resultado de la última búsqueda del origen (o el aviso de que no se ha buscado).</summary>
+    private void ShowFoundVolumes(SourceEntry? s)
+    {
+        var searching = _searchCts is not null;
+        FindPartitionsButton.IsEnabled = s is not null && !searching;
+        OpenFoundVolumeButton.IsEnabled = false;
+        if (s?.SearchResult is not { } r)
+        {
+            FoundVolumesList.ItemsSource = null;
+            if (!searching)
+            {
+                SearchProgressBar.Value = 0;
+                SearchStatusText.Text = s is null
+                    ? "Volúmenes encontrados: abra una imagen de disco."
+                    : "Volúmenes encontrados: pulse «Buscar particiones perdidas» (la búsqueda solo se hace a petición).";
+            }
+            return;
+        }
+        var shift = r.ShiftBytes is { } d
+            ? $" · IMAGEN DESPLAZADA {d / r.SectorSize} sectores (hipótesis con dos evidencias; no se aplica en silencio)"
+            : "";
+        var found = r.Volumes.Count(v => !v.Listed);
+        SearchStatusText.Text =
+            $"Búsqueda {r.Status.Label()}: {r.Volumes.Count} volúmenes ({found} fuera de la tabla) · " +
+            $"{r.Reads} de {r.MaxReads} lecturas" +
+            (r.UnverifiableSectors > 0 ? $" · {r.UnverifiableSectors} sectores no verificables" : "") + shift;
+        FoundVolumesList.ItemsSource = r.Volumes.Select(v => new FoundVolumeRow(v, r.SectorSize)).ToList();
+    }
+
+    private void FindPartitions_Click(object sender, RoutedEventArgs e)
+    {
+        if (Selected is { } s)
+        {
+            _ = FindPartitionsAsync(s);
+        }
+    }
+
+    private void CancelSearch_Click(object sender, RoutedEventArgs e) => _searchCts?.Cancel();
+
+    /// <summary>Lanza la búsqueda exprés sobre el origen, con progreso y cancelación, y muestra el resultado.</summary>
+    internal async Task<PartitionSearchResult?> FindPartitionsAsync(SourceEntry s)
+    {
+        if (_searchCts is not null)
+        {
+            return null;
+        }
+        s.Search?.Dispose();
+        s.Search = null;
+        s.SearchResult = null;
+        _searchCts = new CancellationTokenSource();
+        FindPartitionsButton.IsEnabled = false;
+        CancelSearchButton.IsEnabled = true;
+        FoundVolumesList.ItemsSource = null;
+        SearchProgressBar.Value = 0;
+        SearchStatusText.Text = "Buscando particiones perdidas…";
+        try
+        {
+            var task = await Task.Run(() => s.Source.StartPartitionSearch());
+            s.Search = task;
+            var progress = new Progress<TaskProgress>(p =>
+            {
+                SearchProgressBar.Value = p.Fraction * 100;
+                SearchStatusText.Text = $"Buscando particiones perdidas… {p.Done:N0} de {p.Total:N0} lecturas";
+            });
+            var state = await task.WaitAsync(progress, _searchCts.Token);
+            var r = await Task.Run(task.GetResult);
+            if (!_sources.Contains(s))
+            {
+                return null;
+            }
+            s.SearchResult = r;
+            SearchProgressBar.Value = 100;
+            Log($"Búsqueda de particiones en {s.FileName}: {r.Status.Label()} ({state}), {r.Volumes.Count} volúmenes, " +
+                $"{r.Reads} de {r.MaxReads} lecturas.");
+            return r;
+        }
+        catch (EngineException ex)
+        {
+            Log($"No se pudo buscar particiones en {s.FileName}: [{ex.Status}] {ex.Message}");
+            SearchStatusText.Text = $"No se pudo completar la búsqueda: {ex.Message}";
+            return null;
+        }
+        finally
+        {
+            _searchCts.Dispose();
+            _searchCts = null;
+            CancelSearchButton.IsEnabled = false;
+            if (Selected == s && s.SearchResult is not null)
+            {
+                ShowFoundVolumes(s);
+            }
+            else
+            {
+                FindPartitionsButton.IsEnabled = Selected is not null;
+            }
+        }
+    }
+
+    private void FoundVolumesList_SelectionChanged(object sender, SelectionChangedEventArgs e) =>
+        OpenFoundVolumeButton.IsEnabled = FoundVolumesList.SelectedItem is FoundVolumeRow { Volume.Partial: false };
+
+    private void FoundVolumesList_MouseDoubleClick(object sender, MouseButtonEventArgs e) => OpenFoundVolume_Click(sender, e);
+
+    private void OpenFoundVolume_Click(object sender, RoutedEventArgs e)
+    {
+        if (Selected is { } s && FoundVolumesList.SelectedItem is FoundVolumeRow row)
+        {
+            _ = OpenFoundVolumeAsync(s, row.Volume);
+        }
+    }
+
+    /// <summary>
+    /// Abre un volumen encontrado como origen independiente y lo muestra en el visor. Un volumen
+    /// parcial no se puede abrir; uno que depende del desplazamiento detectado exige confirmación.
+    /// </summary>
+    internal async Task<SourceEntry?> OpenFoundVolumeAsync(SourceEntry parent, FoundVolume v)
+    {
+        if (parent.Search is not { } task || parent.SearchResult is not { } r)
+        {
+            return null;
+        }
+        if (v.Partial)
+        {
+            Log($"El volumen {v.Number} empieza antes del inicio de la imagen: es parcial y no se puede abrir.");
+            return null;
+        }
+        var applyShift = false;
+        if (v.RequiresShift)
+        {
+            var sectors = (r.ShiftBytes ?? 0) / r.SectorSize;
+            var answer = MessageBox.Show(this,
+                $"La búsqueda detectó que la imagen está desplazada {sectors} sectores respecto al disco original.\n\n" +
+                $"El volumen {v.Number} declara empezar en la LBA {v.DeclaredStart:N0} del disco y está en la LBA {v.StartLba:N0} de la imagen.\n\n" +
+                "¿Abrirlo aplicando ese desplazamiento? La descripción del nuevo origen lo indicará.",
+                "Imagen desplazada", MessageBoxButton.YesNo, MessageBoxImage.Question, MessageBoxResult.No);
+            if (answer != MessageBoxResult.Yes)
+            {
+                Log($"No se abrió el volumen {v.Number}: depende del desplazamiento detectado y no se aplicó.");
+                return null;
+            }
+            applyShift = true;
+        }
+        try
+        {
+            var src = await Task.Run(() => task.OpenVolume(v.Index, applyShift));
+            var entry = new SourceEntry(src, parent.Detected, parent.ForcedRaw,
+                $"{parent.FileName} [volumen encontrado {v.Number}: {v.FileSystem.Label()} LBA {v.StartLba:N0}–{v.EndLba:N0}]", parent.Tolerant);
+            AddSource(entry);
+            Log($"Volumen encontrado {v.Number} abierto como dispositivo: {src.Description} (indicadores {v.Indicators}, confianza {v.Confidence.Label()}).");
+            return entry;
+        }
+        catch (EngineException ex)
+        {
+            ShowError("No se pudo abrir el volumen encontrado", ex);
             return null;
         }
     }

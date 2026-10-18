@@ -1567,3 +1567,323 @@ fn shifted_gpt_partitions_open_only_when_the_shift_is_requested() {
     assert_eq!(mr_partitions_free(t), MR_OK);
     assert_eq!(mr_source_close(src), MR_OK);
 }
+
+// ---------- Búsqueda exprés de particiones perdidas (#15) ----------
+
+#[test]
+fn search_structs_match_header() {
+    assert_eq!(std::mem::size_of::<MrPartitionSearchOptions>(), 64);
+    assert_eq!(std::mem::size_of::<MrPartitionSearchInfo>(), 96);
+    assert_eq!(std::mem::size_of::<MrFoundVolume>(), 136);
+    assert_eq!(std::mem::size_of::<MrFoundTable>(), 32);
+    assert_eq!(
+        std::mem::offset_of!(MrPartitionSearchOptions, max_volumes),
+        40
+    );
+    assert_eq!(std::mem::offset_of!(MrPartitionSearchInfo, shift_bytes), 24);
+    assert_eq!(std::mem::offset_of!(MrPartitionSearchInfo, sectors), 88);
+    assert_eq!(std::mem::offset_of!(MrFoundVolume, fs_sector_size), 40);
+    assert_eq!(std::mem::offset_of!(MrFoundVolume, primary_byte), 96);
+    assert_eq!(std::mem::offset_of!(MrFoundVolume, score), 128);
+}
+
+/// Sector de arranque NTFS sintético (total = `sectors - 1`, copia en el último sector).
+fn ntfs_boot(hidden: u32, sectors: u64) -> Vec<u8> {
+    let mut b = vec![0u8; 512];
+    b[..3].copy_from_slice(&[0xEB, 0x52, 0x90]);
+    b[3..11].copy_from_slice(b"NTFS    ");
+    b[0x0B..0x0D].copy_from_slice(&512u16.to_le_bytes());
+    b[0x0D] = 8;
+    b[0x15] = 0xF8;
+    b[0x1C..0x20].copy_from_slice(&hidden.to_le_bytes());
+    b[0x28..0x30].copy_from_slice(&(sectors - 1).to_le_bytes());
+    b[0x30..0x38].copy_from_slice(&4u64.to_le_bytes());
+    b[0x38..0x40].copy_from_slice(&(sectors / 16).to_le_bytes());
+    b[0x40] = 0xF6;
+    b[0x44] = 1;
+    b[0x48..0x50].copy_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
+    b[0x1FE] = 0x55;
+    b[0x1FF] = 0xAA;
+    b
+}
+
+/// Disco sin tabla con dos NTFS. Con `added` sectores añadidos al inicio, los volúmenes declaran
+/// sus LBA del disco original (2048 y 4096) y están `added` sectores más allá.
+fn lost_disk(added: usize) -> Vec<u8> {
+    let mut d = vec![0u8; (6144 + added) * 512];
+    for (start, len) in [(2048usize, 2048usize), (4096, 2048)] {
+        let b = ntfs_boot(start as u32, len as u64);
+        let at = start + added;
+        d[at * 512..(at + 1) * 512].copy_from_slice(&b);
+        d[(at + len - 1) * 512..(at + len) * 512].copy_from_slice(&b);
+    }
+    d
+}
+
+fn search_source(data: &[u8]) -> (tempfile::TempDir, u64) {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("lost.img");
+    std::fs::write(&p, data).unwrap();
+    let h = open(p.to_str().unwrap(), 512, 0).unwrap();
+    (dir, h)
+}
+
+fn search_options_default() -> MrPartitionSearchOptions {
+    MrPartitionSearchOptions {
+        struct_size: std::mem::size_of::<MrPartitionSearchOptions>() as u32,
+        ..Default::default()
+    }
+}
+
+fn start_search(src: u64, o: Option<&MrPartitionSearchOptions>) -> Result<u64, i32> {
+    let mut t = 0u64;
+    let ptr = o.map_or(std::ptr::null(), |o| o as *const MrPartitionSearchOptions);
+    match unsafe { mr_source_partition_search_start(src, ptr, &mut t) } {
+        MR_OK => Ok(t),
+        rc => Err(rc),
+    }
+}
+
+fn search_info(t: u64) -> Result<MrPartitionSearchInfo, i32> {
+    let mut i = MrPartitionSearchInfo {
+        struct_size: std::mem::size_of::<MrPartitionSearchInfo>() as u32,
+        ..Default::default()
+    };
+    match unsafe { mr_partition_search_result(t, &mut i) } {
+        MR_OK => Ok(i),
+        rc => Err(rc),
+    }
+}
+
+fn found_volume(t: u64, index: u32) -> Result<MrFoundVolume, i32> {
+    let mut v = MrFoundVolume {
+        struct_size: std::mem::size_of::<MrFoundVolume>() as u32,
+        ..Default::default()
+    };
+    match unsafe { mr_found_volume_get(t, index, &mut v) } {
+        MR_OK => Ok(v),
+        rc => Err(rc),
+    }
+}
+
+fn found_anomaly(t: u64, vi: u32, ai: u32) -> Result<(MrPartitionAnomaly, String), i32> {
+    let mut a = MrPartitionAnomaly {
+        struct_size: std::mem::size_of::<MrPartitionAnomaly>() as u32,
+        ..Default::default()
+    };
+    let rc = unsafe { mr_found_volume_anomaly(t, vi, ai, &mut a) };
+    if rc != MR_OK {
+        return Err(rc);
+    }
+    let mut buf = vec![0u8; 1024];
+    let mut n = 0usize;
+    let rc =
+        unsafe { mr_found_volume_anomaly_text(t, vi, ai, buf.as_mut_ptr(), buf.len(), &mut n) };
+    assert_eq!(rc, MR_OK);
+    Ok((a, String::from_utf8(buf[..n].to_vec()).unwrap()))
+}
+
+#[test]
+fn partition_search_finds_volumes_and_opens_them() {
+    let (_d, src) = search_source(&lost_disk(0));
+    let t = start_search(src, None).unwrap();
+    let st = wait(t);
+    assert_eq!(st.state, TaskState::Completed as u32);
+    let i = search_info(t).unwrap();
+    assert_eq!(
+        (i.status, i.volume_count, i.flags),
+        (MR_SEARCH_COMPLETE, 2, 0)
+    );
+    assert_eq!((i.max_reads, i.sector_size, i.sectors), (4096, 512, 6144));
+    assert_eq!((st.done, st.total), (i.reads, 4096));
+    assert!(i.reads > 0 && i.reads < 400);
+    let v = found_volume(t, 0).unwrap();
+    assert_eq!(
+        (v.fs, v.start_lba, v.sector_count),
+        (MR_FS_NTFS, 2048, 2048)
+    );
+    assert_eq!((v.primary, v.backup), (1, 1));
+    assert_eq!(v.confidence, MR_CONFIDENCE_VALID);
+    assert_eq!(v.flags, MR_FOUND_HAS_BACKUP);
+    assert_eq!(v.table_index, MR_PARTITION_TABLE);
+    assert_eq!((v.serial, v.suggested_mbr_type), (0x1122_3344_5566_7788, 7));
+    let mut buf = vec![0u8; 512];
+    let mut n = 0usize;
+    assert_eq!(
+        unsafe { mr_found_volume_origin(t, 0, buf.as_mut_ptr(), buf.len(), &mut n) },
+        MR_OK
+    );
+    assert!(String::from_utf8_lossy(&buf[..n]).contains("1 MiB"));
+    // Abrir el volumen: el primer sector es su arranque.
+    let mut vs = 0u64;
+    assert_eq!(unsafe { mr_found_volume_open(t, 0, 0, &mut vs) }, MR_OK);
+    assert!(describe(vs).starts_with("Volumen encontrado NTFS LBA 2048–4095"));
+    assert_eq!(
+        unsafe { mr_source_read(vs, 0, 1, buf.as_mut_ptr(), 512, &mut n) },
+        MR_OK
+    );
+    assert_eq!(&buf[3..11], b"NTFS    ");
+    assert_eq!(mr_source_close(vs), MR_OK);
+    // Índices, tamaños, punteros y opciones no válidos.
+    assert_eq!(found_volume(t, 2).unwrap_err(), MR_ERR_OUT_OF_RANGE);
+    let mut small = MrFoundVolume {
+        struct_size: 8,
+        ..Default::default()
+    };
+    assert_eq!(
+        unsafe { mr_found_volume_get(t, 0, &mut small) },
+        MR_ERR_INVALID_ARGUMENT
+    );
+    assert_eq!(
+        unsafe { mr_found_volume_open(t, 0, 2, &mut vs) },
+        MR_ERR_INVALID_ARGUMENT
+    );
+    assert_eq!(
+        unsafe { mr_found_volume_open(t, 0, 0, std::ptr::null_mut()) },
+        MR_ERR_INVALID_ARGUMENT
+    );
+    assert_eq!(
+        found_anomaly(t, MR_PARTITION_TABLE, 0).unwrap_err(),
+        MR_ERR_OUT_OF_RANGE
+    );
+    let mut ft = MrFoundTable {
+        struct_size: std::mem::size_of::<MrFoundTable>() as u32,
+        ..Default::default()
+    };
+    assert_eq!(
+        unsafe { mr_found_table_get(t, 0, &mut ft) },
+        MR_ERR_OUT_OF_RANGE
+    );
+    // Una tabla de particiones o un origen no son búsquedas; una búsqueda no es otra tarea.
+    assert_eq!(found_volume(src, 0).unwrap_err(), MR_ERR_INVALID_HANDLE);
+    assert_eq!(search_info(src).unwrap_err(), MR_ERR_INVALID_HANDLE);
+    let mut r = MrVerifyReport::default();
+    assert_eq!(
+        unsafe { mr_verify_result(t, &mut r) },
+        MR_ERR_INVALID_HANDLE
+    );
+    // El origen puede cerrarse: el volumen se abre igualmente desde la búsqueda.
+    assert_eq!(mr_source_close(src), MR_OK);
+    assert_eq!(unsafe { mr_found_volume_open(t, 1, 0, &mut vs) }, MR_OK);
+    assert_eq!(mr_source_close(vs), MR_OK);
+    assert_eq!(mr_task_free(t), MR_OK);
+    assert_eq!(search_info(t).unwrap_err(), MR_ERR_INVALID_HANDLE);
+}
+
+#[test]
+fn partition_search_options_are_versioned_and_validated() {
+    let (_d, src) = search_source(&lost_disk(0));
+    let mut o = search_options_default();
+    o.struct_size = 60;
+    assert_eq!(start_search(src, Some(&o)), Err(MR_ERR_INVALID_ARGUMENT));
+    assert!(last_error().contains("mr_partition_search_options"));
+    for f in [
+        |o: &mut MrPartitionSearchOptions| o.flags = 1,
+        |o: &mut MrPartitionSearchOptions| o.reserved = 1,
+        |o: &mut MrPartitionSearchOptions| o.probe_window = 1000,
+        |o: &mut MrPartitionSearchOptions| o.families = 64,
+        |o: &mut MrPartitionSearchOptions| o.max_reads = u64::MAX,
+    ] {
+        let mut o = search_options_default();
+        f(&mut o);
+        assert_eq!(start_search(src, Some(&o)), Err(MR_ERR_INVALID_ARGUMENT));
+    }
+    let mut t = 0u64;
+    assert_eq!(
+        unsafe { mr_source_partition_search_start(src, std::ptr::null(), std::ptr::null_mut()) },
+        MR_ERR_INVALID_ARGUMENT
+    );
+    assert_eq!(
+        unsafe { mr_source_partition_search_start(999_999, std::ptr::null(), &mut t) },
+        MR_ERR_INVALID_HANDLE
+    );
+    // Presupuesto pequeño: resultado parcial informado.
+    let mut o = search_options_default();
+    o.max_reads = 3;
+    let t = start_search(src, Some(&o)).unwrap();
+    assert_eq!(wait(t).state, TaskState::Completed as u32);
+    let i = search_info(t).unwrap();
+    assert_eq!((i.status, i.max_reads), (MR_SEARCH_BUDGET_EXHAUSTED, 3));
+    assert!(i.reads <= 3 && i.pending > 0);
+    assert_eq!(mr_task_free(t), MR_OK);
+    // Solo exFAT: los NTFS no aparecen.
+    let mut o = search_options_default();
+    o.families = MR_SEARCH_FAMILY_EXFAT;
+    let t = start_search(src, Some(&o)).unwrap();
+    wait(t);
+    assert_eq!(search_info(t).unwrap().volume_count, 0);
+    assert_eq!(mr_task_free(t), MR_OK);
+    assert_eq!(mr_source_close(src), MR_OK);
+}
+
+#[test]
+fn shifted_search_reports_the_shift_and_opens_only_on_request() {
+    let (_d, src) = search_source(&lost_disk(16));
+    let t = start_search(src, None).unwrap();
+    wait(t);
+    let i = search_info(t).unwrap();
+    assert_eq!((i.volume_count, i.anomaly_count), (2, 1));
+    assert_eq!((i.flags, i.shift_bytes), (MR_SEARCH_HAS_SHIFT, 16 * 512));
+    let (a, text) = found_anomaly(t, MR_PARTITION_TABLE, 0).unwrap();
+    assert_eq!((a.code, a.lba as i64, a.value as i64), (320, 16, -16));
+    assert_eq!(
+        a.flags,
+        MR_ANOMALY_LBA_SIGNED | MR_ANOMALY_HAS_VALUE | MR_ANOMALY_VALUE_SIGNED
+    );
+    assert!(text.starts_with("image_shifted\n"), "{text}");
+    let v = found_volume(t, 0).unwrap();
+    assert_eq!(v.flags & MR_FOUND_REQUIRES_SHIFT, MR_FOUND_REQUIRES_SHIFT);
+    assert_eq!((v.start_lba, v.declared_start), (2064, 2048));
+    assert_eq!(v.confidence, MR_CONFIDENCE_SUSPICIOUS);
+    let texts: Vec<String> = (0..v.anomaly_count)
+        .map(|k| found_anomaly(t, 0, k).unwrap().1)
+        .collect();
+    assert!(
+        texts
+            .iter()
+            .any(|x| x.starts_with("found_shift_detected\n")),
+        "{texts:?}"
+    );
+    let mut vs = 0u64;
+    assert_eq!(
+        unsafe { mr_found_volume_open(t, 0, 0, &mut vs) },
+        MR_ERR_INVALID_ARGUMENT
+    );
+    assert!(
+        last_error().contains("desplazada 16 sectores"),
+        "{}",
+        last_error()
+    );
+    assert_eq!(
+        unsafe { mr_found_volume_open(t, 0, MR_PARTITION_OPEN_APPLY_SHIFT, &mut vs) },
+        MR_OK
+    );
+    assert!(describe(vs).contains("desplazamiento detectado aplicado"));
+    assert_eq!(mr_source_close(vs), MR_OK);
+    assert_eq!(mr_task_free(t), MR_OK);
+    assert_eq!(mr_source_close(src), MR_OK);
+}
+
+#[test]
+fn cancelled_search_keeps_its_partial_result() {
+    // Imagen dispersa grande: la búsqueda tarda lo bastante para cancelarla a mitad.
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("big.img");
+    let f = std::fs::File::create(&p).unwrap();
+    f.set_len(2 << 30).unwrap();
+    drop(f);
+    let src = open(p.to_str().unwrap(), 512, 0).unwrap();
+    let t = start_search(src, None).unwrap();
+    assert_eq!(mr_task_cancel(t), MR_OK);
+    let st = wait(t);
+    let i = search_info(t).unwrap();
+    if st.state == TaskState::Cancelled as u32 {
+        assert_eq!(i.status, MR_SEARCH_CANCELLED);
+    } else {
+        assert_eq!(st.state, TaskState::Completed as u32);
+        assert_eq!(i.status, MR_SEARCH_COMPLETE);
+    }
+    assert_eq!(i.volume_count, 0);
+    assert_eq!(mr_task_free(t), MR_OK);
+    assert_eq!(mr_source_close(src), MR_OK);
+}

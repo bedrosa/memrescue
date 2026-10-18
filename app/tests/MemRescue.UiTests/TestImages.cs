@@ -81,6 +81,9 @@ public sealed class TestImages : IDisposable
     /// <summary>MBR con una cadena de EBR en bucle (anomalía <c>ebr_loop</c>).</summary>
     public string MbrEbrLoop => Path.Combine(Directory, "mbr_ebr_loop.img");
 
+    /// <summary>MBR a cero con NTFS, FAT32 y exFAT consecutivos (búsqueda de particiones perdidas, #15).</summary>
+    public string LostChainThree => Path.Combine(Directory, "lost_chain_three.img");
+
     /// <summary>gpt_basic.img envuelto en un VHD fijo.</summary>
     public string GptBasicVhd => Path.Combine(Directory, "gpt_basic.vhd");
 

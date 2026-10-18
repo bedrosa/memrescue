@@ -482,3 +482,106 @@ fn partition_option_opens_a_partition_for_sectors_and_verify() {
         .unwrap();
     assert_eq!(o.status.code(), Some(2));
 }
+
+/// Disco sin tabla con un NTFS sintético en la LBA 2048 (copia en su último sector, 4095).
+fn lost_ntfs_image(dir: &std::path::Path) -> std::path::PathBuf {
+    let mut d = vec![0u8; 4096 * 512];
+    let mut b = vec![0u8; 512];
+    b[..3].copy_from_slice(&[0xEB, 0x52, 0x90]);
+    b[3..11].copy_from_slice(b"NTFS    ");
+    b[0x0B..0x0D].copy_from_slice(&512u16.to_le_bytes());
+    b[0x0D] = 8;
+    b[0x15] = 0xF8;
+    b[0x1C..0x20].copy_from_slice(&2048u32.to_le_bytes());
+    b[0x28..0x30].copy_from_slice(&2047u64.to_le_bytes());
+    b[0x30..0x38].copy_from_slice(&4u64.to_le_bytes());
+    b[0x38..0x40].copy_from_slice(&128u64.to_le_bytes());
+    b[0x40] = 0xF6;
+    b[0x44] = 1;
+    b[0x48..0x50].copy_from_slice(&0xABCDu64.to_le_bytes());
+    b[0x1FE] = 0x55;
+    b[0x1FF] = 0xAA;
+    d[2048 * 512..2049 * 512].copy_from_slice(&b);
+    d[4095 * 512..4096 * 512].copy_from_slice(&b);
+    let p = dir.join("lost.img");
+    std::fs::write(&p, d).unwrap();
+    p
+}
+
+#[test]
+fn find_partitions_lists_found_volumes_with_indicators() {
+    let dir = tempfile::tempdir().unwrap();
+    let img = lost_ntfs_image(dir.path());
+    let f = img.to_str().unwrap();
+    let o = cli().args(["find-partitions", f]).output().unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(out.contains("Búsqueda exprés: completa"), "{out}");
+    assert!(out.contains("encontrada  NTFS"), "{out}");
+    assert!(out.contains("Ex P+ C+ Sx U+ A+"), "{out}");
+    assert!(out.contains("válida"), "{out}");
+    let o = cli()
+        .args(["find-partitions", f, "--json", "--max-reads", "100"])
+        .output()
+        .unwrap();
+    assert!(o.status.success());
+    let json = String::from_utf8_lossy(&o.stdout);
+    assert!(json.starts_with("{\"status\":\"complete\""), "{json}");
+    assert!(json.contains("\"max_reads\":100"), "{json}");
+    assert!(
+        json.contains("\"fs\":\"ntfs\",\"start_byte\":1048576,\"length_bytes\":1048576,\"start_lba\":2048,\"sectors\":2048,\"end_lba\":4095"),
+        "{json}"
+    );
+    assert!(
+        json.contains("\"primary\":\"yes\",\"backup\":\"yes\""),
+        "{json}"
+    );
+    assert!(json.contains("\"serial\":\"000000000000abcd\""), "{json}");
+    assert!(json.contains("\"tier\":\"p2\""), "{json}");
+    // Presupuesto mínimo: resultado parcial informado (no es un error).
+    let o = cli()
+        .args(["find-partitions", f, "--json", "--max-reads", "1"])
+        .output()
+        .unwrap();
+    assert!(o.status.success());
+    assert!(String::from_utf8_lossy(&o.stdout).starts_with("{\"status\":\"budget_exhausted\""));
+}
+
+#[test]
+fn found_option_opens_a_found_volume() {
+    let dir = tempfile::tempdir().unwrap();
+    let img = lost_ntfs_image(dir.path());
+    let f = img.to_str().unwrap();
+    let o = cli()
+        .args(["sectors", f, "--found", "1", "--lba", "0"])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(String::from_utf8_lossy(&o.stdout).contains("EB 52 90 4E 54 46 53 20"));
+    assert!(String::from_utf8_lossy(&o.stderr)
+        .contains("Volumen encontrado 1: Volumen encontrado NTFS LBA 2048–4095"));
+    let o = cli()
+        .args(["verify", f, "--found", "1", "--json"])
+        .output()
+        .unwrap();
+    assert!(o.status.success());
+    assert!(String::from_utf8_lossy(&o.stdout).contains("\"sectors\":2048,\"ok\":2048,\"bad\":0"));
+    // Volumen inexistente: error de operación; usos incorrectos: código 2.
+    let o = cli()
+        .args(["image-info", f, "--found", "2"])
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("no existe el volumen encontrado 2"));
+    for args in [
+        vec!["image-info", f, "--found", "0"],
+        vec!["image-info", f, "--found", "1", "--partition", "1"],
+        vec!["image-info", f, "--found", "1", "--range", "0:8"],
+        vec!["find-partitions", f, "--found", "1"],
+        vec!["find-partitions", f, "--max-reads", "0"],
+        vec!["find-partitions", f, "--max-reads", "x"],
+    ] {
+        let o = cli().args(&args).output().unwrap();
+        assert_eq!(o.status.code(), Some(2), "{args:?}");
+    }
+}

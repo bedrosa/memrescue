@@ -4,10 +4,13 @@
 //! que `cargo test` sin corpus no falle; el script las ejecuta explícitamente con `--ignored`.
 //! Comprueban que el motor (Rust) coincide con implementaciones independientes (Python):
 //! SHA-256 (`sha2` vs `hashlib`) y CRC-32 (`crc32fast` vs `zlib`). Las tablas de particiones
-//! se comparan con los manifiestos en el módulo `partitions`.
+//! se comparan con los manifiestos en el módulo `partitions` y la búsqueda de particiones perdidas
+//! en el módulo `search`.
 
 #[path = "corpus/partitions.rs"]
 mod partitions;
+#[path = "corpus/search.rs"]
+mod search;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

@@ -283,8 +283,8 @@ separados). Falta un oráculo de terceros (`sgdisk`/`sfdisk`), que requiere WSL 
 estructuras que consulta la búsqueda (arranque, copia, FSInfo, región de arranque exFAT, cabecera de las
 FAT y etiqueta de FAT32), sin MFT ni árbol de directorios. Los sectores ilegibles no se pueden
 representar en un fichero RAW: la prueba debe envolver la imagen con `FaultyDevice` en `unreadable_lbas`.
-Quedan para #15 los casos de presupuesto, cancelación, escala (imágenes dispersas de 1 GiB y 2 TiB) y
-«todo relleno de ilegible», que dependen del motor y no del corpus.
+Los casos de presupuesto, cancelación, escala (1 GiB y 2 TiB) y «todo relleno de ilegible», que dependen
+del motor y no del corpus, los cubre #15 (ver más abajo).
 
 Tablas MBR/EBR (issue #12, ADR-022):
 
@@ -329,6 +329,29 @@ Tablas MBR/EBR (issue #12, ADR-022):
   completo por la DLL, incluida la lectura del marcador de cada partición abierta) e interfaz
   (`PartitionUiTests`, 3 pruebas, una con `gpt_basic`). La prueba C# del corpus compara la tabla
   completa (MBR y GPT) y abre cada partición GPT comprobando su marcador.
+
+Búsqueda exprés de particiones perdidas (issue #15, ADR-023, `formatos/busqueda-particiones.md`),
+pruebas por fila del plan de INV-05b §9:
+
+| Fila de INV-05b §9 | Pruebas |
+|---|---|
+| Volúmenes perdidos (`lost_ntfs_mbr_zeroed`, `lost_fat32_chs`, `lost_exfat_1mib`, `lost_chain_three`) | `core/mr-part/tests/search_corpus.rs` (`--ignored`): `found_volumes_match_every_manifest` compara los `[[found_volumes]]` de los **38** manifiestos (18 volúmenes: `fs`, `start_lba`, `sectors`, `end_lba`, `hidden_sectors`, `boot_lba`, `backup_boot_lba`, `primary_boot`, `backup_boot`, `evidence`, `partial`, `serial`, `suggested_mbr_type`, confianza y anomalías `image_shifted`/`mbr_displaced`; nada más) y `scenario_details` el nivel que encuentra cada uno (P2 rejilla, LBA 63 CHS, tercero por encadenamiento P1) e indicadores; la CLI (`cli/tests/corpus/search.rs`, 2) y C# (`PartitionSearchCorpusTests`, 38 casos) repiten la comparación |
+| Principal dañada (`ntfs_`, `fat32_`, `exfat_primary_damaged`) | `scenario_details`: sospechosos con `found_primary_damaged`; el NTFS se encuentra por su copia al final (P4) |
+| `primary_unreadable`, `backup_unreadable` (`unreadable_lbas`) | Con `FaultyDevice`: «?» y `found_*_unreadable`, nunca el relleno; `unreadable_boot_structures_never_yield_volumes` hace ilegibles **todas** las estructuras de arranque de cada volumen del corpus (ninguno aparece); unitaria `unreadable_fill_that_mimics_a_boot_sector_is_never_evidence` (relleno que es un arranque NTFS perfecto) |
+| Imágenes desplazadas (`image_shifted_pos`/`_neg`) | Corpus (desplazamiento ±, tabla en la LBA 8, NTFS parcial); unitaria `shift_needs_two_independent_pieces_of_evidence`; apertura solo con `apply_shift` en mr-api, FFI (`shifted_search_reports_the_shift_and_opens_only_on_request`), CLI (`--found 2` con y sin `--apply-shift`, parcial rechazado) y C# |
+| `gpt_4kn_lost` | Corpus con 4096 B y `gpt_4kn_lost_read_as_512_reports_sector_size` (mismos bytes, `found_sector_size_mismatch`); CLI `--sector-size 512 --found 1` |
+| `superfloppy`, tablas intactas | Corpus (P0 en el byte 0; ninguna imagen con tabla produce volúmenes ni tablas encontradas); unitaria `table_partition_is_marked_not_duplicated` (`tabla #1`, sin duplicado) |
+| Negativos (`empty_disk`, `random_disk`, señuelo) | Corpus (0 volúmenes; `decoy_lbas` nunca son tablas); unitaria `decoy_table_inside_valid_partition_is_ignored` |
+| Presupuesto | `small_budget_is_respected_and_reported` (1, 2, 3, mitad y total - 1 lecturas y presupuesto de bytes: `BudgetExhausted`, lecturas del origen ≤ límite, pendientes, determinista); `grid_tiers_respect_their_quota`; FFI, CLI (`--max-reads 1`) y C# |
+| Cancelación | `cancellation_stops_before_the_next_read` (tras 0, 1, 3, 7 y 12 lecturas: ninguna más); mr-api (tarea cancelada con resultado), FFI y C# |
+| Escala | `reads_do_not_grow_with_disk_size`: dispositivo virtual de 1 GiB y de 2 TiB con el mismo contenido, mismo resultado y lecturas contadas en el origen iguales (± 4) |
+| Determinismo | `search_is_deterministic`: dos ejecuciones por manifiesto, misma secuencia de lecturas del origen (envoltorio que las registra) y mismo resultado |
+| Reconocedores y fuzzing | 3 unitarias de reconocedores (cada campo fuera de rango, suma exFAT, coherencia), `recognizers_never_panic_on_mutations` (6000 sectores) y `search_fuzz_is_bounded` (150 discos mutados) |
+
+Total: 16 unitarias y 7 de corpus en mr-part, 3 en mr-api, 5 en mr-ffi, 2 de CLI más 2 de corpus,
+5 + 38 casos en C# y 1 de UI Automation. Las pruebas de corpus de Rust se ejecutan en los pasos ya
+existentes (`cargo test -p mr-part -- --ignored` y `cargo test -p memrescue-cli --test corpus --
+--ignored`), sin pasos nuevos.
 
 ## 7. Registro
 

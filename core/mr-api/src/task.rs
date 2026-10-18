@@ -32,6 +32,8 @@ pub struct TaskContext {
     cancel: AtomicBool,
     done: AtomicU64,
     total: AtomicU64,
+    /// La operación atendió la cancelación y devuelve un resultado parcial (`Ok`).
+    partial: AtomicBool,
 }
 
 impl TaskContext {
@@ -53,6 +55,11 @@ impl TaskContext {
     }
     pub fn total(&self) -> u64 {
         self.total.load(Ordering::Relaxed)
+    }
+    /// Marca que la operación se canceló pero entrega un resultado parcial válido: la tarea
+    /// termina en [`TaskState::Cancelled`] y [`Task::wait`] devuelve ese resultado (`Ok`).
+    pub fn finish_cancelled_with_result(&self) {
+        self.partial.store(true, Ordering::Relaxed);
     }
 }
 
@@ -88,6 +95,7 @@ impl<T: Send + 'static> Task<T> {
                     )),
                 };
                 let st = match &r {
+                    Ok(_) if t.ctx.partial.load(Ordering::Relaxed) => TaskState::Cancelled,
                     Ok(_) => TaskState::Completed,
                     Err(ApiError::Cancelled) => TaskState::Cancelled,
                     Err(_) => TaskState::Failed,
@@ -159,6 +167,23 @@ mod tests {
         assert!(matches!(t.wait(), Err(ApiError::Cancelled)));
         assert_eq!(t.state(), TaskState::Cancelled);
         assert!(t.progress().0 < 1_000_000);
+    }
+
+    /// Una operación que atiende la cancelación con un resultado parcial termina cancelada y
+    /// conserva el resultado.
+    #[test]
+    fn cancelled_with_partial_result_keeps_it() {
+        let t = Task::spawn(|ctx| {
+            while !ctx.is_cancelled() {
+                thread::sleep(Duration::from_millis(1));
+            }
+            ctx.finish_cancelled_with_result();
+            Ok(7u32)
+        })
+        .unwrap();
+        t.cancel();
+        assert_eq!(t.wait().unwrap(), 7);
+        assert_eq!(t.state(), TaskState::Cancelled);
     }
 
     #[test]

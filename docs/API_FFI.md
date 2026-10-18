@@ -151,6 +151,32 @@ equivalente; 122 `hybrid_mbr_mismatch`); 201-241 GPT (las de una copia: impar la
 `PartitionTable` (`EngineHandle`: listas materializadas de `PartitionEntry` y `PartitionAnomaly`, `HasGpt`,
 `GptSelected`, `Shift`, `DiskGuid`, `OpenPartition(index, applyShift)`).
 
+## Búsqueda exprés de particiones perdidas (ampliación compatible de la ABI 3, issue #15, ADR-023)
+
+Funciones nuevas; ninguna firma, estructura ni significado existente cambia. La búsqueda es una
+**tarea** (mismo registro y mismas funciones comunes: `mr_task_status_get` con progreso = lecturas
+hechas / `max_reads`, `mr_task_cancel`, `mr_task_free`) y su resultado se consulta **por índice** con
+estructuras de salida versionadas por `struct_size`. Al cancelarla, la tarea termina en estado
+cancelado (4) **con** resultado parcial (`status = MR_SEARCH_CANCELLED`); las demás tareas no cambian.
+Detalle del algoritmo, indicadores y confianza en `formatos/busqueda-particiones.md`.
+
+| Función | Descripción |
+|---|---|
+| `mr_source_partition_search_start(source, options, out_task)` | Lee la tabla del origen y lanza la búsqueda. `options` (`mr_partition_search_options`, 64 B, versionada) puede ser `NULL`; cada campo a 0 toma su valor por defecto (`max_reads` 4096, `max_bytes` 32 MiB, `start_grid_bytes` 64 MiB, `end_grid_bytes` 16 MiB, `max_volumes` 256, `probe_window` 8192, `cylinders` 64, `probes_per_gap` 8, `families` = todas `MR_SEARCH_FAMILY_*`); `flags` y `reserved` deben ser 0; valores fuera de límites → `MR_ERR_INVALID_ARGUMENT` antes de lanzar nada |
+| `mr_partition_search_result(task, out)` | `mr_partition_search_info` (96 B): `status` (`MR_SEARCH_COMPLETE` 1, `BUDGET_EXHAUSTED` 2, `CANCELLED` 3), recuentos de volúmenes, tablas encontradas y anomalías de la búsqueda, `flags` (`MR_SEARCH_HAS_SHIFT`, `MR_SEARCH_VOLUME_LIMIT`), `shift_bytes` (con signo), lecturas, `max_reads`, bytes, sectores no verificables, candidatos sondeados y pendientes, sector y sectores del origen |
+| `mr_found_volume_get(task, index, out)` | `mr_found_volume` (136 B): `fs` (`MR_FS_*`), `start_byte` y `start_lba` con signo, longitud, sectores, sector del FS, `confidence`, los seis indicadores (`MR_CHECK_YES` 1, `NO` 2, `UNVERIFIABLE` 3, `OUTSIDE` 4, `NOT_APPLICABLE` 5), nivel (0-4 = P0-P4), `flags` (`MR_FOUND_PARTIAL`, `LISTED`, `REQUIRES_SHIFT`, `HAS_BACKUP`), partición de la tabla y tabla encontrada que lo describen (`MR_PARTITION_TABLE` si ninguna), posiciones de principal y copia, inicio declarado, número de serie, tipo MBR sugerido y puntuación |
+| `mr_found_volume_origin(task, index, buf, cap, out_len)` | Qué candidato propuso el volumen (texto) |
+| `mr_found_volume_anomaly(task, volume_index, anomaly_index, out)` | `mr_partition_anomaly` de un volumen (códigos 301-314) o, con `volume_index = MR_PARTITION_TABLE`, de la búsqueda (`image_shifted` 320, `mbr_displaced` 321). `lba` es `int64_t` (`MR_ANOMALY_LBA_SIGNED`) y `value` también (`MR_ANOMALY_VALUE_SIGNED`) |
+| `mr_found_volume_anomaly_text(...)` | `"<código estable>\n<descripción>"` |
+| `mr_found_table_get(task, index, out)` | `mr_found_table` (32 B): `kind` (`MR_FOUND_TABLE_MBR` 1, `GPT` 2), `lba`, `declared_lba` (`MyLBA`), nº de entradas |
+| `mr_found_volume_open(task, index, flags, out_source)` | El volumen como origen (`RangeView` sobre el origen de la búsqueda, que se conserva aunque se cierre). Parcial o desalineado: `MR_ERR_INVALID_ARGUMENT` siempre; con `MR_FOUND_REQUIRES_SHIFT`, solo con `MR_PARTITION_OPEN_APPLY_SHIFT` (la descripción dice «desplazamiento detectado aplicado»); si termina fuera del origen se abre la parte existente |
+
+Consultar el resultado antes del final → `MR_ERR_NOT_FINISHED`; handle de otro tipo →
+`MR_ERR_INVALID_HANDLE`; índice fuera de límites → `MR_ERR_OUT_OF_RANGE`. En C#:
+`Source.StartPartitionSearch(PartitionSearchOptions?)` devuelve `PartitionSearchTask` (`EngineTask`) con
+`GetResult()` (`PartitionSearchResult` con `FoundVolume`, `FoundTable` y anomalías) y
+`OpenVolume(index, applyShift)`.
+
 ## Modo tolerante de contenedores (`MR_OPEN_TOLERANT`, ADR-020)
 
 Ampliación compatible de la ABI 3 (nuevo bit de `flags`; las estructuras y la versión no cambian). Sin el
@@ -182,7 +208,7 @@ después de liberarlos.
 
 ## Pruebas que garantizan el contrato
 
-- Rust (`core/mr-ffi/src/tests.rs`, 28 pruebas): tamaños de estructuras (incluidas las de particiones), tabla GPT sintética (copia, GUID de disco, nombre, GUID único, nombre de tipo, apertura) y GPT desplazada (copia de respaldo, `image_shifted` con signo, apertura rechazada sin `MR_PARTITION_OPEN_APPLY_SHIFT` y correcta con él), tablas de particiones por índice (esquema, confianza, anomalías de tabla y de partición, nombres de tipo con búfer pequeño, apertura de una partición y de una recortada, tabla que sobrevive a su origen, `struct_size` incorrecto, punteros nulos, handles de otro tipo, EBR ilegible como anomalía), verificación extendida con
+- Rust (`core/mr-ffi/src/tests.rs`, 33 pruebas): búsqueda de particiones perdidas (tamaños y desplazamientos de las 4 estructuras, flujo completo con apertura de volúmenes también tras cerrar el origen, opciones versionadas y validadas, presupuesto agotado, familias, desplazamiento con anomalías con signo y apertura solo con `MR_PARTITION_OPEN_APPLY_SHIFT`, cancelación con resultado parcial, handles de otro tipo), tamaños de estructuras (incluidas las de particiones), tabla GPT sintética (copia, GUID de disco, nombre, GUID único, nombre de tipo, apertura) y GPT desplazada (copia de respaldo, `image_shifted` con signo, apertura rechazada sin `MR_PARTITION_OPEN_APPLY_SHIFT` y correcta con él), tablas de particiones por índice (esquema, confianza, anomalías de tabla y de partición, nombres de tipo con búfer pequeño, apertura de una partición y de una recortada, tabla que sobrevive a su origen, `struct_size` incorrecto, punteros nulos, handles de otro tipo, EBR ilegible como anomalía), verificación extendida con
   códigos de error simulados (origen `FaultyDevice` registrado con `mr_api::source_from_device`) y
   validación de `mr_verify_options`, protocolo de búfer pequeño, rutas
   de dispositivo, UTF-8 inválido, punteros nulos y cadenas desmesuradas, handles inválidos o de otro
@@ -195,5 +221,5 @@ después de liberarlos.
 - C# (`app/tests/MemRescue.Core.Interop.Tests`): los mismos contratos desde .NET contra la DLL
   real (política de errores y `ErrorCodeList` en `VerifyPolicyTests`; patrones de relleno, preferencias y
   paleta en `FillPatternTests`, incluidos VHD fijo construido según la especificación, descriptor VMDK malicioso, rangos, estados y
-  divididas y modo tolerante con un VHD dinámico dañado; particiones en `PartitionTests` con un disco MBR sintético y el corpus completo), finalizadores, rutas no ASCII, cancelación, base de datos de trabajo, inmutabilidad del origen y el
+  divididas y modo tolerante con un VHD dinámico dañado; particiones en `PartitionTests` con un disco MBR sintético y el corpus completo; búsqueda de particiones perdidas en `PartitionSearchTests` con discos sintéticos y los 38 manifiestos), finalizadores, rutas no ASCII, cancelación, base de datos de trabajo, inmutabilidad del origen y el
   corpus sintético (lectura de marcadores en LBA exactas y cabeceras GPT).
