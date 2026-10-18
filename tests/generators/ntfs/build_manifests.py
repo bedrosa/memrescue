@@ -5,7 +5,7 @@ Uso (en el ejecutor de GitHub Actions, tras generate.sh):
     python3 -I build_manifests.py <dir_generado> <dir_manifiestos_salida> [--compare-with <otro_dir_generado>]
                                   [--tsk-dump <dir>]
 
-La verdad de cada manifiesto sale de la salida de TSK (`mmls`, `fsstat`, `istat -r`, `icat`, `ifind`):
+La verdad de cada manifiesto sale de la salida de TSK (`mmls`, `fsstat`, `istat -r`, `icat`):
 registros MFT, estado de asignación, nombres y rutas (cadena de padres de `$FILE_NAME`), tamaños,
 residencia, runs, rangos dispersos, flujos alternativos y SHA-256 del contenido que devuelve `icat`.
 MemRescue no interviene. La intención que escribió el generador (`intent/*.intent.json`) solo se usa
@@ -116,11 +116,6 @@ class Tsk:
     def icat(self, n: int, type_id: int, attr_id: int) -> bytes:
         r = self.run(self.base("icat") + [str(self.image), f"{n}-{type_id}-{attr_id}"], binary=True)
         return r.stdout
-
-    def ifind_block(self, lcn: int) -> int | None:
-        out = self.run(self.base("ifind") + ["-d", str(lcn), str(self.image)], check=False)
-        m = re.match(r"\s*(\d+)", out)
-        return int(m.group(1)) if m else None
 
 
 def mmls(image: Path, dump: Path | None) -> dict:
@@ -331,9 +326,24 @@ def stream_entry(tsk: Tsk, n: int, attr: dict, cluster: int) -> tuple[dict, byte
     return e, data
 
 
-def classify(tsk: Tsk, n: int, entry: dict, data: bytes, spec: dict, cluster: int, by_record: dict[int, str]) -> None:
-    """Compara cluster a cluster lo que devuelve TSK con el contenido original del generador."""
+def cluster_owners(records: dict[int, dict]) -> list[tuple[int, int, int]]:
+    """Tramos [lcn, lcn_fin) de los atributos no residentes de los registros asignados, según TSK."""
+    out = []
+    for rn, info in records.items():
+        if not info["allocated"]:
+            continue
+        for a in info["attrs"]:
+            if not a["resident"] and a["raw_runs"]:
+                runs, _ = normalize_runs(a["raw_runs"])
+                out += [(lcn, lcn + count, rn) for _, lcn, count in runs]
+    return out
+
+
+def classify(n: int, entry: dict, data: bytes, spec: dict, cluster: int, records: dict[int, dict]) -> None:
+    """Compara cluster a cluster lo que devuelve TSK con el contenido original del generador e
+    identifica, con los runs de TSK de los registros asignados, a quién pertenecen ahora."""
     original = content(spec)
+    owners_map = cluster_owners(records)
     total, bad, owners = 0, 0, set()
     for vcn, lcn, count in entry.get("runs", []):
         for i in range(count):
@@ -343,9 +353,9 @@ def classify(tsk: Tsk, n: int, entry: dict, data: bytes, spec: dict, cluster: in
             total += 1
             if data[start:start + cluster] != original[start:start + cluster]:
                 bad += 1
-                owner = tsk.ifind_block(lcn + i)
-                if owner is not None and owner != n:
-                    owners.add(by_record.get(owner, f"registro {owner}"))
+                for lo, hi, rn in owners_map:
+                    if lo <= lcn + i < hi and rn != n:
+                        owners.add(resolve_path(rn, records) or f"registro {rn}")
     if total == 0:
         raise Fail(f"registro {n}: contenido distinto del original sin clusters que comparar")
     entry["state"] = "overwritten"
@@ -354,14 +364,13 @@ def classify(tsk: Tsk, n: int, entry: dict, data: bytes, spec: dict, cluster: in
     entry["sha256"] = hashlib.sha256(original).hexdigest()
     entry["clusters"] = total
     entry["overwritten_clusters"] = bad
-    who = ", ".join(sorted(owners)) if owners else "ningún fichero asignado"
-    entry["reason"] = f"{bad} de {total} clusters con otro contenido; asignados ahora a {who}"
+    who = ", ".join(sorted(owners)) if owners else "ningún fichero"
+    entry["reason"] = f"{bad} de {total} clusters con otro contenido, asignados ahora a {who}"
 
 
 def build_files(tsk: Tsk, vol: dict, records: dict[int, dict], intent: dict, errors: list[str]) -> list[dict]:
     cluster = vol["cluster_size"]
     paths = user_records(records)
-    by_record = {n: p for p, ns in paths.items() for n in ns}
     wanted = {e["path"]: e for e in intent["entries"]}
     for p in sorted(set(paths) - set(wanted)):
         errors.append(f"TSK ve {p} (registros {paths[p]}) y el generador no lo creó")
@@ -404,7 +413,7 @@ def build_files(tsk: Tsk, vol: dict, records: dict[int, dict], intent: dict, err
                 elif s["resident"]:
                     errors.append(f"{path}: borrado residente con contenido distinto")
                 else:
-                    classify(tsk, n, e, data, want["content"], cluster, by_record)
+                    classify(n, e, data, want["content"], cluster, records)
             if want["expect"] == "overwrite_target" and e["recoverable"] == "full":
                 errors.append(f"{path}: debía quedar sobrescrito y TSK lo recupera íntegro")
             if want["expect"] == "deleted" and e["recoverable"] != "full":

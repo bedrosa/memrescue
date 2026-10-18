@@ -51,12 +51,12 @@ jobs:
         run: diff -r out/manifests out/manifests-b
       - name: Byte reproducibility report (run A against run B)
         run: diff out/a/SHA256SUMS out/b/SHA256SUMS && echo "byte-identical" || echo "images differ between runs"
+      - name: Independent re-check of the manifests with The Sleuth Kit
+        run: python3 -I tests/generators/ntfs/verify_tsk.py out/a/images out/manifests
+      - name: Structural validator (Python, no TSK, no generator code)
+        run: python3 -I -X utf8 tests/generators/validate_ntfs_images.py out/a/images out/manifests
       - name: Committed manifests match the TSK truth of this run
         run: diff -r tests/corpus/ntfs/manifests out/manifests
-      - name: Independent re-check of the committed manifests with The Sleuth Kit
-        run: python3 -I tests/generators/ntfs/verify_tsk.py out/a/images tests/corpus/ntfs/manifests
-      - name: Structural validator (Python, no TSK, no generator code)
-        run: python3 -I -X utf8 tests/generators/validate_ntfs_images.py out/a/images tests/corpus/ntfs/manifests
       - name: Provenance
         if: always()
         run: |
