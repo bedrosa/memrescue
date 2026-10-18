@@ -92,6 +92,11 @@ confirmación explícita del usuario o descomprimir; hoy se rechazan con errores
 ## M2 · Particiones: **EN CURSO** (plan técnico en `PLAN_M2.md`)
 
 - INV-05 (acotada) → MBR/EBR, GPT con copia y tolerancias, APM.
+  - **MBR/EBR: hecho (#12)**: parser con confianza y anomalías tipadas, API, ABI 3 ampliada, CLI
+    `partitions` / `--partition N` y pestaña «Particiones» en la interfaz (ADR-022).
+  - **GPT con copia y tolerancias: hecho (#13)** e **integrado (#12)**: particiones GPT, copia de respaldo
+    en uso y desplazamiento en API, ABI, CLI (`--apply-shift`) e interfaz (ADR-022, adenda).
+  - APM: #17 (opcional).
 - Búsqueda exprés de particiones perdidas (boot sectors/superbloques en ubicaciones típicas).
 - Indicadores de estructuras.
 - **Paridad objetivo**: PT-01…PT-06, PT-10 (lectura/guardar).

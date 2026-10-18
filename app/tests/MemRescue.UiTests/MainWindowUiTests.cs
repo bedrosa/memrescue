@@ -115,7 +115,7 @@ public sealed class MainWindowUiTests(TestImages images)
 
         var partitions = app.OpenMenuItem("DiskMenu", "PartitionsMenuItem");
         Assert.Equal("Particiones…", partitions.Current.Name);
-        Assert.False(partitions.Current.IsEnabled, "«Particiones…» debe estar deshabilitado (pendiente, M2).");
+        Assert.True(partitions.Current.IsEnabled, "«Particiones…» está habilitado desde M2 (lista de particiones).");
         app.CloseMenu("DiskMenu");
 
         var goTo = app.OpenMenuItem("EditorMenu", "GoToSectorMenuItem");

@@ -18,6 +18,12 @@ internal static partial class NativeMethods
     internal const uint VerifyIgnoreAllErrors = 2;
     internal const int MaxSkipCodes = 256;
     internal const uint ReadReadBack = 1;
+    internal const uint PartitionTableLevel = 0xFFFF_FFFF;
+    internal const uint AnomalyHasTarget = 1;
+    internal const uint AnomalyHasValue = 2;
+    internal const uint AnomalyValueSigned = 4;
+    internal const uint GptPresent = 1;
+    internal const uint PartitionOpenApplyShift = 1;
 
     [LibraryImport(Dll)]
     internal static partial uint mr_abi_version();
@@ -94,6 +100,36 @@ internal static partial class NativeMethods
 
     [LibraryImport(Dll)]
     internal static partial int mr_verify_untrusted_range(ulong task, ulong index, out ulong lba, out ulong count, out uint state);
+
+    [LibraryImport(Dll)]
+    internal static partial int mr_source_partitions(ulong source, out ulong table);
+
+    [LibraryImport(Dll)]
+    internal static partial int mr_partitions_info(ulong table, ref MrPartitionTableInfo info);
+
+    [LibraryImport(Dll)]
+    internal static partial int mr_partition_get(ulong table, uint index, ref MrPartitionInfo info);
+
+    [LibraryImport(Dll)]
+    internal static partial int mr_partition_type_name(ulong table, uint index, byte[]? buf, nuint cap, out nuint outLen);
+
+    [LibraryImport(Dll)]
+    internal static partial int mr_partition_anomaly(ulong table, uint partitionIndex, uint anomalyIndex, ref MrPartitionAnomaly anomaly);
+
+    [LibraryImport(Dll)]
+    internal static partial int mr_partition_anomaly_text(ulong table, uint partitionIndex, uint anomalyIndex, byte[]? buf, nuint cap, out nuint outLen);
+
+    [LibraryImport(Dll)]
+    internal static partial int mr_partition_open(ulong table, uint index, out ulong source);
+
+    [LibraryImport(Dll)]
+    internal static partial int mr_partition_open_ex(ulong table, uint index, uint flags, out ulong source);
+
+    [LibraryImport(Dll)]
+    internal static partial int mr_partition_name(ulong table, uint index, byte[]? buf, nuint cap, out nuint outLen);
+
+    [LibraryImport(Dll)]
+    internal static partial int mr_partitions_free(ulong table);
 
     [LibraryImport(Dll)]
     internal static partial int mr_task_status_get(ulong task, out MrTaskStatus status);

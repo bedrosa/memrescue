@@ -6,6 +6,8 @@
 //!   soportado (VHD, VHDX, VMDK monolithicSparse) y devuelve sus datos.
 //! - [`discover_split`] / [`open_split_source`]: imágenes divididas (apertura explícita).
 //! - [`open_range`]: un rango de sectores de otro origen como origen propio.
+//! - [`partitions`]: tabla de particiones del origen (MBR/EBR, MBR protector o híbrido) con la
+//!   confianza y las anomalías de cada partición; [`open_partition`]: una partición como origen.
 //! - [`read_sectors`]: lectura estricta de un rango de sectores; [`read_sectors_mapped`]: lectura
 //!   tolerante con el estado de cada sector (visor hexadecimal); [`read_sectors_mapped_with`]: la
 //!   misma con salto y patrones de relleno configurables.
@@ -26,6 +28,8 @@ use thiserror::Error;
 
 pub use mr_common::ENGINE_VERSION;
 pub use mr_image::OpenOptions;
+pub use mr_part;
+pub use mr_part::{Partition, PartitionTable};
 
 #[derive(Debug, Error)]
 pub enum ApiError {
@@ -192,11 +196,26 @@ pub fn open_split_source(first: impl AsRef<Path>, opts: OpenOptions) -> Result<S
 /// Presenta `count` sectores de `parent` desde `start_lba` como un origen independiente
 /// (partición o rango elegido por el usuario).
 pub fn open_range(parent: &Source, start_lba: u64, count: u64) -> Result<Source> {
+    open_view(parent, start_lba, count, |end| {
+        format!(
+            "Rango LBA {start_lba}–{end} de: {}",
+            parent.info().description
+        )
+    })
+}
+
+/// Vista acotada de `parent` con la descripción que construye `describe` a partir de la última LBA.
+fn open_view(
+    parent: &Source,
+    start_lba: u64,
+    count: u64,
+    describe: impl FnOnce(u64) -> String,
+) -> Result<Source> {
     let dev: Arc<dyn BlockDevice> = Arc::clone(parent) as Arc<dyn BlockDevice>;
     let view = RangeView::new(dev, start_lba, count)?;
     let p = parent.info();
     let end = start_lba + count - 1; // RangeView::new ya validó el rango (count > 0, sin desbordes)
-    let description = format!("Rango LBA {start_lba}–{end} de: {}", p.description);
+    let description = describe(end);
     Ok(Arc::new(OpenSource::new(
         Arc::new(view),
         Meta {
@@ -208,6 +227,65 @@ pub fn open_range(parent: &Source, start_lba: u64, count: u64) -> Result<Source>
             range: Some((start_lba, count)),
         },
     )))
+}
+
+/// Tabla de particiones del origen (solo lectura, tolerante a sectores dañados): esquema, particiones
+/// con su confianza y anomalías. Ver `mr_part::read_partition_table`.
+pub fn partitions(src: &dyn BlockDevice) -> Result<PartitionTable> {
+    Ok(mr_part::read_partition_table(src)?)
+}
+
+/// Abre la partición `index` de `table` (leída de `parent`) como origen independiente (vista
+/// acotada, `RangeView`). Si termina fuera del origen se abre solo la parte que existe y la
+/// descripción lo indica. Se rechaza con [`ApiError::InvalidArgument`] si empieza fuera, si la
+/// tabla usa otro tamaño de sector o si es una partición GPT de una imagen desplazada y no se pide
+/// `apply_shift`; con él, la LBA de la imagen se calcula con el desplazamiento informado y la
+/// descripción lo dice (ADR-022, adenda). Nunca se aplica un desplazamiento en silencio.
+pub fn open_partition(
+    parent: &Source,
+    table: &PartitionTable,
+    index: usize,
+    apply_shift: bool,
+) -> Result<Source> {
+    let info = parent.info();
+    let c = mr_part::open_coordinates(
+        table,
+        index,
+        info.sector_size,
+        info.sector_count,
+        apply_shift,
+    )
+    .map_err(ApiError::InvalidArgument)?;
+    let p = &table.partitions[index];
+    let kind = match &p.kind {
+        mr_part::PartitionKind::Mbr(t) => format!("tipo 0x{t:02X}"),
+        mr_part::PartitionKind::Gpt(g) => format!("GPT {}", mr_part::gpt::format_guid(g)),
+    };
+    open_view(parent, c.image_start, c.count, |end| {
+        let mut d = if c.shift_applied != 0 {
+            format!(
+                "Partición LBA {}–{} del disco = LBA {}–{end} de la imagen (desplazamiento aplicado: {} sectores, LBA imagen = LBA disco - {}) ({kind}) de: {}",
+                p.start_lba,
+                p.start_lba.saturating_add(c.count - 1),
+                c.image_start,
+                c.shift_applied,
+                c.shift_applied,
+                info.description
+            )
+        } else {
+            format!(
+                "Partición LBA {}–{end} ({kind}) de: {}",
+                c.image_start, info.description
+            )
+        };
+        if c.missing_at_end > 0 {
+            d.push_str(&format!(
+                "; recortada: faltan {} sectores al final del origen",
+                c.missing_at_end
+            ));
+        }
+        d
+    })
 }
 
 /// Abre la imagen en solo lectura y devuelve sus datos básicos.
@@ -707,6 +785,62 @@ mod tests {
         drop(parent);
         assert!(read_sectors(r2.as_ref(), 0, 1).is_ok());
         assert_eq!(std::fs::read(&img).unwrap(), data);
+    }
+
+    #[test]
+    fn partitions_are_listed_and_open_as_sources() {
+        // MBR con una primaria [8, 24) y otra que termina fuera del disco [40, 80) de 64 sectores.
+        let mut data: Vec<u8> = (0..64 * 512).map(|i| (i / 512) as u8).collect();
+        data[..512].fill(0);
+        for (i, (kind, start, count)) in [(0x07u8, 8u32, 16u32), (0x83, 40, 40)].iter().enumerate()
+        {
+            let e = &mut data[0x1BE + 16 * i..0x1BE + 16 * (i + 1)];
+            e[4] = *kind;
+            e[8..12].copy_from_slice(&start.to_le_bytes());
+            e[12..16].copy_from_slice(&count.to_le_bytes());
+        }
+        data[510] = 0x55;
+        data[511] = 0xAA;
+        let src = source_from_device(Arc::new(MemDevice::new(data, 512).unwrap()), "disco");
+        let t = partitions(src.as_ref()).unwrap();
+        assert_eq!(t.scheme, mr_part::Scheme::Mbr);
+        assert_eq!(t.partitions.len(), 2);
+        let p0 = open_partition(&src, &t, 0, false).unwrap();
+        assert_eq!(p0.info().sector_count, 16);
+        assert_eq!(p0.info().range, Some((8, 16)));
+        assert!(p0
+            .info()
+            .description
+            .starts_with("Partición LBA 8–23 (tipo 0x07)"));
+        assert!(read_sectors(p0.as_ref(), 0, 1)
+            .unwrap()
+            .iter()
+            .all(|&b| b == 8));
+        assert!(read_sectors(p0.as_ref(), 16, 1).is_err());
+        let p1 = open_partition(&src, &t, 1, false).unwrap();
+        assert_eq!(p1.info().sector_count, 24);
+        assert!(p1
+            .info()
+            .description
+            .contains("recortada: faltan 16 sectores"));
+        let mut outside = t.clone();
+        outside.partitions[1].start_lba = 64;
+        assert!(matches!(
+            open_partition(&src, &outside, 1, false),
+            Err(ApiError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            open_partition(&src, &t, 2, false),
+            Err(ApiError::InvalidArgument(_))
+        ));
+        // Origen ilegible en la LBA 0: sin tabla, con la anomalía, sin error.
+        let bad = FaultyDevice::new(MemDevice::new(vec![0u8; 8 * 512], 512).unwrap()).with_bad([0]);
+        let t = partitions(&bad).unwrap();
+        assert_eq!(t.scheme, mr_part::Scheme::None);
+        assert_eq!(
+            t.anomalies,
+            vec![mr_part::Anomaly::UnreadableSector { lba: 0 }]
+        );
     }
 
     #[test]

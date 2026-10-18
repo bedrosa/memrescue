@@ -26,6 +26,11 @@
  * y bit MR_OPEN_TOLERANT en las opciones de mr_source_open (modo tolerante de contenedores).
  * Añadido sin cambiar la ABI 3: lectura con estado y patrones de relleno configurables
  * (mr_source_read_mapped_ex, mr_read_options). mr_source_read_mapped no cambia.
+ * Añadido sin cambiar la ABI 3 (M2, issue #12): tablas de particiones por índice
+ * (mr_source_partitions, mr_partitions_info, mr_partition_get, mr_partition_type_name,
+ * mr_partition_anomaly, mr_partition_anomaly_text, mr_partition_open, mr_partitions_free)
+ * con estructuras versionadas por struct_size; con GPT integrada: copia en uso, desplazamiento,
+ * nombres y GUID (mr_partition_name, mr_partition_open_ex con MR_PARTITION_OPEN_APPLY_SHIFT).
  */
 #ifndef MEMRESCUE_CORE_H
 #define MEMRESCUE_CORE_H
@@ -230,6 +235,167 @@ mr_status mr_verify_error_code(uint64_t task, uint32_t index, int32_t *out_code,
                                uint64_t *out_sectors);
 mr_status mr_verify_untrusted_range(uint64_t task, uint64_t index, uint64_t *out_lba,
                                     uint64_t *out_count, uint32_t *out_state);
+
+/* ---------- Particiones (añadido sin cambiar la ABI 3) ----------
+ * mr_source_partitions lee la tabla del origen (MBR/EBR; MBR protector o híbrido: solo lo que ve
+ * el MBR) y devuelve un handle que se consulta por índice y se libera con mr_partitions_free.
+ * Lectura tolerante: un sector ilegible es una anomalía (MR_ANOMALY_UNREADABLE_SECTOR), nunca se
+ * interpreta su relleno. Las estructuras de salida son versionadas: el llamador escribe
+ * struct_size = sizeof(...) antes de la llamada; otro tamaño se rechaza (MR_ERR_INVALID_ARGUMENT). */
+#define MR_SCHEME_NONE    0u
+#define MR_SCHEME_MBR     1u
+#define MR_SCHEME_GPT     2u   /* GPT (MBR protector, o firma GPT sin MBR utilizable) */
+#define MR_SCHEME_HYBRID  3u   /* MBR híbrido: entradas MBR distintas de 0xEE y después las GPT */
+
+#define MR_CONFIDENCE_VALID             1u
+#define MR_CONFIDENCE_VALID_WITH_FIXES  2u
+#define MR_CONFIDENCE_SUSPICIOUS        3u
+#define MR_CONFIDENCE_INVALID           4u
+
+#define MR_SEVERITY_NOTICE      1u
+#define MR_SEVERITY_SUSPICIOUS  2u
+#define MR_SEVERITY_INVALID     3u
+#define MR_SEVERITY_COMPENSATED 4u   /* daño compensado por la otra copia GPT (válida con correcciones) */
+
+/* mr_partition_table_info.gpt_selected y gpt_flags */
+#define MR_GPT_NONE     0u   /* sin GPT o ninguna copia utilizable */
+#define MR_GPT_PRIMARY  1u
+#define MR_GPT_BACKUP   2u   /* copia de respaldo en uso */
+#define MR_GPT_PRESENT  1u   /* gpt_flags: hay lectura GPT */
+
+/* mr_partition_open_ex: abrir una partición GPT de una imagen desplazada en LBA disco - shift. */
+#define MR_PARTITION_OPEN_APPLY_SHIFT 1u
+
+#define MR_ORIGIN_PRIMARY  1u
+#define MR_ORIGIN_LOGICAL  2u
+#define MR_ORIGIN_GPT      3u
+
+#define MR_PARTITION_TABLE     0xFFFFFFFFu  /* partition_index de las anomalías de la tabla */
+#define MR_ANOMALY_HAS_TARGET  1u           /* mr_partition_anomaly.flags: target_lba válido */
+#define MR_ANOMALY_HAS_VALUE   2u           /* mr_partition_anomaly.flags: value válido */
+#define MR_ANOMALY_VALUE_SIGNED 4u          /* value es int64_t en complemento a dos */
+
+/* Códigos de anomalía (mr_partition_anomaly.code); el texto estable va en mr_partition_anomaly_text. */
+#define MR_ANOMALY_UNREADABLE_SECTOR           1u    /* unreadable_sector */
+#define MR_ANOMALY_MBR_MISSING               100u    /* mbr_missing: sin tabla reconocible */
+#define MR_ANOMALY_MBR_EMPTY                 101u    /* mbr_empty: firma sin entradas */
+#define MR_ANOMALY_MBR_SIGNATURE_MISSING     102u
+#define MR_ANOMALY_MBR_INVALID_BOOT_INDICATOR 103u   /* value = indicador */
+#define MR_ANOMALY_MBR_MULTIPLE_ACTIVE       104u
+#define MR_ANOMALY_MBR_MULTIPLE_EXTENDED     105u
+#define MR_ANOMALY_MBR_OUTSIDE_DISK          106u    /* value = LBA inicial */
+#define MR_ANOMALY_MBR_PARTIALLY_OUTSIDE     107u    /* value = final (exclusivo) */
+#define MR_ANOMALY_MBR_OVERLAP               108u
+#define MR_ANOMALY_MBR_UNKNOWN_TYPE          109u    /* value = tipo */
+#define MR_ANOMALY_MBR_ZERO_LENGTH           110u    /* value = tipo */
+#define MR_ANOMALY_EBR_LOOP                  111u    /* target_lba = EBR repetido */
+#define MR_ANOMALY_EBR_LINK_OUTSIDE_DISK     112u    /* target_lba = destino */
+#define MR_ANOMALY_EBR_LINK_OUTSIDE_EXTENDED 113u    /* target_lba = destino */
+#define MR_ANOMALY_EBR_CHAIN_LIMIT           114u    /* value = límite */
+#define MR_ANOMALY_EBR_LOGICAL_OUTSIDE_EXT   115u
+#define MR_ANOMALY_EBR_INVALID               116u
+#define MR_ANOMALY_EBR_EXTRA_ENTRIES         117u
+#define MR_ANOMALY_PROTECTIVE_MBR_START      118u    /* value = LBA inicial declarada */
+#define MR_ANOMALY_PROTECTIVE_SIZE_MISMATCH  119u    /* value = tamaño declarado */
+#define MR_ANOMALY_HYBRID_MBR                120u
+#define MR_ANOMALY_SUPERFLOPPY               121u
+#define MR_ANOMALY_HYBRID_MBR_MISMATCH       122u    /* entrada del híbrido sin partición GPT igual */
+/* GPT (bloque 2xx): las de una copia usan el código impar para la primaria y el siguiente para la
+ * de respaldo. lba = posición en la imagen; *_OUTSIDE_IMAGE: lba no válido, value = LBA del disco. */
+#define MR_ANOMALY_GPT_HEADER_MISSING        201u    /* 202 respaldo */
+#define MR_ANOMALY_GPT_HEADER_OUTSIDE_IMAGE  203u    /* 204 respaldo; value = LBA del disco */
+#define MR_ANOMALY_GPT_HEADER_CRC            205u    /* 206 respaldo */
+#define MR_ANOMALY_GPT_HEADER_SIZE           207u    /* 208 respaldo; value = tamaño */
+#define MR_ANOMALY_GPT_REVISION_UNSUPPORTED  209u    /* 210 respaldo; value = revisión */
+#define MR_ANOMALY_GPT_REVISION_MINOR        211u    /* 212 respaldo; value = revisión */
+#define MR_ANOMALY_GPT_MY_LBA_MISMATCH       213u    /* 214 respaldo; value = MyLBA, target = esperada */
+#define MR_ANOMALY_GPT_ALTERNATE_LBA         215u    /* 216 respaldo; value = AlternateLBA */
+#define MR_ANOMALY_GPT_USABLE_RANGE_INVALID  217u    /* 218 respaldo */
+#define MR_ANOMALY_GPT_ENTRIES_LOCATION      219u    /* 220 respaldo; value = LBA de las entradas */
+#define MR_ANOMALY_GPT_ENTRY_ARRAY_LIMITS    221u    /* 222 respaldo; value = nº de entradas */
+#define MR_ANOMALY_GPT_ENTRIES_CRC           223u    /* 224 respaldo */
+#define MR_ANOMALY_GPT_ENTRIES_OUTSIDE_IMAGE 225u    /* 226 respaldo; value = LBA del disco */
+#define MR_ANOMALY_GPT_BACKUP_IN_USE         230u
+#define MR_ANOMALY_GPT_COPIES_DISAGREE       231u
+#define MR_ANOMALY_IMAGE_SHIFTED             232u    /* value = desplazamiento (con signo) */
+#define MR_ANOMALY_GPT_IMAGE_TRUNCATED       233u    /* value = sectores que faltan */
+#define MR_ANOMALY_GPT_USABLE_OUTSIDE_IMAGE  234u
+#define MR_ANOMALY_GPT_SECTOR_SIZE_MISMATCH  235u    /* value = tamaño de sector usado */
+#define MR_ANOMALY_GPT_ENTRY_INVERTED        236u    /* value = índice de entrada */
+#define MR_ANOMALY_GPT_ENTRY_OUTSIDE_USABLE  237u    /* value = índice de entrada */
+#define MR_ANOMALY_GPT_ENTRY_OUTSIDE_IMAGE   238u    /* value = índice de entrada */
+#define MR_ANOMALY_GPT_ENTRY_OVERLAP         239u    /* value = índice de entrada */
+#define MR_ANOMALY_GPT_DUPLICATE_UNIQUE_GUID 240u    /* value = índice de entrada */
+#define MR_ANOMALY_GPT_NAME_INVALID          241u    /* value = índice de entrada */
+
+typedef struct mr_partition_table_info {  /* 80 bytes */
+    uint32_t struct_size;        /* = sizeof(mr_partition_table_info), lo escribe el llamador */
+    uint32_t scheme;             /* MR_SCHEME_* */
+    uint32_t sector_size;        /* unidades de las LBA de las particiones */
+    uint32_t confidence;         /* MR_CONFIDENCE_* del conjunto */
+    uint64_t partition_count;
+    uint64_t anomaly_count;      /* anomalías de la tabla (partition_index = MR_PARTITION_TABLE) */
+    uint32_t gpt_selected;       /* MR_GPT_NONE / MR_GPT_PRIMARY / MR_GPT_BACKUP */
+    uint32_t gpt_flags;          /* MR_GPT_PRESENT */
+    int64_t  shift;              /* LBA disco = LBA imagen + shift (las particiones GPT llevan LBA del disco) */
+    uint64_t trailing_sectors_missing;
+    uint32_t gpt_sector_size;    /* 0 sin GPT */
+    uint32_t reserved;
+    uint8_t  disk_guid[16];      /* orden del disco; ceros si no hay */
+} mr_partition_table_info;
+
+typedef struct mr_partition_info {  /* 96 bytes */
+    uint32_t struct_size;        /* = sizeof(mr_partition_info), lo escribe el llamador */
+    uint32_t origin;             /* MR_ORIGIN_* */
+    uint32_t slot;               /* entrada de su tabla (0-3) o índice GPT */
+    uint32_t mbr_type;           /* 0 en GPT */
+    uint64_t ebr_lba;            /* EBR de una lógica; 0 en las demás */
+    uint64_t start_lba;
+    uint64_t sector_count;
+    uint32_t active;             /* 1 = indicador 0x80 */
+    uint32_t confidence;         /* MR_CONFIDENCE_* */
+    uint32_t anomaly_count;      /* anomalías propias (mr_partition_anomaly con su índice) */
+    uint32_t reserved;
+    uint8_t  gpt_type[16];       /* GUID de tipo en el orden del disco; ceros en MBR */
+    uint8_t  unique_guid[16];    /* GUID único GPT en el orden del disco; ceros en MBR */
+    uint64_t attributes;         /* atributos GPT; 0 en MBR */
+} mr_partition_info;
+
+typedef struct mr_partition_anomaly {  /* 40 bytes */
+    uint32_t struct_size;        /* = sizeof(mr_partition_anomaly), lo escribe el llamador */
+    uint32_t code;               /* MR_ANOMALY_* */
+    uint32_t severity;           /* MR_SEVERITY_* */
+    uint32_t flags;              /* MR_ANOMALY_HAS_TARGET | MR_ANOMALY_HAS_VALUE */
+    uint64_t lba;                /* sector de tabla donde se detectó */
+    uint64_t target_lba;
+    uint64_t value;
+} mr_partition_anomaly;
+
+mr_status mr_source_partitions(uint64_t source, uint64_t *out_table);
+mr_status mr_partitions_info(uint64_t table, mr_partition_table_info *out);
+mr_status mr_partition_get(uint64_t table, uint32_t index, mr_partition_info *out);
+/* Nombre legible del tipo (cadena vacía si es desconocido). */
+mr_status mr_partition_type_name(uint64_t table, uint32_t index,
+                                 uint8_t *buf, size_t cap, size_t *out_len);
+/* Nombre GPT de la partición (cadena vacía en MBR). */
+mr_status mr_partition_name(uint64_t table, uint32_t index,
+                            uint8_t *buf, size_t cap, size_t *out_len);
+/* partition_index = MR_PARTITION_TABLE para las anomalías de la tabla. */
+mr_status mr_partition_anomaly(uint64_t table, uint32_t partition_index, uint32_t anomaly_index,
+                               mr_partition_anomaly *out);
+/* "<código estable>\n<descripción en español>". */
+mr_status mr_partition_anomaly_text(uint64_t table, uint32_t partition_index,
+                                    uint32_t anomaly_index,
+                                    uint8_t *buf, size_t cap, size_t *out_len);
+/* Partición como origen (vista acotada; si termina fuera del origen se abre la parte existente y
+ * mr_source_describe lo indica). Se cierra con mr_source_close. */
+mr_status mr_partition_open(uint64_t table, uint32_t index, uint64_t *out_source);
+/* Una partición GPT de una imagen desplazada (shift != 0) se rechaza con mr_partition_open; con
+ * MR_PARTITION_OPEN_APPLY_SHIFT se abre en LBA disco - shift y mr_source_describe lo indica. Una
+ * tabla interpretada con otro tamaño de sector que el del origen se rechaza siempre. */
+mr_status mr_partition_open_ex(uint64_t table, uint32_t index, uint32_t flags,
+                               uint64_t *out_source);
+mr_status mr_partitions_free(uint64_t table);
 
 mr_status mr_task_status_get(uint64_t task, mr_task_status *out);
 mr_status mr_task_cancel(uint64_t task);

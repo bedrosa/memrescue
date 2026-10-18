@@ -35,7 +35,8 @@
                 <Separator />
                 <MenuItem Header="_Seleccionar disco físico…" IsEnabled="False" InputGestureText="(M9)" ToolTip="Pendiente: acceso a discos físicos (hito M9)" />
                 <MenuItem Header="Construir _RAID virtual…" IsEnabled="False" InputGestureText="(M5)" ToolTip="Pendiente: RAID virtual (hito M5)" />
-                <MenuItem Header="_Particiones…" AutomationProperties.AutomationId="PartitionsMenuItem" IsEnabled="False" InputGestureText="(M2)" ToolTip="Pendiente: lectura de MBR/GPT y búsqueda de particiones (hito M2)" />
+                <MenuItem Header="_Particiones…" AutomationProperties.AutomationId="PartitionsMenuItem" Click="ShowPartitionsTab_Click"
+                          ToolTip="Tabla de particiones del origen seleccionado (MBR/EBR) con su confianza y anomalías; cada partición se puede abrir como dispositivo" />
                 <MenuItem Header="_Bloquear volúmenes…" IsEnabled="False" InputGestureText="(M9)" ToolTip="Pendiente (hito M9)" />
                 <MenuItem Header="Parámetros de _E/S…" IsEnabled="False" InputGestureText="(M9)" ToolTip="Pendiente: política de errores en dispositivos reales (hito M9)" />
                 <Separator />
@@ -107,7 +108,8 @@
                     <ComboBoxItem Content="4096" />
                 </ComboBox>
                 <Separator />
-                <Button Content="Particiones" IsEnabled="False" ToolTip="Pendiente (hito M2)" />
+                <Button Content="Particiones" AutomationProperties.AutomationId="PartitionsToolbarButton" Click="ShowPartitionsTab_Click"
+                        ToolTip="Ver la tabla de particiones del origen seleccionado" />
                 <Button Content="Escaneo completo" IsEnabled="False" ToolTip="Pendiente (hito M6)" />
                 <Button Content="Recuperar" IsEnabled="False" ToolTip="Pendiente (hito M4)" />
             </ToolBar>
@@ -225,6 +227,51 @@
                                        ToolTip="Posición en el origen (arrastre para recorrer imágenes grandes)"
                                        ValueChanged="LbaScrollBar_ValueChanged" />
                         </Grid>
+                    </DockPanel>
+                </TabItem>
+
+                <!-- Tabla de particiones del origen seleccionado (MBR/EBR; MBR protector o híbrido de GPT). -->
+                <TabItem x:Name="PartitionsTab" Header="Particiones">
+                    <DockPanel Margin="6">
+                        <TextBlock x:Name="PartitionSchemeText" DockPanel.Dock="Top" Margin="0,0,0,4" TextWrapping="Wrap"
+                                   Text="Abra una imagen de disco para ver su tabla de particiones."
+                                   AutomationProperties.AutomationId="PartitionSchemeText" />
+                        <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Margin="0,0,0,6">
+                            <Button x:Name="OpenPartitionButton" Content="Abrir en el visor" IsEnabled="False"
+                                    AutomationProperties.AutomationId="OpenPartitionButton" Click="OpenPartition_Click"
+                                    ToolTip="Abre la partición seleccionada como un origen independiente (solo lectura) y muestra su primer sector" />
+                            <Button x:Name="RefreshPartitionsButton" Content="Volver a leer" Margin="6,0,0,0"
+                                    AutomationProperties.AutomationId="RefreshPartitionsButton" Click="RefreshPartitions_Click"
+                                    ToolTip="Vuelve a leer la tabla de particiones del origen seleccionado" />
+                        </StackPanel>
+                        <TextBlock x:Name="PartitionAnomaliesHeader" DockPanel.Dock="Bottom" Text="Anomalías:" Margin="0,6,0,2"
+                                   Foreground="{StaticResource MutedBrush}" />
+                        <ListBox x:Name="PartitionAnomaliesList" DockPanel.Dock="Bottom" Height="110"
+                                 AutomationProperties.AutomationId="PartitionAnomaliesList"
+                                 AutomationProperties.LabeledBy="{Binding ElementName=PartitionAnomaliesHeader}" />
+                        <ListView x:Name="PartitionsList" SelectionMode="Single" AutomationProperties.AutomationId="PartitionsList"
+                                  SelectionChanged="PartitionsList_SelectionChanged" MouseDoubleClick="PartitionsList_MouseDoubleClick">
+                            <ListView.ItemContainerStyle>
+                                <Style TargetType="ListViewItem">
+                                    <Setter Property="AutomationProperties.Name" Value="{Binding AutomationName}" />
+                                    <Setter Property="AutomationProperties.AutomationId" Value="{Binding AutomationId}" />
+                                    <Setter Property="ToolTip" Value="{Binding Details}" />
+                                </Style>
+                            </ListView.ItemContainerStyle>
+                            <ListView.View>
+                                <GridView>
+                                    <GridViewColumn Header="N" Width="32" DisplayMemberBinding="{Binding Number}" />
+                                    <GridViewColumn Header="Origen" Width="130" DisplayMemberBinding="{Binding Origin}" />
+                                    <GridViewColumn Header="Activa" Width="48" DisplayMemberBinding="{Binding ActiveText}" />
+                                    <GridViewColumn Header="LBA inicial" Width="90" DisplayMemberBinding="{Binding StartText}" />
+                                    <GridViewColumn Header="LBA final" Width="90" DisplayMemberBinding="{Binding EndText}" />
+                                    <GridViewColumn Header="Tamaño" Width="80" DisplayMemberBinding="{Binding SizeText}" />
+                                    <GridViewColumn Header="Tipo" Width="190" DisplayMemberBinding="{Binding Type}" />
+                                    <GridViewColumn Header="Nombre" Width="110" DisplayMemberBinding="{Binding Name}" />
+                                    <GridViewColumn Header="Confianza" Width="100" DisplayMemberBinding="{Binding ConfidenceText}" />
+                                </GridView>
+                            </ListView.View>
+                        </ListView>
                     </DockPanel>
                 </TabItem>
 

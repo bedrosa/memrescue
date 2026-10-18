@@ -12,6 +12,7 @@ mr-common.workspace = true
 mr-io.workspace = true
 mr-image.workspace = true
 mr-store.workspace = true
+mr-part.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

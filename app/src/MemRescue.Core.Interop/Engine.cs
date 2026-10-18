@@ -397,6 +397,17 @@ public sealed class Source : EngineHandle
         return buf;
     }
 
+    /// <summary>
+    /// Lee la tabla de particiones del origen (MBR/EBR; MBR protector o híbrido de GPT). La lectura es
+    /// tolerante: un sector ilegible aparece como anomalía, nunca se interpreta su relleno.
+    /// </summary>
+    public PartitionTable ReadPartitions()
+    {
+        // Si la lectura de las listas falla, el finalizador de la tabla libera el handle.
+        Engine.Check(NativeMethods.mr_source_partitions(Handle, out var h));
+        return new PartitionTable(h, this);
+    }
+
     public HashTask StartHash(HashAlgorithms algorithms, string? storePath = null)
     {
         var s = storePath is null ? null : Engine.Utf8(storePath);

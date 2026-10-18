@@ -35,7 +35,50 @@ public sealed class SourceEntry(Source source, ImageFormat detected, bool forced
     public string Summary => $"{MainWindow.FormatSize(Info.SizeBytes)} · {Info.SectorCount:N0} × {Info.SectorSize} B"
         + (Tolerant ? " · MODO TOLERANTE" : "");
 
-    public void Dispose() => Source.Dispose();
+    /// <summary>Tabla de particiones leída (se lee al seleccionar el origen por primera vez).</summary>
+    public PartitionTable? Partitions { get; set; }
+
+    public void Dispose()
+    {
+        Partitions?.Dispose();
+        Source.Dispose();
+    }
+}
+
+/// <summary>Fila de la lista de particiones (textos ya formateados para la vista y UI Automation).</summary>
+public sealed class PartitionRow(PartitionEntry entry, uint sectorSize)
+{
+    public PartitionEntry Entry { get; } = entry;
+
+    public int Number => Entry.Number;
+
+    public string Origin => Entry.OriginLabel;
+
+    public string ActiveText => Entry.Active ? "sí" : "";
+
+    public string StartText => Entry.StartLba.ToString("N0", CultureInfo.CurrentCulture);
+
+    public string EndText => Entry.EndLba.ToString("N0", CultureInfo.CurrentCulture);
+
+    public string SizeText => MainWindow.FormatSize(Entry.SectorCount * sectorSize);
+
+    public string Type => Entry.TypeLabel;
+
+    /// <summary>Nombre GPT (vacío en MBR).</summary>
+    public string Name => Entry.Name;
+
+    public string ConfidenceText => Entry.Confidence.Label();
+
+    public string AutomationId => "Partition" + Entry.Number.ToString(CultureInfo.InvariantCulture);
+
+    public string AutomationName =>
+        $"Partición {Entry.Number}: {Entry.OriginLabel}, LBA {Entry.StartLba}–{Entry.EndLba}, {Entry.SectorCount} sectores, {Entry.TypeLabel}, " +
+        (Entry.Name.Length > 0 ? $"«{Entry.Name}», " : "") +
+        $"{(Entry.Active ? "activa, " : "")}confianza {Entry.Confidence.Label()}";
+
+    public string Details => Entry.Anomalies.Count == 0
+        ? AutomationName
+        : AutomationName + "\n" + string.Join("\n", Entry.Anomalies.Select(a => a.ToString()));
 }
 
 public partial class MainWindow : Window
@@ -366,6 +409,7 @@ public partial class MainWindow : Window
         LbaScrollBar.Visibility = PropsGrid.Visibility;
         if (s is null)
         {
+            ClearPartitionsView("Abra una imagen de disco para ver su tabla de particiones.");
             SetHexMessage("");
             SectorStatesPanel.Children.Clear();
             SectorInfoText.Text = "";
@@ -400,6 +444,155 @@ public partial class MainWindow : Window
         PropSectors.Text = $"{s.Info.SectorCount:N0} (LBA 0 – {(s.Info.SectorCount == 0 ? 0 : s.Info.SectorCount - 1):N0})";
         PropTrailing.Text = $"{s.Info.TrailingBytes}";
         _ = ShowSectorAsync(s.CurrentLba);
+        _ = ShowPartitionsAsync(s);
+    }
+
+    // ---------- Particiones ----------
+
+    private void ShowPartitionsTab_Click(object sender, RoutedEventArgs e) => MainTabs.SelectedItem = PartitionsTab;
+
+    private void ClearPartitionsView(string message)
+    {
+        PartitionsList.ItemsSource = null;
+        PartitionAnomaliesList.Items.Clear();
+        PartitionSchemeText.Text = message;
+        OpenPartitionButton.IsEnabled = false;
+    }
+
+    /// <summary>
+    /// Muestra la tabla de particiones del origen (la lee la primera vez, en segundo plano). La lectura
+    /// es tolerante: un sector de tabla ilegible aparece como anomalía, nunca se interpreta.
+    /// </summary>
+    internal async Task<PartitionTable?> ShowPartitionsAsync(SourceEntry s, bool reload = false)
+    {
+        if (reload && s.Partitions is { } old)
+        {
+            s.Partitions = null;
+            old.Dispose();
+        }
+        if (s.Partitions is null)
+        {
+            ClearPartitionsView("Leyendo la tabla de particiones…");
+            try
+            {
+                var table = await Task.Run(() => s.Source.ReadPartitions());
+                if (s.Partitions is not null || !_sources.Contains(s))
+                {
+                    table.Dispose(); // otra lectura terminó antes o el origen se cerró
+                }
+                else
+                {
+                    s.Partitions = table;
+                    Log($"Particiones de {s.FileName}: {table.Scheme.Label()}, {table.Partitions.Count} particiones, " +
+                        $"confianza {table.Confidence.Label()}, {table.AllAnomalies.Count()} anomalías.");
+                }
+            }
+            catch (EngineException ex)
+            {
+                Log($"No se pudo leer la tabla de particiones de {s.FileName}: [{ex.Status}] {ex.Message}");
+                if (Selected == s)
+                {
+                    ClearPartitionsView($"No se pudo leer la tabla de particiones: {ex.Message}");
+                }
+                return null;
+            }
+        }
+        if (Selected != s || s.Partitions is not { } t)
+        {
+            return s.Partitions;
+        }
+        var gpt = !t.HasGpt ? ""
+            : t.GptSelected switch
+            {
+                GptCopyInUse.Primary => " · copia GPT: primaria",
+                GptCopyInUse.Backup => " · COPIA GPT DE RESPALDO EN USO (la primaria no es utilizable)",
+                _ => " · ninguna copia GPT es utilizable",
+            };
+        var shift = t.Shift != 0
+            ? $" · IMAGEN DESPLAZADA {t.Shift} sectores (LBA disco = LBA imagen + {t.Shift}; las LBA mostradas son del disco)"
+            : "";
+        PartitionSchemeText.Text =
+            $"Esquema: {t.Scheme.Label()} · {t.Partitions.Count} particiones · confianza del conjunto: {t.Confidence.Label()}{gpt}{shift}";
+        PartitionsList.ItemsSource = t.Partitions.Select(p => new PartitionRow(p, t.SectorSize)).ToList();
+        PartitionAnomaliesList.Items.Clear();
+        foreach (var a in t.Anomalies)
+        {
+            PartitionAnomaliesList.Items.Add($"Tabla: {a}");
+        }
+        foreach (var p in t.Partitions)
+        {
+            foreach (var a in p.Anomalies)
+            {
+                PartitionAnomaliesList.Items.Add($"Partición {p.Number}: {a}");
+            }
+        }
+        if (PartitionAnomaliesList.Items.Count == 0)
+        {
+            PartitionAnomaliesList.Items.Add("(ninguna)");
+        }
+        OpenPartitionButton.IsEnabled = false;
+        return t;
+    }
+
+    private void PartitionsList_SelectionChanged(object sender, SelectionChangedEventArgs e) =>
+        OpenPartitionButton.IsEnabled = PartitionsList.SelectedItem is PartitionRow;
+
+    private void PartitionsList_MouseDoubleClick(object sender, MouseButtonEventArgs e) => OpenPartition_Click(sender, e);
+
+    private void RefreshPartitions_Click(object sender, RoutedEventArgs e)
+    {
+        if (Selected is { } s)
+        {
+            _ = ShowPartitionsAsync(s, reload: true);
+        }
+    }
+
+    private void OpenPartition_Click(object sender, RoutedEventArgs e)
+    {
+        if (Selected is { } s && PartitionsList.SelectedItem is PartitionRow row)
+        {
+            _ = OpenPartitionAsync(s, row.Entry);
+        }
+    }
+
+    /// <summary>Abre una partición del origen como un origen independiente y la muestra en el visor.</summary>
+    internal async Task<SourceEntry?> OpenPartitionAsync(SourceEntry parent, PartitionEntry p)
+    {
+        if (parent.Partitions is not { } table)
+        {
+            return null;
+        }
+        // Nunca se aplica en silencio el desplazamiento de una imagen: se pide confirmación.
+        var applyShift = false;
+        if (p.Origin == PartitionOrigin.Gpt && table.Shift != 0)
+        {
+            var image = (long)p.StartLba - table.Shift;
+            var answer = MessageBox.Show(this,
+                $"La imagen está desplazada {table.Shift} sectores respecto al disco original (LBA disco = LBA imagen + {table.Shift}).\n\n" +
+                $"La partición {p.Number} declara la LBA {p.StartLba:N0} del disco, que corresponde a la LBA {image:N0} de la imagen.\n\n" +
+                "¿Abrirla aplicando ese desplazamiento? La descripción del nuevo origen lo indicará.",
+                "Imagen desplazada", MessageBoxButton.YesNo, MessageBoxImage.Question, MessageBoxResult.No);
+            if (answer != MessageBoxResult.Yes)
+            {
+                Log($"No se abrió la partición {p.Number}: la imagen está desplazada y no se aplicó el desplazamiento.");
+                return null;
+            }
+            applyShift = true;
+        }
+        try
+        {
+            var src = await Task.Run(() => table.OpenPartition(p.Index, applyShift));
+            var entry = new SourceEntry(src, parent.Detected, parent.ForcedRaw,
+                $"{parent.FileName} [partición {p.Number}: LBA {p.StartLba:N0}–{p.EndLba:N0}{(applyShift ? $" del disco, desplazamiento {table.Shift}" : "")}]", parent.Tolerant);
+            AddSource(entry);
+            Log($"Partición {p.Number} abierta como dispositivo: {src.Description} ({src.Info.SectorCount:N0} sectores, confianza {p.Confidence.Label()}).");
+            return entry;
+        }
+        catch (EngineException ex)
+        {
+            ShowError("No se pudo abrir la partición", ex);
+            return null;
+        }
     }
 
     // ---------- Visor de sectores ----------
@@ -1022,8 +1215,8 @@ public partial class MainWindow : Window
             $"MemRescue {typeof(MainWindow).Assembly.GetName().Version}\n" +
             $"Motor {Engine.EngineVersion} (ABI {Engine.AbiVersion})\n\n" +
             "Herramienta de recuperación de datos y edición de disco.\n" +
-            "Versión de desarrollo (hito M1): imágenes RAW, VHD, VHDX, VMDK monolithicSparse y divididas en solo lectura, " +
-            "rangos como dispositivo, visor de sectores con estado de validez, hashes y comprobación de legibilidad.",
+            "Versión de desarrollo (hito M2 en curso): imágenes RAW, VHD, VHDX, VMDK monolithicSparse y divididas en solo lectura, " +
+            "rangos y particiones MBR/EBR como dispositivo, visor de sectores con estado de validez, hashes y comprobación de legibilidad.",
             "Acerca de MemRescue", MessageBoxButton.OK, MessageBoxImage.Information);
 
     private void Exit_Click(object sender, RoutedEventArgs e) => Close();

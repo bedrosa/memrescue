@@ -207,6 +207,7 @@ dependencies = [
  "mr-common",
  "mr-image",
  "mr-io",
+ "mr-part",
  "mr-store",
  "tempfile",
  "thiserror",

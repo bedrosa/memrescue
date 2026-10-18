@@ -15,6 +15,7 @@
 pub mod gpt;
 pub mod mbr;
 pub mod sector;
+pub mod table;
 
 pub use mr_common::Confidence;
 
@@ -87,4 +88,140 @@ pub struct PartitionTable {
     pub partitions: Vec<Partition>,
     /// Anomalías de la tabla en conjunto (no atribuibles a una partición).
     pub anomalies: Vec<Anomaly>,
+    /// Lectura GPT completa (copias, copia elegida, desplazamiento, GUID únicos y atributos) cuando
+    /// el esquema es GPT o híbrido; `None` en los demás.
+    pub gpt: Option<gpt::GptRead>,
+}
+
+// ---------------------------------------------------------------------------------------------
+// Añadido en #12 (MBR/EBR) e integración con GPT (#13): gravedad, códigos y textos de las
+// anomalías, nombres de tipo y detección del esquema. Detalle en `table`.
+// ---------------------------------------------------------------------------------------------
+
+pub use table::{gpt_type_name, open_coordinates, read_partition_table, OpenCoordinates};
+
+/// Gravedad de una anomalía: el nivel de [`Confidence`] que deja a lo que afecta.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Severity {
+    /// Informativa (disco sin tabla, MBR híbrido...): no resta confianza.
+    Notice,
+    /// Daño compensado por una redundancia (p. ej. una copia GPT dañada cuando la otra es
+    /// válida): la estructura es `ValidWithFixes`.
+    Compensated,
+    /// La estructura se puede usar con cautela.
+    Suspicious,
+    /// La estructura no es coherente.
+    Invalid,
+}
+
+impl Anomaly {
+    /// Sector de la imagen donde se detectó (`None` si no tiene posición en la imagen).
+    pub fn lba(&self) -> Option<u64> {
+        match self {
+            Anomaly::UnreadableSector { lba } => Some(*lba),
+            Anomaly::Mbr(m) => Some(m.lba()),
+            Anomaly::Gpt(g) => table::gpt_lba(g),
+        }
+    }
+
+    /// Código estable (JSON de la CLI). Coincide con el del manifiesto del corpus cuando existe.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Anomaly::UnreadableSector { .. } => "unreadable_sector",
+            Anomaly::Mbr(m) => m.code(),
+            Anomaly::Gpt(g) => table::gpt_code(g),
+        }
+    }
+
+    pub fn severity(&self) -> Severity {
+        match self {
+            Anomaly::UnreadableSector { .. } => Severity::Suspicious,
+            Anomaly::Mbr(m) => m.severity(),
+            Anomaly::Gpt(g) => table::gpt_severity(g),
+        }
+    }
+
+    /// LBA de destino (enlaces de EBR, `MyLBA` esperada), si la hay.
+    pub fn target(&self) -> Option<u64> {
+        match self {
+            Anomaly::Mbr(m) => m.target(),
+            Anomaly::Gpt(g) => table::gpt_target(g),
+            _ => None,
+        }
+    }
+
+    /// Valor asociado (tipo, tamaño declarado, LBA del disco, índice de entrada...), si lo hay. En
+    /// `image_shifted` es el desplazamiento con signo en complemento a dos ([`Anomaly::value_signed`]).
+    pub fn value(&self) -> Option<u64> {
+        match self {
+            Anomaly::Mbr(m) => m.value(),
+            Anomaly::Gpt(g) => table::gpt_value(g),
+            _ => None,
+        }
+    }
+
+    /// `true` si [`Anomaly::value`] debe leerse como entero con signo (`i64`).
+    pub fn value_signed(&self) -> bool {
+        matches!(self, Anomaly::Gpt(gpt::GptAnomaly::ImageShifted { .. }))
+    }
+}
+
+impl std::fmt::Display for Anomaly {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Anomaly::UnreadableSector { lba } => write!(
+                f,
+                "el sector {lba} no se pudo leer: no se interpreta como estructura"
+            ),
+            Anomaly::Mbr(m) => m.fmt(f),
+            Anomaly::Gpt(g) => g.fmt(f),
+        }
+    }
+}
+
+impl PartitionKind {
+    /// Nombre legible del tipo, si se conoce.
+    pub fn type_name(&self) -> Option<&'static str> {
+        match self {
+            PartitionKind::Mbr(t) => mbr::type_name(*t),
+            PartitionKind::Gpt(g) => gpt_type_name(g),
+        }
+    }
+}
+
+impl PartitionTable {
+    /// Todas las anomalías: las de la tabla y las de cada partición, en ese orden.
+    pub fn all_anomalies(&self) -> impl Iterator<Item = &Anomaly> {
+        self.anomalies
+            .iter()
+            .chain(self.partitions.iter().flat_map(|p| p.anomalies.iter()))
+    }
+
+    /// Confianza del conjunto: la peor entre la gravedad de todas las anomalías y la confianza que
+    /// el lector GPT da a la copia elegida (inválida si ninguna es utilizable).
+    pub fn confidence(&self) -> Confidence {
+        let own = mbr::confidence_of(self.all_anomalies());
+        match &self.gpt {
+            Some(g) if g.confidence.rank() < own.rank() => g.confidence.clone(),
+            _ => own,
+        }
+    }
+
+    /// Datos GPT propios de una partición (GUID único y atributos).
+    pub fn gpt_entry(&self, p: &Partition) -> Option<&gpt::GptPartition> {
+        let Origin::Gpt { index } = p.origin else {
+            return None;
+        };
+        self.gpt
+            .as_ref()?
+            .partitions
+            .iter()
+            .find(|g| g.partition.origin == Origin::Gpt { index })
+    }
+
+    /// Desplazamiento de la imagen detectado por la GPT (`LBA disco = LBA imagen + shift`); 0 si no
+    /// hay GPT o la imagen no está desplazada.
+    pub fn shift(&self) -> i64 {
+        self.gpt.as_ref().map_or(0, |g| g.shift)
+    }
 }

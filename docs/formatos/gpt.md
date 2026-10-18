@@ -172,4 +172,5 @@ tampoco `image_shifted` en imágenes sin GPT, que deduce la búsqueda de volúme
 - El desplazamiento solo se deduce del respaldo encontrado en la última LBA de la imagen; una imagen
   desplazada **y** recortada a la vez sin primaria no se reconoce (lo cubrirá la búsqueda de #15).
 - La clasificación del esquema (GPT, híbrido o MBR) y la comprobación del MBR protector corresponden al
-  analizador MBR (#12) y a la integración.
+  analizador MBR (#12) y a la integración (`mr_part::table`, ADR-022 adenda), que también asigna a cada
+  anomalía GPT su código estable, su gravedad y su código numérico de la ABI (201-241).

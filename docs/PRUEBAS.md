@@ -286,6 +286,50 @@ representar en un fichero RAW: la prueba debe envolver la imagen con `FaultyDevi
 Quedan para #15 los casos de presupuesto, cancelación, escala (imágenes dispersas de 1 GiB y 2 TiB) y
 «todo relleno de ilegible», que dependen del motor y no del corpus.
 
+Tablas MBR/EBR (issue #12, ADR-022):
+
+- `core/mr-part/src/mbr/tests.rs` (23 pruebas, discos construidos en memoria; una por regla y una de fuzzing): primarias sanas;
+  sector vacío o con firma sin entradas; firma ausente (se lee, sospechosa); sector sin firma no
+  plausible (indicador no válido, ninguna entrada dentro, dos extendidas); indicador no válido con firma
+  (inválida) y en entrada libre (aviso); varias activas; fuera y parcialmente fuera del disco; solapes
+  (una anomalía por partición, salida acotada); tipo desconocido y tamaño 0; cadena de EBR con ambos
+  modos de direccionamiento y tipos 0x05/0x0F/0x85; bucle (también un EBR que se enlaza a sí mismo);
+  enlace fuera del disco y fuera de la extendida; lógica fuera de la extendida; EBR con dos enlaces, sin
+  firma o a cero; límite de 1024 EBR; MBR protector (inicio y tamaño) e híbrido; arranque NTFS/FAT32 en
+  la LBA 0 (disco sin particionar) y cabecera GPT en la LBA 0; sectores ilegibles (`FaultyDevice`) en la
+  LBA 0 y en un EBR; tabla desplazada (`read_mbr_at`); sector de 4096 B; y un fuzzing acotado con
+  semilla fija (3000 discos con tablas aleatorias: sin pánicos, sin bucles, salida acotada, < 60 s).
+- `cli/tests/corpus/partitions.rs` (6 pruebas, `--ignored`, dentro de `cli/tests/corpus.rs`): para los 38
+  manifiestos, el esquema visto desde el MBR, las particiones (inicio, tamaño, tipo, activa, lógica), la
+  extendida, los EBR recorridos, el conjunto **exacto** de anomalías MBR (código, LBA, destino y valor) y
+  las particiones que señala cada una (26 anomalías y 25 particiones); señuelos no interpretados;
+  `unreadable_lbas` con `FaultyDevice` (resultado idéntico), LBA 0 ilegible en todas las imágenes y
+  último EBR ilegible; imágenes desplazadas con las coordenadas del manifiesto (cabecera GPT en la LBA 0,
+  MBR desplazado leído en `mbr_displaced` con particiones que coinciden con `found_volumes` y empiezan por
+  su sector de arranque); 300 mutaciones deterministas por imagen de las tablas del corpus (bytes de las
+  entradas y enlaces que apuntan a otras tablas: sin pánicos, < 5 s por lectura, salida acotada y cada
+  partición que empieza dentro se abre acotada al disco); y `partitions --json` de la CLI frente al
+  manifiesto. Los códigos `gpt_*` son de #13 y `image_shifted` / `mbr_displaced`, de #15; aquí se
+  ignoran como anomalías (los desplazamientos se comprueban aparte).
+- Integración con GPT (ADR-022, adenda): `core/mr-part/src/table.rs` (6 pruebas con discos GPT
+  sintéticos: MBR protector con particiones GPT, híbrido con `hybrid_mbr_mismatch`, MBR clásico que
+  ignora una GPT obsoleta, LBA 0 en blanco con GPT, imagen desplazada que solo se abre pidiéndolo y
+  partición anterior al inicio de la imagen, nombres de tipo y códigos GPT) y en
+  `cli/tests/corpus/partitions.rs` `partition_table_matches_every_manifest` (los 38 manifiestos por
+  `read_partition_table`: esquema, particiones MBR y después GPT con tipo, nombre y GUID único, copia en
+  uso, desplazamiento y el conjunto **exacto** de anomalías con código en el manifiesto, MBR y GPT
+  unidas, 41 anomalías; las 21 particiones GPT se abren, en las imágenes desplazadas solo con
+  `apply_shift`, y empiezan por su marcador) y `cli_json_for_gpt_basic_and_damaged_primary`
+  (`partitions --json` de `gpt_basic`, `gpt_primary_header_bad` y `gpt_shifted_start`, y `--partition`
+  con y sin `--apply-shift`). Códigos sin equivalente en el manifiesto (`gpt_backup_in_use`,
+  `gpt_image_truncated`, `gpt_copies_disagree`...) no se comparan, como en `formatos/gpt.md`.
+- `mr-api` (`partitions_are_listed_and_open_as_sources`), `mr-ffi` (6 pruebas), CLI
+  (`cli/tests/cli.rs`: `partitions` en texto y JSON, `--partition N` con `sectors`, `verify` e
+  `image-info`, errores de uso), C# (`PartitionTests`: disco sintético, ciclo de vida y el corpus
+  completo por la DLL, incluida la lectura del marcador de cada partición abierta) e interfaz
+  (`PartitionUiTests`, 3 pruebas, una con `gpt_basic`). La prueba C# del corpus compara la tabla
+  completa (MBR y GPT) y abre cada partición GPT comprobando su marcador.
+
 ## 7. Registro
 
 Los resultados de cada hito se anotan en `PROGRESO.md` con: suites ejecutadas, nº de pruebas,
