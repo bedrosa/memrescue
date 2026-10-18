@@ -2,6 +2,8 @@
 //!
 //! Todas las operaciones son de solo lectura y solo aceptan ficheros de imagen.
 
+mod ntfs_files;
+
 use mr_api::mr_fs_ntfs::{
     BackupState, BootSource, NtfsVolume, RecordOutcome, RecordSource, RecordState,
 };
@@ -33,6 +35,8 @@ USO:
   memrescue-cli partitions <imagen> [ORIGEN] [--json]
   memrescue-cli find-partitions <imagen> [ORIGEN] [--json] [--max-reads N]
   memrescue-cli ntfs-info <imagen> [ORIGEN] [--json]
+  memrescue-cli ntfs-stat <imagen> --record N [ORIGEN] [--json]
+  memrescue-cli ntfs-cat <imagen> --record N [--stream NOMBRE] [-o SALIDA [--overwrite]] [ORIGEN]
   memrescue-cli sectors <imagen> --lba N [--count M] [--retries N] [--jump N] [--read-back]
                         [--bad-fill PATRÓN] [--skip-fill PATRÓN] [ORIGEN]
   memrescue-cli verify <imagen> [--retries N] [--jump N] [--read-back]
@@ -97,6 +101,25 @@ VOLUMEN NTFS (ntfs-info):
   Las LBA de los sectores ilegibles son relativas al origen abierto (la partición, si la hay).
   Código de salida 3 si algún registro tiene sectores ilegibles.
 
+FICHEROS NTFS (ntfs-stat, ntfs-cat), por número de registro MFT (el árbol de directorios llega
+con #22):
+  --record N         registro base del fichero (también no en uso: ficheros borrados)
+  --stream NOMBRE    flujo alternativo ($DATA con nombre); sin él, el flujo principal
+  -o, --output F     fichero de salida de ntfs-cat (sin él, la salida estándar). Se rechazan el
+                     propio origen (o uno de sus segmentos), las rutas de dispositivo y los
+                     directorios. Se escribe en un temporal del mismo directorio que se renombra
+                     al terminar: una copia interrumpida nunca deja un fichero parcial con el
+                     nombre F (el temporal se borra). No se detectan enlaces duros al origen.
+  --overwrite        sustituir F si ya existe (sin esta opción: código de salida 2)
+  ntfs-stat: cabecera, $STANDARD_INFORMATION, $FILE_NAME, atributos (registro en que está cada
+  uno, también los de las extensiones de $ATTRIBUTE_LIST), flujos con tamaños, runs, dispersos,
+  tramos sin mapa y anomalías.
+  ntfs-cat: contenido del flujo (residente, no residente, disperso, comprimido LZNT1). Los
+  dispersos y lo que queda más allá del tamaño inicializado son ceros del formato. Los tramos
+  no fiables (sectores ilegibles, sin mapa, fuera del origen, unidad comprimida dañada) se
+  escriben con el patrón de relleno BAD! solo en esos bytes, se listan en la salida de errores y
+  el código de salida es 3: nunca son datos del origen.
+
 Formatos: RAW, VHD (fijo/dinámico), VHDX (fijo/dinámico), VMDK monolithicSparse e imágenes
 divididas. Tamaños de sector habituales: 512, 1024, 2048, 4096.
 Códigos de salida: 0 correcto, 1 error de operación, 2 uso incorrecto,
@@ -132,6 +155,14 @@ struct Args {
     /// Patrones de relleno (`sectors`); `None` = por defecto.
     bad_fill: Option<[u8; 4]>,
     skip_fill: Option<[u8; 4]>,
+    /// Registro MFT (`ntfs-stat`, `ntfs-cat`).
+    record: Option<u64>,
+    /// Flujo alternativo (`ntfs-cat`).
+    stream: Option<String>,
+    /// Fichero de salida (`ntfs-cat`).
+    output: Option<PathBuf>,
+    /// Sustituir la salida si existe (`ntfs-cat -o`).
+    overwrite: bool,
 }
 
 /// Analiza `--skip-codes`: códigos positivos separados por comas (decimal o `0x…`), sin
@@ -196,6 +227,10 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
         ignore_errors: false,
         bad_fill: None,
         skip_fill: None,
+        record: None,
+        stream: None,
+        output: None,
+        overwrite: false,
     };
     while let Some(s) = it.next() {
         match s.as_str() {
@@ -266,6 +301,14 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
             }
             "--db" => a.db = Some(it.next().ok_or("falta el valor de --db")?.into()),
             "--json" => a.json = true,
+            "--record" => a.record = Some(num(&mut it, "--record")?),
+            "--stream" => {
+                a.stream = Some(it.next().ok_or("falta el valor de --stream")?);
+            }
+            "--overwrite" => a.overwrite = true,
+            "-o" | "--output" => {
+                a.output = Some(it.next().ok_or("falta el valor de -o")?.into());
+            }
             x if x.starts_with("--") => return Err(format!("opción desconocida: {x}")),
             _ => a.positional.push(s),
         }
@@ -670,6 +713,21 @@ fn run(args: Vec<String>) -> Result<(), (u8, String)> {
     if cmd != "sectors" && (a.bad_fill.is_some() || a.skip_fill.is_some()) {
         return Err(usage("--bad-fill y --skip-fill solo se aplican a sectors"));
     }
+    let ntfs_file_cmd = cmd == "ntfs-cat" || cmd == "ntfs-stat";
+    if !ntfs_file_cmd && a.record.is_some() {
+        return Err(usage("--record solo se aplica a ntfs-cat y ntfs-stat"));
+    }
+    if cmd != "ntfs-cat" && (a.stream.is_some() || a.output.is_some()) {
+        return Err(usage("--stream y -o solo se aplican a ntfs-cat"));
+    }
+    if a.overwrite && a.output.is_none() {
+        return Err(usage("--overwrite solo se aplica a ntfs-cat con -o"));
+    }
+    if cmd == "ntfs-cat" && a.json {
+        return Err(usage(
+            "ntfs-cat no admite --json (escribe el contenido del flujo)",
+        ));
+    }
 
     match cmd.as_str() {
         "version" | "--version" => {
@@ -929,6 +987,23 @@ fn run(args: Vec<String>) -> Result<(), (u8, String)> {
                         sum.unreadable.len()
                     ),
                 ));
+            }
+        }
+        "ntfs-stat" | "ntfs-cat" => {
+            let p = one(&a)?;
+            let record = a.record.ok_or_else(|| usage("falta --record N"))?;
+            let src = open_src(&a, &p).map_err(|e| op(&e))?;
+            let v = mr_api::ntfs_open(&src).map_err(|e| op(&e))?;
+            if cmd == "ntfs-cat" {
+                let stream = a.stream.clone().unwrap_or_default();
+                ntfs_files::cat(&v, &src, record, &stream, a.output.as_deref(), a.overwrite)?;
+            } else {
+                let f = mr_api::ntfs_file(&v, record).map_err(|e| op(&e))?;
+                if a.json {
+                    println!("{}", ntfs_files::stat_json(&v, &f));
+                } else {
+                    ntfs_files::stat_text(&v, &f);
+                }
             }
         }
         "image-info" => {

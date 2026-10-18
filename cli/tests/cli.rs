@@ -602,3 +602,35 @@ fn ntfs_info_rejects_a_source_without_ntfs() {
     let o = cli().args(["ntfs-info"]).output().unwrap();
     assert_eq!(o.status.code(), Some(2));
 }
+
+#[test]
+fn ntfs_cat_and_stat_validate_arguments_before_writing() {
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("ceros.img");
+    std::fs::write(&img, vec![0u8; 64 * 1024]).unwrap();
+    let f = img.to_str().unwrap();
+    let out = dir.path().join("salida.bin");
+    let o_s = out.to_str().unwrap();
+    // Origen sin NTFS: error de operación y ningún fichero de salida.
+    let o = cli()
+        .args(["ntfs-cat", f, "--record", "5", "-o", o_s])
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(1));
+    assert!(!out.exists());
+    // Errores de uso.
+    for args in [
+        vec!["ntfs-cat", f],
+        vec!["ntfs-stat", f],
+        vec!["ntfs-cat", f, "--record", "x"],
+        vec!["ntfs-cat", f, "--record", "5", "--json"],
+        vec!["ntfs-stat", f, "--record", "5", "-o", o_s],
+        vec!["ntfs-info", f, "--record", "5"],
+        vec!["ntfs-cat", f, "--record", "5", "--stream"],
+        vec!["ntfs-cat", f, "--record", "5", "--overwrite"],
+    ] {
+        let o = cli().args(&args).output().unwrap();
+        assert_eq!(o.status.code(), Some(2), "{args:?}");
+    }
+    assert!(!out.exists());
+}

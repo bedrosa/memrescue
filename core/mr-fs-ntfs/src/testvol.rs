@@ -102,6 +102,56 @@ pub fn non_resident(
     a
 }
 
+/// Atributo no residente con indicadores, unidad de compresión y tamaño comprimido (cabecera de
+/// 0x48 bytes si lo lleva).
+#[allow(clippy::too_many_arguments)]
+pub fn non_resident_ex(
+    type_code: u32,
+    name: &str,
+    flags: u16,
+    start_vcn: u64,
+    last_vcn: u64,
+    pairs: &[u8],
+    cu: u16,
+    sizes: (u64, u64, u64),
+    compressed_size: Option<u64>,
+) -> Vec<u8> {
+    let n = utf16(name);
+    let header = if compressed_size.is_some() {
+        0x48
+    } else {
+        0x40
+    };
+    let roff = align8(header + n.len());
+    let len = align8(roff + pairs.len());
+    let mut a = vec![0u8; len];
+    a[0..4].copy_from_slice(&type_code.to_le_bytes());
+    a[4..8].copy_from_slice(&(len as u32).to_le_bytes());
+    a[8] = 1;
+    a[9] = (n.len() / 2) as u8;
+    a[0x0A..0x0C].copy_from_slice(&(header as u16).to_le_bytes());
+    a[0x0C..0x0E].copy_from_slice(&flags.to_le_bytes());
+    a[0x10..0x18].copy_from_slice(&start_vcn.to_le_bytes());
+    a[0x18..0x20].copy_from_slice(&last_vcn.to_le_bytes());
+    a[0x20..0x22].copy_from_slice(&(roff as u16).to_le_bytes());
+    a[0x22..0x24].copy_from_slice(&cu.to_le_bytes());
+    a[0x28..0x30].copy_from_slice(&sizes.0.to_le_bytes());
+    a[0x30..0x38].copy_from_slice(&sizes.1.to_le_bytes());
+    a[0x38..0x40].copy_from_slice(&sizes.2.to_le_bytes());
+    if let Some(c) = compressed_size {
+        a[0x40..0x48].copy_from_slice(&c.to_le_bytes());
+    }
+    a[header..header + n.len()].copy_from_slice(&n);
+    a[roff..roff + pairs.len()].copy_from_slice(pairs);
+    a
+}
+
+/// Cambia el identificador de un atributo construido con estas funciones.
+pub fn with_id(mut a: Vec<u8>, id: u16) -> Vec<u8> {
+    a[0x0E..0x10].copy_from_slice(&id.to_le_bytes());
+    a
+}
+
 /// Entero con signo en el mínimo de bytes little-endian.
 fn signed_bytes(v: i64) -> Vec<u8> {
     let b = v.to_le_bytes();
@@ -160,6 +210,18 @@ pub fn protect(buf: &mut [u8]) {
 
 /// Registro FILE protegido con los atributos dados.
 pub fn record(number: u32, seq: u16, flags: u16, attrs: &[Vec<u8>], size: usize) -> Vec<u8> {
+    record_with_base(number, seq, flags, 0, attrs, size)
+}
+
+/// Registro FILE con referencia a un registro base (`base` = número | secuencia << 48).
+pub fn record_with_base(
+    number: u32,
+    seq: u16,
+    flags: u16,
+    base: u64,
+    attrs: &[Vec<u8>],
+    size: usize,
+) -> Vec<u8> {
     let mut r = vec![0u8; size];
     let count = size / 512 + 1;
     let first = align8(0x30 + 2 * count);
@@ -171,6 +233,7 @@ pub fn record(number: u32, seq: u16, flags: u16, attrs: &[Vec<u8>], size: usize)
     r[0x14..0x16].copy_from_slice(&(first as u16).to_le_bytes());
     r[0x16..0x18].copy_from_slice(&flags.to_le_bytes());
     r[0x1C..0x20].copy_from_slice(&(size as u32).to_le_bytes());
+    r[0x20..0x28].copy_from_slice(&base.to_le_bytes());
     r[0x28..0x2A].copy_from_slice(&(attrs.len() as u16).to_le_bytes());
     r[0x2C..0x30].copy_from_slice(&number.to_le_bytes());
     r[0x30..0x32].copy_from_slice(&3u16.to_le_bytes());
@@ -233,6 +296,8 @@ pub struct Synth {
     /// Tramos en disco `(byte, bytes)` de cada registro de la MFT.
     pub pieces: Vec<Vec<(u64, u64)>>,
     pub mirror_offset: u64,
+    /// Runs de la MFT `(LCN, clústeres)`.
+    pub mft_runs: [(u64, u64); 2],
 }
 
 /// Registros de la MFT sintética y los inicializados.
@@ -398,7 +463,27 @@ impl Synth {
             mirr_lcn: mirr,
             pieces,
             mirror_offset,
+            mft_runs: runs,
         }
+    }
+
+    /// Sustituye el registro `n` (ya protegido) en la MFT y, si es de los 4 primeros, en la copia.
+    pub fn put_record(&mut self, n: u64, rec: &[u8]) {
+        let mut at = 0usize;
+        for &(d, l) in &self.pieces[n as usize] {
+            self.image[d as usize..(d + l) as usize].copy_from_slice(&rec[at..at + l as usize]);
+            at += l as usize;
+        }
+        if n < 4 {
+            let m = (self.mirror_offset + n * 1024) as usize;
+            self.image[m..m + 1024].copy_from_slice(rec);
+        }
+    }
+
+    /// Escribe `data` en el clúster `lcn` (y los siguientes).
+    pub fn put_clusters(&mut self, lcn: u64, data: &[u8]) {
+        let at = (lcn * self.cluster) as usize;
+        self.image[at..at + data.len()].copy_from_slice(data);
     }
 
     /// Primer byte del registro `n` en el volumen.

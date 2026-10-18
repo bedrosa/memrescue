@@ -601,3 +601,56 @@ registros que `$MFTMirr` contiene.
 (`$ATTRIBUTE_LIST`) se lee solo en la parte que cubre el registro 0 (`mft_incomplete`); seguirlas
 queda para #21. Si el registro 0 falla en las dos copias, el volumen no se abre (lo cubrirá el
 escaneo de M6).
+
+---
+
+## ADR-026 · Flujos NTFS: estado por tramo, extensiones estrictas y LZNT1 con oráculo de Windows (Aceptada, 2026-10-18)
+
+**Contexto.** Issue #21 (FS-01, FS-03, FS-04): leer el contenido de los ficheros NTFS
+(residentes, no residentes, dispersos, comprimidos con LZNT1, flujos alternativos) y seguir
+`$ATTRIBUTE_LIST`. Hay que decidir cómo se entregan los bytes que no son datos del origen, qué
+hacer con extensiones que no cuadran y cómo validar LZNT1 sin ficheros comprimidos en el corpus
+(ntfs-3g no los crea).
+
+**Decisión** (detalle en `formatos/ntfs.md`):
+1. **Estado por tramo de bytes** en lugar de por sector: `data`, `sparse`, `uninitialized`
+   (fiables: ceros definidos por el formato; lo que hay más allá del tamaño inicializado **nunca**
+   se lee) y `unreadable`, `unmapped`, `outside_source`, `corrupt` (no fiables: patrón `BAD!`
+   alineado al desplazamiento del flujo, configurable). Es la extensión de ADR-019 a ficheros: un
+   fichero tiene clústeres en disco, huecos y unidades comprimidas que no son sectores. La CLI
+   escribe el patrón solo en esos bytes, los lista en la salida de errores y termina con código 3.
+2. **Errores frente a avisos en un flujo**: lo que impide saber qué hay en el flujo (cifrado,
+   tamaños incoherentes, unidad de compresión distinta de 16 clústeres, extensiones solapadas,
+   repetidas o más allá del tamaño asignado, sin primera extensión) es un error tipado; lo que solo
+   deja partes sin describir (runs no válidos en una extensión, hueco entre extensiones, runs más
+   cortos que los datos inicializados) es un aviso y esas partes se leen `unmapped`.
+3. **Extensiones estrictas**: un registro de extensión solo se usa si su referencia al base es
+   exactamente el base (número y secuencia), su secuencia es la de la entrada de la lista y no tiene
+   lista propia (no se sigue: no puede haber ciclos); cada registro se lee una vez, con límites de
+   4096 extensiones y 1 MiB de lista. Única holgura: en un registro no en uso se admite la secuencia
+   incrementada una vez al liberarlo (ficheros borrados). Las mismas reglas completan `$MFT`
+   (`mft_extended`).
+4. **LZNT1** propio de [MS-XCA] con límites (4096 por bloque, referencias dentro del bloque,
+   límite de salida por unidad de compresión; ante un error solo cuentan los bloques completos).
+   **Oráculo independiente**: vectores generados en Windows con `RtlCompressBuffer` /
+   `RtlDecompressBuffer` (`tests/generators/gen_lznt1_vectors.py`, ctypes, sin administrador),
+   versionados como texto hexadecimal con el SHA-256 de los datos sin comprimir; los casos límite
+   (bloque corto seguido de otro, firma, terminación, errores) fijan el comportamiento de Windows.
+5. **Unidad comprimida con sectores ilegibles**: se descomprime hasta el primer bloque afectado;
+   el resto de la unidad es `unreadable` (los bloques LZNT1 son independientes).
+6. **Salida de `ntfs-cat`** (`mr_api::create_output`, reutilizable en M4): nunca el propio origen
+   ni uno de sus segmentos (rutas canónicas; los enlaces duros no se detectan), ni una ruta de
+   dispositivo (lista blanca de ADR-014), ni un directorio; se permite junto al origen. Una salida
+   existente solo se sustituye con `--overwrite`; se escribe en un temporal del mismo directorio
+   que se renombra al terminar y se borra si no se termina.
+
+**Alternativas.** Implementar `BlockDevice` para el flujo con `SectorState` (no distingue
+disperso de sin inicializar ni comprimido dañado, y fuerza tamaños de sector); rellenar con ceros
+lo ilegible (se confundiría con datos); aceptar extensiones con cualquier secuencia (mezclaría
+registros reutilizados de otros ficheros); comprobar la firma de la cabecera LZNT1 (Windows no lo
+hace y rechazaríamos datos que Windows lee).
+
+**Consecuencias.** 439 flujos del corpus coinciden con el SHA-256 del manifiesto (vivos, borrados
+íntegros, sobrescritos con lo que devuelve TSK y ADS). La lectura de un fichero borrado sigue sus
+runs tal como están; su fiabilidad la dará #23. FFI e interfaz llegan con el árbol (#22). Los
+flujos cifrados no se leen (FS-05, M4).

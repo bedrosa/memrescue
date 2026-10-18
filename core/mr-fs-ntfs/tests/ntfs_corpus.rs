@@ -1,4 +1,4 @@
-//! Lector NTFS (#20) contra el corpus NTFS (ADR-024, esquema del manifiesto en `docs/PRUEBAS.md`
+//! Lector NTFS (#20, #21) contra el corpus NTFS (ADR-024, esquema del manifiesto en `docs/PRUEBAS.md`
 //! §1.2). La verdad de los manifiestos la obtuvo The Sleuth Kit, no MemRescue.
 //!
 //! Requieren las imágenes descargadas (`python -I -X utf8 tools/fetch_ntfs_corpus.py`, en
@@ -9,9 +9,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use mr_fs_ntfs::runs::{merge_contiguous, Run};
+use mr_common::{HashAlgorithm, MultiHasher};
+use mr_fs_ntfs::runs::{merge_contiguous, sparse_ranges, Run};
 use mr_fs_ntfs::{
-    BackupState, BootSource, Confidence, NtfsVolume, RecordOutcome, RecordSource, RecordState,
+    BackupState, BootSource, Confidence, DataStream, NtfsError, NtfsVolume, RangeState,
+    RecordOutcome, RecordSource, RecordState,
 };
 use mr_io::{BlockDevice, FaultyDevice, ImageFile, RangeView};
 use mr_part::{open_coordinates, read_partition_table, Scheme};
@@ -27,12 +29,14 @@ fn generated() -> PathBuf {
 }
 
 /// Manifiesto NTFS: claves de nivel superior, tablas simples (`[volume]`, `[partition]`) y tablas
-/// repetidas (`[[damage]]`, `[[files]]`; los `[[files.ads]]` se ignoran aquí).
+/// repetidas (`[[damage]]`, `[[files]]` y sus `[[files.ads]]`).
 struct Manifest {
     top: HashMap<String, String>,
     tables: HashMap<String, HashMap<String, String>>,
     damage: Vec<HashMap<String, String>>,
     files: Vec<HashMap<String, String>>,
+    /// Flujos alternativos de cada entrada de `files` (mismo índice).
+    ads: Vec<Vec<HashMap<String, String>>>,
 }
 
 impl Manifest {
@@ -43,12 +47,14 @@ impl Manifest {
             tables: HashMap::new(),
             damage: Vec::new(),
             files: Vec::new(),
+            ads: Vec::new(),
         };
         enum Cur {
             Top,
             Table(String),
             Damage,
             File,
+            Ads,
             Skip,
         }
         let mut cur = Cur::Top;
@@ -64,7 +70,12 @@ impl Manifest {
                     }
                     "files" => {
                         m.files.push(HashMap::new());
+                        m.ads.push(Vec::new());
                         Cur::File
+                    }
+                    "files.ads" => {
+                        m.ads.last_mut().unwrap().push(HashMap::new());
+                        Cur::Ads
                     }
                     _ => Cur::Skip,
                 };
@@ -89,6 +100,9 @@ impl Manifest {
                 }
                 Cur::File => {
                     m.files.last_mut().unwrap().insert(k, v);
+                }
+                Cur::Ads => {
+                    m.ads.last_mut().unwrap().last_mut().unwrap().insert(k, v);
                 }
                 Cur::Skip => {}
             }
@@ -454,4 +468,201 @@ fn unreadable_mft_sectors_on_the_corpus() {
     assert_eq!(mm.len(), 1);
     assert_eq!((mm[0].record, mm[0].mirror), (0, RecordState::Unreadable));
     assert_eq!(all_states(&v), healthy);
+}
+
+/// Escritor que solo calcula el SHA-256.
+struct Sha(MultiHasher);
+
+impl std::io::Write for Sha {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.update(b);
+        Ok(b.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// SHA-256 del flujo y su informe; el flujo debe ser íntegramente fiable.
+fn stream_sha(s: &DataStream<'_>) -> (String, mr_fs_ntfs::CopyReport) {
+    let mut h = Sha(MultiHasher::new(&[HashAlgorithm::Sha256]));
+    let r = s.copy_to(&mut h).unwrap();
+    (h.0.finish().remove(0).1, r)
+}
+
+/// Comprueba un flujo contra su entrada del manifiesto (fichero o flujo alternativo): tamaño,
+/// residencia, runs, dispersos, tamaño inicializado y SHA-256 del contenido.
+fn check_stream(what: &str, s: &DataStream<'_>, e: &HashMap<String, String>, want_sha: &str) {
+    let l = s.layout();
+    let size: u64 = e["size"].parse().unwrap();
+    assert_eq!(s.size(), size, "{what}");
+    assert_eq!(l.is_resident().to_string(), e["resident"], "{what}");
+    assert!(l.issues.is_empty(), "{what}: {:?}", l.issues);
+    if !l.is_resident() {
+        let runs: Vec<Vec<u64>> = merge_contiguous(&l.runs)
+            .iter()
+            .filter_map(|r| r.lcn.map(|lcn| vec![r.vcn, lcn, r.length]))
+            .collect();
+        assert_eq!(runs, int_lists(&e["runs"]), "{what}: runs");
+        let sparse: Vec<Vec<u64>> = sparse_ranges(&l.runs)
+            .iter()
+            .map(|&(v, n)| vec![v, n])
+            .collect();
+        let want_sparse = e.get("sparse").map(|x| int_lists(x)).unwrap_or_default();
+        assert_eq!(sparse, want_sparse, "{what}: dispersos");
+        let init: u64 = e.get("init_size").map_or(size, |x| x.parse().unwrap());
+        assert_eq!(l.initialized_size, init, "{what}: init_size");
+    }
+    let (sha, r) = stream_sha(s);
+    assert_eq!(r.bytes, size, "{what}");
+    assert_eq!(r.untrusted_bytes(), 0, "{what}: {:?}", r.untrusted);
+    if !l.is_resident() {
+        // Lo que queda más allá del tamaño inicializado son ceros del formato, nunca leídos.
+        let init = l.initialized_size.min(size);
+        assert_eq!(r.count(RangeState::Uninitialized), size - init, "{what}");
+        let cluster = u64::from(l.cluster_size);
+        let sparse_bytes: u64 = sparse_ranges(&l.runs)
+            .iter()
+            .map(|&(v, n)| {
+                let a = (v * cluster).min(init);
+                let b = ((v + n) * cluster).min(init);
+                b - a
+            })
+            .sum();
+        assert_eq!(r.count(RangeState::Sparse), sparse_bytes, "{what}");
+    }
+    assert_eq!(sha, want_sha, "{what}: SHA-256");
+}
+
+#[test]
+#[ignore = "requiere el corpus NTFS (tools/fetch_ntfs_corpus.py)"]
+fn file_contents_match_every_manifest() {
+    let mut by_kind: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut damaged = 0;
+    for m in manifests() {
+        let name = m.name().to_string();
+        let v = open(&m);
+        for (f, ads) in m.files.iter().zip(&m.ads) {
+            let n: u64 = f["mft_record"].parse().unwrap();
+            let what = format!("{name} {}", f["path"]);
+            if f.get("mft_damaged").map(String::as_str) == Some("true") {
+                match v.open_stream(n, "") {
+                    Err(NtfsError::RecordUnusable { state, .. }) => {
+                        assert_eq!(state, RecordState::Damaged, "{what}")
+                    }
+                    other => panic!("{what}: {other:?}"),
+                }
+                damaged += 1;
+                continue;
+            }
+            let file = v.file(n).unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert!(file.anomalies.is_empty(), "{what}: {:?}", file.anomalies);
+            assert!(file.standard_information().is_some(), "{what}");
+            assert!(!file.file_names().is_empty(), "{what}");
+            // Flujos $DATA: el principal (ficheros) y los alternativos del manifiesto.
+            let mut want_streams: Vec<String> = ads.iter().map(|a| a["name"].clone()).collect();
+            if f["type"] == "file" {
+                want_streams.push(String::new());
+            }
+            want_streams.sort();
+            assert_eq!(file.data_streams(), want_streams, "{what}");
+            if f["type"] == "file" {
+                let s = v.stream_of(&file, "").unwrap();
+                assert_eq!(s.record_in_use(), f["state"] == "live", "{what}");
+                let (kind, sha) = match (f["state"].as_str(), f.get("recovered_sha256")) {
+                    ("overwritten", Some(r)) => ("overwritten", r),
+                    ("deleted", None) => {
+                        assert_eq!(f["recoverable"], "full", "{what}");
+                        ("deleted", &f["sha256"])
+                    }
+                    ("live", None) => ("live", &f["sha256"]),
+                    other => panic!("{what}: {other:?}"),
+                };
+                check_stream(&what, &s, f, sha);
+                *by_kind.entry(kind).or_default() += 1;
+            }
+            for a in ads {
+                let w = format!("{what}:{}", a["name"]);
+                let s = v.stream_of(&file, &a["name"]).unwrap();
+                check_stream(&w, &s, a, &a["sha256"]);
+                *by_kind.entry("ads").or_default() += 1;
+            }
+            // Un flujo que no existe es un error tipado.
+            assert!(matches!(
+                v.stream_of(&file, "no-existe"),
+                Err(NtfsError::Stream { .. })
+            ));
+        }
+    }
+    let got: Vec<(&str, usize)> = by_kind.into_iter().collect();
+    println!("flujos comparados por SHA-256: {got:?}; registros dañados: {damaged}");
+    assert_eq!(damaged, 4);
+    // 439 flujos con el SHA-256 del manifiesto: 419 vivos, 12 borrados íntegros, 3 sobrescritos
+    // (contenido que devuelve TSK) y 5 flujos alternativos.
+    assert_eq!(
+        got,
+        vec![
+            ("ads", 5),
+            ("deleted", 12),
+            ("live", 419),
+            ("overwritten", 3)
+        ]
+    );
+}
+
+#[test]
+#[ignore = "requiere el corpus NTFS (tools/fetch_ntfs_corpus.py)"]
+fn unreadable_clusters_inside_a_file_are_reported_per_range() {
+    let m = manifests()
+        .into_iter()
+        .find(|m| m.name() == "ntfs_basic")
+        .unwrap();
+    let f = m
+        .files
+        .iter()
+        .find(|f| f["path"] == "/datos/historico.bin")
+        .unwrap();
+    let n: u64 = f["mft_record"].parse().unwrap();
+    let run = &int_lists(&f["runs"])[0];
+    assert_eq!(run[2], 98);
+    let cluster = m.vol_num("cluster_size");
+    let lba = |vcn: u64, sector: u64| (run[1] + vcn) * cluster / 512 + sector;
+    // Dos sectores contiguos en el clúster 10 y uno en el 50.
+    let bad = [lba(10, 2), lba(10, 3), lba(50, 7)];
+    let healthy = open(&m);
+    let mut want = Vec::new();
+    healthy
+        .open_stream(n, "")
+        .unwrap()
+        .copy_to(&mut want)
+        .unwrap();
+    let dev = FaultyDevice::new(ImageFile::open(generated().join(&m.top["file"]), 512).unwrap())
+        .with_bad(bad);
+    let v = NtfsVolume::open(Arc::new(dev)).unwrap();
+    let s = v.open_stream(n, "").unwrap();
+    let mut got = Vec::new();
+    let r = s.copy_to(&mut got).unwrap();
+    assert_eq!(got.len(), want.len());
+    let a = 10 * cluster + 1024;
+    let b = 50 * cluster + 7 * 512;
+    let want_ranges = [(a, 1024, Some((bad[0], 2))), (b, 512, Some((bad[2], 1)))];
+    assert_eq!(r.untrusted.len(), want_ranges.len());
+    for (x, w) in r.untrusted.iter().zip(want_ranges) {
+        assert_eq!((x.offset, x.length, x.lbas), w);
+    }
+    assert!(r
+        .untrusted
+        .iter()
+        .all(|x| x.state == RangeState::Unreadable));
+    assert_eq!(r.untrusted_bytes(), 1536);
+    for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+        let i = i as u64;
+        let inside = (a..a + 1024).contains(&i) || (b..b + 512).contains(&i);
+        if inside {
+            assert_eq!(*g, b"BAD!"[(i % 4) as usize], "byte {i}");
+        } else {
+            assert_eq!(g, w, "byte {i}");
+        }
+    }
 }

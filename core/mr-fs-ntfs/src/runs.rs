@@ -1,10 +1,9 @@
 //! Decodificación de *mapping pairs* (lista de runs de un atributo no residente).
 //!
-//! **Frontera con #21.** Este módulo contiene solo lo necesario para localizar las extensiones de
-//! `$MFT` y `$MFTMirr`: decodificar los runs con aritmética comprobada y validarlos contra el
-//! tamaño del volumen. #21 lo ampliará (runs de atributos en varios registros, unidades de
-//! compresión, lectura de datos, dispersos con `init_size`) sin cambiar la interfaz de
-//! [`decode_runs`].
+//! [`decode_runs`] decodifica con aritmética comprobada y valida cada run contra el tamaño del
+//! volumen; [`decode_extent`] además exige que los runs de una extensión (un atributo no residente
+//! dentro de un registro) cubran exactamente su tramo de VCN. La unión de extensiones de varios
+//! registros, los tamaños y las unidades de compresión se comprueban en [`crate::file`].
 //!
 //! Formato público: cada run empieza por un byte de cabecera; su nibble bajo es el número de bytes
 //! de la longitud (1 a 8, sin signo) y el alto el del desplazamiento de LCN (0 a 8, con signo,
@@ -50,6 +49,8 @@ pub enum RunError {
     OutsideVolume { at: usize, lcn: u64, length: u64 },
     /// Más de [`MAX_RUNS`] runs.
     TooManyRuns,
+    /// Los runs de una extensión no terminan en su VCN final + 1.
+    Coverage { runs_end: u64, expected_end: u64 },
 }
 
 impl RunError {
@@ -63,6 +64,7 @@ impl RunError {
             RunError::Overflow { .. } => "runs_overflow",
             RunError::OutsideVolume { .. } => "runs_outside_volume",
             RunError::TooManyRuns => "runs_too_many",
+            RunError::Coverage { .. } => "runs_coverage",
         }
     }
 }
@@ -85,6 +87,13 @@ impl fmt::Display for RunError {
                 "run en el byte {at}: {length} clústeres desde el LCN {lcn} fuera del volumen"
             ),
             RunError::TooManyRuns => write!(f, "más de {MAX_RUNS} runs"),
+            RunError::Coverage {
+                runs_end,
+                expected_end,
+            } => write!(
+                f,
+                "los runs terminan en el VCN {runs_end} y el atributo en el {expected_end}"
+            ),
         }
     }
 }
@@ -165,6 +174,35 @@ pub fn decode_runs(
         vcn = vcn.checked_add(length).ok_or(RunError::Overflow { at })?;
         at = end;
     }
+}
+
+/// Decodifica los runs de una extensión que cubre los VCN `start_vcn..=last_vcn` (atributo vacío:
+/// `last_vcn = start_vcn - 1`) y exige que terminen exactamente en `last_vcn + 1`.
+pub fn decode_extent(
+    pairs: &[u8],
+    start_vcn: u64,
+    last_vcn: u64,
+    total_clusters: u64,
+) -> Result<Vec<Run>, RunError> {
+    let runs = decode_runs(pairs, start_vcn, total_clusters)?;
+    let runs_end = runs.last().map_or(start_vcn, Run::end_vcn);
+    let expected_end = last_vcn.wrapping_add(1);
+    if runs_end != expected_end {
+        return Err(RunError::Coverage {
+            runs_end,
+            expected_end,
+        });
+    }
+    Ok(runs)
+}
+
+/// Tramos dispersos `(vcn, clústeres)` de una lista de runs, con los contiguos unidos.
+pub fn sparse_ranges(runs: &[Run]) -> Vec<(u64, u64)> {
+    merge_contiguous(runs)
+        .iter()
+        .filter(|r| r.lcn.is_none())
+        .map(|r| (r.vcn, r.length))
+        .collect()
 }
 
 /// Une los runs contiguos en disco (mismo resultado que muestran otras herramientas).
@@ -284,6 +322,29 @@ mod tests {
             decode_runs(&many, 0, 10).unwrap_err(),
             RunError::TooManyRuns
         );
+    }
+
+    #[test]
+    fn extents_must_cover_their_vcn_range() {
+        let p = encode_runs(&[(Some(100), 4), (None, 4)]);
+        assert_eq!(decode_extent(&p, 10, 17, 1000).unwrap().len(), 2);
+        assert_eq!(
+            decode_extent(&p, 10, 18, 1000).unwrap_err(),
+            RunError::Coverage {
+                runs_end: 18,
+                expected_end: 19
+            }
+        );
+        assert_eq!(
+            decode_extent(&p, 10, 16, 1000).unwrap_err().code(),
+            "runs_coverage"
+        );
+        // Atributo vacío.
+        assert_eq!(decode_extent(&[0], 0, u64::MAX, 10).unwrap(), vec![]);
+        assert_eq!(decode_extent(&[0], 5, 4, 10).unwrap(), vec![]);
+        assert!(decode_extent(&[0], 0, 0, 10).is_err());
+        let r = decode_runs(&p, 0, 1000).unwrap();
+        assert_eq!(sparse_ranges(&r), vec![(4, 4)]);
     }
 
     #[test]

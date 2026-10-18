@@ -1,0 +1,260 @@
+# Generado por tests/generators/gen_lznt1_vectors.py con RtlCompressBuffer/RtlDecompressBuffer
+# de ntdll.dll (COMPRESSION_FORMAT_LZNT1) como oráculo: no editar a mano.
+# Cada vector está en <name>.hex (bytes comprimidos en hexadecimal).
+schema_version = 1
+[[vector]]
+name = "one_byte"
+kind = "compressed"
+engine = "standard"
+expect = "ok"
+plain_size = 1
+plain_sha256 = "bbeebd879e1dff6918546dc0c179fdde505f2a21591c9a9c96e36b054ec5af83"
+compressed_size = 4
+compressed_sha256 = "2edc63b37c635da7455dabaea0b6037dd0194cbcff5316aad563dd472f7d9922"
+
+[[vector]]
+name = "three_bytes"
+kind = "compressed"
+engine = "standard"
+expect = "ok"
+plain_size = 3
+plain_sha256 = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+compressed_size = 6
+compressed_sha256 = "0f2c53c5a5935d15392ca29cb7007569fc29231c89162b70306fea1cf7849a38"
+
+[[vector]]
+name = "zeros_64k_one_byte"
+kind = "compressed"
+engine = "standard"
+expect = "ok"
+plain_size = 65536
+plain_sha256 = "3091600cce824cbfd9a39c060f1dfc2b067430adbaee73f0a6983fe8ef93f10b"
+compressed_size = 212
+compressed_sha256 = "b6e7064e74c2aa7e60d1a6297914f38a5c10e4713b12d879cd48456c8b826305"
+
+[[vector]]
+name = "zeros_64k_one_byte_max"
+kind = "compressed"
+engine = "maximum"
+expect = "ok"
+plain_size = 65536
+plain_sha256 = "3091600cce824cbfd9a39c060f1dfc2b067430adbaee73f0a6983fe8ef93f10b"
+compressed_size = 212
+compressed_sha256 = "7dc3c108476f7e59a03a231f8bc0595af34b3a0bdda3a477dcc2fadabace8277"
+
+[[vector]]
+name = "period3_12k"
+kind = "compressed"
+engine = "standard"
+expect = "ok"
+plain_size = 12288
+plain_sha256 = "7834ab64afb43e3f7a58712a73251d9258453c373cccc3c6bd8154ab767fc06a"
+compressed_size = 24
+compressed_sha256 = "c158a41c45309b083a03f75fb5717547943471eb28004d8c324e7c269a64b7cd"
+
+[[vector]]
+name = "text_4095"
+kind = "compressed"
+engine = "standard"
+expect = "ok"
+plain_size = 4095
+plain_sha256 = "5486540b1e72fe4b75054f62c52e7661be981f71cd8edee30e105d98ea286453"
+compressed_size = 1362
+compressed_sha256 = "a598c702b392772ea898c3d56f009c715d0de653d1f0db65b51fd6d26434035b"
+
+[[vector]]
+name = "text_4096"
+kind = "compressed"
+engine = "standard"
+expect = "ok"
+plain_size = 4096
+plain_sha256 = "303d85bc16cf9dd43cf5290a5bc7ed42c7d188aba9f2a3e66ea5a996f5e9e743"
+compressed_size = 1436
+compressed_sha256 = "fa4413d24858ebc2350666d4ef6283fa100b2ff8e1354f97efe0f6da2d0a15db"
+
+[[vector]]
+name = "text_4097"
+kind = "compressed"
+engine = "standard"
+expect = "ok"
+plain_size = 4097
+plain_sha256 = "797e0a9470d22cb4f65580b8cdcaf26fa300a796aaced4a1f47e61284c2f2c5e"
+compressed_size = 1365
+compressed_sha256 = "77b14d3a0e501d36588552543edaa21edbb10a4e0977570dda4f3d8e8565f75c"
+
+[[vector]]
+name = "text_64k"
+kind = "compressed"
+engine = "standard"
+expect = "ok"
+plain_size = 65536
+plain_sha256 = "9051ca3e0cb745b36dc6a3e16bb175d301262024147b616c0f8391e31ca381f6"
+compressed_size = 22159
+compressed_sha256 = "b85d8fede709950651c9fd7a619ca2d3559cfe369f3618ba47ed64e4eb69583c"
+
+[[vector]]
+name = "text_200k_max"
+kind = "compressed"
+engine = "maximum"
+expect = "ok"
+plain_size = 200000
+plain_sha256 = "c6191f3d0c3381661abfd92ce59f0556417aa701e4da8326d73b6537d5034dfa"
+compressed_size = 49879
+compressed_sha256 = "15fa9a883b06075671bbacdb8baa77c8008de6486a3f6ca1280c34a28a283c9e"
+
+[[vector]]
+name = "alphabet4_50000"
+kind = "compressed"
+engine = "standard"
+expect = "ok"
+plain_size = 50000
+plain_sha256 = "ae855389443422092857214d640297202ced4f0baf5bdb1fadfad744c837993b"
+compressed_size = 30118
+compressed_sha256 = "6fd755be6c4254118f61272a1232aff13c3225595103a8061758d4ecba245c3c"
+
+[[vector]]
+name = "alphabet16_64k_max"
+kind = "compressed"
+engine = "maximum"
+expect = "ok"
+plain_size = 65536
+plain_sha256 = "01773d47b1467f209686fa76b1b118c2999f25cdb6adc65626135f0d33c0a4b6"
+compressed_size = 56990
+compressed_sha256 = "61adf19fc0540a21cd38aa783980fe02de4029d8a97b8fd8896917dc6b73130c"
+
+[[vector]]
+name = "random_4096"
+kind = "compressed"
+engine = "standard"
+expect = "ok"
+plain_size = 4096
+plain_sha256 = "2d8c0be490f326058fee6f190db9ffb9ff4660e849da3df1cebdc1925376b536"
+compressed_size = 4098
+compressed_sha256 = "5ff68f6d131d337743f3132a52712105dcd632da3b231b98ecf0990b4c52d5a6"
+
+[[vector]]
+name = "random_9000"
+kind = "compressed"
+engine = "standard"
+expect = "ok"
+plain_size = 9000
+plain_sha256 = "7630c6522dee3e3fa48bf6e59d6eb96f1c44f96dda059bba8e0a0b955cb57c11"
+compressed_size = 9107
+compressed_sha256 = "56ccbb161941657f62ca950618493221b04f87053a273568e8785160be18d689"
+
+[[vector]]
+name = "byte_runs_128k"
+kind = "compressed"
+engine = "standard"
+expect = "ok"
+plain_size = 131072
+plain_sha256 = "58cbc2a29b8e58d8bd4877c1a67918c96c8de07d3d50a665aa7659d01ad4819b"
+compressed_size = 11345
+compressed_sha256 = "6d0f84f2306f8ad54021f1cb47af220b45191aba430c2df80563443d9f593c6c"
+
+[[vector]]
+name = "mixed_3cu_plus"
+kind = "compressed"
+engine = "standard"
+expect = "ok"
+plain_size = 196731
+plain_sha256 = "a5845e53c3d9b31f955956af1f979b7db5c1735ae128a3d08de23bb524624a0b"
+compressed_size = 93029
+compressed_sha256 = "da9661fd53f7e12ff94cb5f94dfdd7965b6e74e4ca72fba37e09d6c6fbcb9fe5"
+
+[[vector]]
+name = "mixed_3cu_plus_max"
+kind = "compressed"
+engine = "maximum"
+expect = "ok"
+plain_size = 196731
+plain_sha256 = "a5845e53c3d9b31f955956af1f979b7db5c1735ae128a3d08de23bb524624a0b"
+compressed_size = 86626
+compressed_sha256 = "426e2b8076f631c1d39c16f03d29da8055ed7f4b4888bcf8f711019471a8a8e7"
+
+[[vector]]
+name = "crafted_short_raw_then_raw"
+kind = "crafted"
+output_buffer = 16384
+compressed_size = 19
+compressed_sha256 = "74299b79d95a8babb4ad087422501e0d9cfed39c7711ecc7e532c5d53ad6ceae"
+expect = "ok"
+plain_size = 4101
+plain_sha256 = "93125673d9449c9772662095776b5b4801040f743957b3c68372e0fd49d3a23e"
+
+[[vector]]
+name = "crafted_short_compressed_then_raw"
+kind = "crafted"
+output_buffer = 16384
+compressed_size = 10
+compressed_sha256 = "6aaa0a2570ea551e5dd9ae0178809c8b349b786de98b14354de9a2d0612fa575"
+expect = "ok"
+plain_size = 4098
+plain_sha256 = "379b015cdbcd6908de7164a24b69871ccc3dceb09c43b9e2484bacb39966a49f"
+
+[[vector]]
+name = "crafted_signature_0"
+kind = "crafted"
+output_buffer = 64
+compressed_size = 7
+compressed_sha256 = "75644bfea1572958ce1aa11a9e104f55450f15230b1301a9b344cd6fae1bd1d4"
+expect = "ok"
+plain_size = 5
+plain_sha256 = "f0393febe8baaa55e32f7be2a7cc180bf34e52137d99e056c817a9c07b8f239a"
+
+[[vector]]
+name = "crafted_trailing_byte"
+kind = "crafted"
+output_buffer = 64
+compressed_size = 8
+compressed_sha256 = "167bc83698a56dde8aabf9f52e8b76bb26b16d3da9c285d9e9e93bb0e0d01767"
+expect = "ok"
+plain_size = 5
+plain_sha256 = "f0393febe8baaa55e32f7be2a7cc180bf34e52137d99e056c817a9c07b8f239a"
+
+[[vector]]
+name = "crafted_end_then_garbage"
+kind = "crafted"
+output_buffer = 64
+compressed_size = 12
+compressed_sha256 = "5f7e58a6e8a3af07d9cb8bad32bc9e011cac74b8997cb3a000534b2f50150d3f"
+expect = "ok"
+plain_size = 5
+plain_sha256 = "f0393febe8baaa55e32f7be2a7cc180bf34e52137d99e056c817a9c07b8f239a"
+
+[[vector]]
+name = "crafted_truncated_chunk"
+kind = "crafted"
+output_buffer = 64
+compressed_size = 6
+compressed_sha256 = "a227892c2b3376aa947d8ddac1142b466142b0137e6ac77426cc0901dd247657"
+expect = "error"
+windows_status = "0xC0000242"
+
+[[vector]]
+name = "crafted_backref_at_start"
+kind = "crafted"
+output_buffer = 64
+compressed_size = 5
+compressed_sha256 = "52d95455433e8abd6e83717259ded43615ee8c8721846dd11f1a38bbe9ab6913"
+expect = "error"
+windows_status = "0xC0000242"
+
+[[vector]]
+name = "crafted_backref_too_far"
+kind = "crafted"
+output_buffer = 64
+compressed_size = 6
+compressed_sha256 = "bd590a6a05a76917168d65d428d5f4e1db587768a0b701747a06eb562497916a"
+expect = "error"
+windows_status = "0xC0000242"
+
+[[vector]]
+name = "crafted_overlapping_copy"
+kind = "crafted"
+output_buffer = 64
+compressed_size = 6
+compressed_sha256 = "69bc022917ebcbad4e452c79437168417ba53350ca6e176deee6830901cce556"
+expect = "ok"
+plain_size = 9
+plain_sha256 = "e05db8688a0e247ab4ada686600d10b1460d8ceaa0adee919024bd99ebeead92"

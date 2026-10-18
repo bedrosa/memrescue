@@ -122,8 +122,12 @@ Milestone propio para no retrasar NTFS y la recuperación.
     `$MFT`, registros FILE con fixups, cabeceras de atributo, lectura y enumeración de registros con
     estado, `$MFTMirr`; `mr_api::ntfs_open` y CLI `ntfs-info`; pruebas contra el corpus NTFS en la CI
     (job `ntfs`). FFI e interfaz llegan con el árbol (#22).
-  - Pendiente: atributos, runs de datos, residentes, dispersos, LZNT1 y ADS (#21); índices `$I30` y
-    árbol (#22); borrados (#23); extensiones de `$MFT` por `$ATTRIBUTE_LIST`.
+  - **Hecho (#21, ADR-026)**: atributos tipados, `$ATTRIBUTE_LIST` (también de `$MFT`), runs de
+    cualquier atributo, flujos residentes, no residentes, dispersos, con tamaño inicializado menor y
+    comprimidos LZNT1 (oráculo de Windows), ADS; lectura con estado por tramo; `mr_api::ntfs_file`,
+    `ntfs_read_stream`, `ntfs_copy_stream`; CLI `ntfs-stat` y `ntfs-cat`; SHA-256 de 439 flujos del
+    corpus. FFI e interfaz con el árbol (#22).
+  - Pendiente: índices `$I30` y árbol (#22); borrados (#23).
 - Ficheros borrados (registros MFT no en uso, entradas INDX residuales).
 - **Paridad objetivo**: FS-01…FS-04.
 
