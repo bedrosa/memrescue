@@ -184,7 +184,7 @@ Cada INV: alcance cerrado, fuentes en este orden: (1) especificación pública, 
 | INV-03 | Puntuación de volúmenes candidatos | Pendiente NTFS | M6 | Métrica de % / Check / votos | `FUN_006a6d80`, `FUN_006a89b0`, `FUN_006a8c50` |
 | INV-03b | RAID: mapeo, delay, cálculo automático | Área "RAID/RAW" | M5 | Fórmulas de rotación y métrica de detección | Cadenas 0x6c1d64, 0x677594; manual RAID |
 | INV-04 | FS no NTFS (uno por sesión) | Área "otros FS" | M8 | Validadores y escáneres de FAT, exFAT, HFS+, ReFS, Btrfs | Rangos del doc F1-03 |
-| INV-05 | MBR/EBR y búsqueda exprés de particiones | Área "otros FS" | M2 | **Hecha** (2026-10-17): `investigacion/dmde-fase2/INV-05-…md`. Queda el bucle externo de candidatos (INV-05b) | 0x608b00–0x613300 |
+| INV-05 | MBR/EBR y búsqueda exprés de particiones | Área "otros FS" | M2 | **Hecha** (2026-10-17): `investigacion/dmde-fase2/INV-05-…md`. Bucle de candidatos: INV-05b (2026-10-18, `investigacion/dmde-fase2/INV-05b-…md`, propuesta propia) | 0x608b00–0x613300 |
 | INV-06 | Bucle de lectura con errores, CDB SCSI/ATA | Área "E/S" | M9 | Secuencia de reintentos/saltos/retroceso; opcodes | 0x4d6b00, 0x4d7730, 0x4d7f20, 0x4d9870 |
 | INV-07 | Script de manejo de E/S | Área "arranque/scripts" | M11 | Gramática y semántica | `deviohsc.txt`, 0x4c3e80 |
 | INV-08 | Escritura NTFS sin driver | Nueva | M12 | Qué estructuras actualiza al crear/borrar | Mensajes 1780–1823 |
