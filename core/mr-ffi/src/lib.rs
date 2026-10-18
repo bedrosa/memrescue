@@ -387,7 +387,7 @@ fn api_error_code(e: &ApiError) -> i32 {
         }
         ApiError::Ntfs(_) => MR_ERR_CORRUPT,
         ApiError::Cancelled => MR_ERR_CANCELLED,
-        ApiError::InvalidArgument(_) => MR_ERR_INVALID_ARGUMENT,
+        ApiError::InvalidArgument(_) | ApiError::OutputExists(_) => MR_ERR_INVALID_ARGUMENT,
         ApiError::Spawn(_) => MR_ERR_IO,
     }
 }

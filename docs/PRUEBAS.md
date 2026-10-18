@@ -455,8 +455,56 @@ Lector NTFS (issue #20, ADR-025, `formatos/ntfs.md`):
   de las 10 imágenes frente a su manifiesto, `--partition 1` en las particionadas, y salida de texto).
 - `mr-api`: `ntfs_open_rejects_a_source_without_ntfs`.
 
-Campos del manifiesto NTFS que no se comparan todavía: `[[files]]` `path`, `size`, `sha256`,
-`resident`, `runs`, `sparse`, `init_size`, `recoverable` y `[[files.ads]]` (#21, #22, #23).
+Atributos, runs, flujos y LZNT1 (issue #21, ADR-026, `formatos/ntfs.md`):
+
+- `core/mr-fs-ntfs/src` (21 unitarias más, 54 en total): `values` (valores tipados y cada límite,
+  entradas de `$ATTRIBUTE_LIST`, fuzzing de 20 000 valores), `runs` (`decode_extent`: cobertura
+  exacta del tramo de VCN), `file` (reglas de disposición sin registros: tamaños, primera
+  extensión, formas mezcladas, compresión con clúster grande, unidad de compresión ignorada, runs
+  fuera del volumen), `lznt1` (**oráculo de Windows**: los 26 vectores de `tests/vectors/lznt1`,
+  generados con `RtlCompressBuffer`/`RtlDecompressBuffer` por `tests/generators/gen_lznt1_vectors.py`,
+  se descomprimen y su tamaño y SHA-256 coinciden con el manifiesto, 4 de ellos de más de una unidad
+  de compresión; los 3 casos que Windows rechaza también fallan; límite de salida con bloques
+  completos; bloques mal formados; ida y vuelta con un compresor de pruebas; fuzzing de 30 000
+  entradas sin pánicos y con la salida acotada) y `stream_tests.rs` (volúmenes sintéticos de
+  clústeres de 4 KiB): residentes y ADS, dispersos con tamaño inicializado menor (estados por tramo
+  y 200 lecturas parciales), sectores ilegibles con `FaultyDevice` (tramo exacto, LBA y patrón; un
+  sector ilegible más allá del tamaño inicializado no se lee), origen truncado (`outside_source`),
+  fichero comprimido de 4 unidades (comprimida, sin comprimir, dispersa y final parcial; 100 lecturas
+  que cruzan unidades), sector ilegible dentro de una unidad comprimida (datos hasta el bloque
+  afectado) y bloque dañado (`corrupt`), `$ATTRIBUTE_LIST` residente y no residente con dos
+  extensiones, fichero borrado con secuencias incrementadas, extensiones de otro base, reutilizadas,
+  ilegibles, con lista propia, fuera de la MFT, con otro estado de uso, solapadas, repetidas, con
+  hueco o más allá del tamaño asignado, errores de flujo tipados, extensiones de `$MFT`
+  (`mft_extended` y `mft_incomplete`) y fuzzing de 600 volúmenes con registros mutados (sin
+  pánicos, salida del tamaño pedido, patrón en cada tramo no fiable).
+- `core/mr-fs-ntfs/tests/ntfs_corpus.rs` (5, `--ignored`; 2 nuevas):
+  `file_contents_match_every_manifest` abre **cada** fichero y flujo alternativo de los 10
+  manifiestos y compara tamaño, `resident`, `runs` (fusionados, sin dispersos), `sparse`,
+  `init_size` (los bytes más allá son `uninitialized`, los dispersos `sparse`), los flujos `$DATA`
+  del fichero y el SHA-256 de todo el contenido leído (sin ningún tramo no fiable): 419 vivos, 12
+  borrados íntegros, 3 sobrescritos (con `recovered_sha256`, lo que devuelve TSK) y 5 flujos
+  alternativos (uno de un directorio) = **439 flujos con el SHA-256 del manifiesto**; las 4 entradas
+  con `mft_damaged` dan `RecordUnusable` (dañado); `$STANDARD_INFORMATION` y `$FILE_NAME` válidos y
+  ninguna anomalía en ningún fichero. `unreadable_clusters_inside_a_file_are_reported_per_range`:
+  `ntfs_basic` con 3 sectores ilegibles dentro de `/datos/historico.bin`: exactamente dos tramos
+  `unreadable` con su LBA, patrón `BAD!` en esos bytes y el resto idéntico a la lectura sana.
+- CLI: `cli/tests/cli.rs` (`ntfs_cat_and_stat_validate_arguments_before_writing`: origen sin NTFS
+  sin crear la salida, 7 errores de uso) y `cli/tests/ntfs_corpus.rs` (2 nuevas, `--ignored`):
+  `ntfs-cat` de 116 flujos (ficheros y ADS de `ntfs_sparse_ads`, `ntfs_gpt` con `--partition 1` y
+  borrados de `ntfs_deleted`, a la salida estándar o con `-o`) con el SHA-256 del manifiesto y
+  `ntfs-stat --json` con sus runs y dispersos; imagen truncada: código 3, tramo listado en la
+  salida de errores y patrón solo en esos bytes; salida = origen o dispositivo rechazada (origen
+  intacto), flujo inexistente, registro fuera de la MFT y registro dañado.
+- `mr-api`: `output_path_is_never_the_source_or_a_device` y
+  `create_output_is_atomic_and_never_overwrites_silently` (temporal visible solo hasta confirmar,
+  salida existente rechazada sin `overwrite` y sustituida con él, escritura sin confirmar que no
+  deja ni fichero final ni temporal, sustitución fallida que conserva el anterior, origen
+  rechazado también con `overwrite`). CLI de corpus: salida existente con código 2 sin
+  `--overwrite`, sustituida con él y sin temporales.
+
+Campos del manifiesto NTFS que no se comparan todavía: `[[files]]` `path` (#22) y `recoverable`
+de los sobrescritos (#23).
 
 ## 7. Registro
 

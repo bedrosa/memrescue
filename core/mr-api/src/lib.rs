@@ -16,6 +16,11 @@
 //!   como origen.
 //! - [`ntfs_open`]: detecta y abre el volumen NTFS de un origen (imagen completa, partición o
 //!   volumen encontrado): arranque usado, MFT, `$MFTMirr` y lectura de registros (#20).
+//! - [`ntfs_file`], [`ntfs_open_stream`], [`ntfs_read_stream`] y [`ntfs_copy_stream`]: atributos
+//!   de un fichero por número de registro MFT y contenido de sus flujos `$DATA` (principal o
+//!   alternativos) con el estado de cada tramo (#21); [`check_output_path`] valida el destino de
+//!   una extracción y [`create_output`] lo escribe de forma atómica (fichero temporal en el mismo
+//!   directorio y renombrado final; nunca sobrescribe sin petición explícita).
 //! - [`start_hash_task`]: hashes del fichero completo en segundo plano.
 //! - [`start_verify_task`]: lectura completa tolerante a errores con mapa de validez por sector.
 
@@ -50,6 +55,9 @@ pub enum ApiError {
     Cancelled,
     #[error("argumento no válido: {0}")]
     InvalidArgument(String),
+    /// El fichero de salida ya existe y no se pidió sobrescribirlo.
+    #[error("la salida {} ya existe: no se sobrescribe sin una petición explícita", .0.display())]
+    OutputExists(PathBuf),
     #[error("no se pudo iniciar la tarea: {0}")]
     Spawn(std::io::Error),
 }
@@ -304,6 +312,207 @@ pub fn open_partition(
 pub fn ntfs_open(src: &Source) -> Result<mr_fs_ntfs::NtfsVolume> {
     let dev: Arc<dyn BlockDevice> = Arc::clone(src) as Arc<dyn BlockDevice>;
     Ok(mr_fs_ntfs::NtfsVolume::open(dev)?)
+}
+
+/// Fichero del registro base `record` (atributos del registro y de sus extensiones, anomalías).
+/// Vale también para registros no en uso (borrados).
+pub fn ntfs_file(vol: &mr_fs_ntfs::NtfsVolume, record: u64) -> Result<mr_fs_ntfs::NtfsFile> {
+    Ok(vol.file(record)?)
+}
+
+/// Abre el flujo `$DATA` `stream` (`""` = el principal) del registro base `record`.
+pub fn ntfs_open_stream<'v>(
+    vol: &'v mr_fs_ntfs::NtfsVolume,
+    record: u64,
+    stream: &str,
+) -> Result<mr_fs_ntfs::DataStream<'v>> {
+    Ok(vol.open_stream(record, stream)?)
+}
+
+/// Lee `len` bytes (como mucho `mr_fs_ntfs::stream::MAX_STREAM_READ`) desde `offset` del flujo
+/// `stream` del registro `record`, con el estado de cada tramo: los no fiables llevan el patrón de
+/// relleno y nunca son datos.
+pub fn ntfs_read_stream(
+    vol: &mr_fs_ntfs::NtfsVolume,
+    record: u64,
+    stream: &str,
+    offset: u64,
+    len: usize,
+) -> Result<mr_fs_ntfs::StreamChunk> {
+    Ok(vol.open_stream(record, stream)?.read(offset, len)?)
+}
+
+/// Copia el flujo `stream` del registro `record` a `out` con memoria acotada. El informe dice
+/// cuántos bytes hay de cada estado y qué tramos no son fiables (escritos con el patrón `BAD!`).
+pub fn ntfs_copy_stream(
+    vol: &mr_fs_ntfs::NtfsVolume,
+    record: u64,
+    stream: &str,
+    out: &mut dyn std::io::Write,
+) -> Result<mr_fs_ntfs::CopyReport> {
+    let s = vol.open_stream(record, stream)?;
+    s.copy_to(out).map_err(|e| match e {
+        mr_fs_ntfs::stream::CopyError::Ntfs(n) => ApiError::Ntfs(n),
+        mr_fs_ntfs::stream::CopyError::Write(w) => ApiError::Io(mr_io::IoError::Io(w)),
+    })
+}
+
+/// Comprueba que `out` puede ser el fichero de salida de una extracción del origen `src`: no es
+/// una ruta de dispositivo (la misma lista blanca léxica que los orígenes, ADR-014), no es un
+/// directorio y no es el propio origen ni uno de sus segmentos. Nunca se escribe sobre el origen.
+pub fn check_output_path(src: &Source, out: &Path) -> Result<()> {
+    let raw = out.to_string_lossy();
+    mr_io::path_policy::check_lexical(&raw)?;
+    if out.is_dir() {
+        return Err(ApiError::InvalidArgument(format!(
+            "la salida {} es un directorio",
+            out.display()
+        )));
+    }
+    // Ruta canónica de la salida (si aún no existe, la de su directorio más el nombre).
+    let canon = match std::fs::canonicalize(out) {
+        Ok(c) => c,
+        Err(_) => {
+            let parent = out
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            let name = out.file_name().ok_or_else(|| {
+                ApiError::InvalidArgument(format!(
+                    "salida sin nombre de fichero: {}",
+                    out.display()
+                ))
+            })?;
+            std::fs::canonicalize(parent)
+                .map_err(|e| ApiError::Io(mr_io::IoError::Io(e)))?
+                .join(name)
+        }
+    };
+    let info = src.info();
+    let same = |p: &Path| {
+        let c = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        c.to_string_lossy().to_lowercase() == canon.to_string_lossy().to_lowercase()
+    };
+    if same(&info.path) || info.segments.iter().any(|s| same(s)) {
+        return Err(ApiError::InvalidArgument(format!(
+            "la salida {} es el propio origen: nunca se escribe sobre él",
+            out.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Fichero de salida en curso de [`create_output`]: se escribe en un temporal del mismo
+/// directorio y solo [`OutputFile::commit`] lo renombra al nombre final. Si se descarta sin
+/// confirmar (error, cancelación, pánico), el temporal se borra: nunca queda un fichero parcial
+/// con el nombre final.
+pub struct OutputFile {
+    writer: Option<std::io::BufWriter<std::fs::File>>,
+    tmp: PathBuf,
+    target: PathBuf,
+    overwrite: bool,
+}
+
+impl OutputFile {
+    /// Ruta del fichero temporal (para diagnóstico y pruebas).
+    pub fn temp_path(&self) -> &Path {
+        &self.tmp
+    }
+
+    /// Termina la escritura: vacía, sincroniza y renombra el temporal al nombre final. Sin
+    /// `overwrite`, se vuelve a comprobar que el destino no ha aparecido entretanto.
+    pub fn commit(mut self) -> Result<PathBuf> {
+        let w = self.writer.take().expect("writer presente hasta commit");
+        let f = w
+            .into_inner()
+            .map_err(|e| ApiError::Io(mr_io::IoError::Io(e.into_error())))?;
+        f.sync_all()
+            .map_err(|e| ApiError::Io(mr_io::IoError::Io(e)))?;
+        drop(f);
+        if !self.overwrite && self.target.exists() {
+            let _ = std::fs::remove_file(&self.tmp);
+            return Err(ApiError::OutputExists(self.target.clone()));
+        }
+        if let Err(e) = std::fs::rename(&self.tmp, &self.target) {
+            let _ = std::fs::remove_file(&self.tmp);
+            return Err(ApiError::Io(mr_io::IoError::Io(e)));
+        }
+        Ok(self.target.clone())
+    }
+}
+
+impl std::io::Write for OutputFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self.writer.as_mut() {
+            Some(w) => w.write(buf),
+            None => Err(std::io::Error::other("salida ya cerrada")),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self.writer.as_mut() {
+            Some(w) => w.flush(),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for OutputFile {
+    fn drop(&mut self) {
+        if let Some(w) = self.writer.take() {
+            drop(w);
+            let _ = std::fs::remove_file(&self.tmp);
+        }
+    }
+}
+
+/// Crea el fichero de salida de una extracción del origen `src` con la política común (la misma
+/// que usará la recuperación de M4): [`check_output_path`] (nunca el origen ni un dispositivo ni un
+/// directorio); si `out` ya existe y `overwrite` es `false`, [`ApiError::OutputExists`]; la
+/// escritura va a un temporal nuevo (`.<nombre>.<pid>-<n>.mrtmp`) del mismo directorio que se
+/// renombra al confirmar ([`OutputFile::commit`]) y se borra si no se confirma.
+pub fn create_output(src: &Source, out: &Path, overwrite: bool) -> Result<OutputFile> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    check_output_path(src, out)?;
+    if !overwrite && out.exists() {
+        return Err(ApiError::OutputExists(out.to_path_buf()));
+    }
+    let name = out.file_name().ok_or_else(|| {
+        ApiError::InvalidArgument(format!("salida sin nombre de fichero: {}", out.display()))
+    })?;
+    let dir = out
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut last = None;
+    for _ in 0..16 {
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let tmp = dir.join(format!(
+            ".{}.{}-{n}.mrtmp",
+            name.to_string_lossy(),
+            std::process::id()
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(f) => {
+                return Ok(OutputFile {
+                    writer: Some(std::io::BufWriter::new(f)),
+                    tmp,
+                    target: out.to_path_buf(),
+                    overwrite,
+                })
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = Some(e),
+            Err(e) => return Err(ApiError::Io(mr_io::IoError::Io(e))),
+        }
+    }
+    Err(ApiError::Io(mr_io::IoError::Io(last.unwrap_or_else(
+        || std::io::Error::other("no se pudo crear el fichero temporal"),
+    ))))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1189,5 +1398,85 @@ mod tests {
             Err(ApiError::Ntfs(mr_fs_ntfs::NtfsError::NotNtfs { .. })) => {}
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn output_path_is_never_the_source_or_a_device() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("origen.img");
+        std::fs::write(&img, vec![0u8; 4096]).unwrap();
+        let src = open_source(&img, 512).unwrap();
+        // El propio origen, también escrito de otra forma.
+        let alt = dir.path().join(".").join("ORIGEN.IMG");
+        for bad in [img.clone(), alt] {
+            match check_output_path(&src, &bad) {
+                Err(ApiError::InvalidArgument(m)) => assert!(m.contains("propio origen"), "{m}"),
+                other => panic!("{other:?}"),
+            }
+        }
+        // Dispositivos y directorios.
+        for dev in [r"\\.\PhysicalDrive0", r"\\.\C:", "NUL", r"\\?\GLOBALROOT\x"] {
+            assert!(
+                matches!(
+                    check_output_path(&src, Path::new(dev)),
+                    Err(ApiError::Io(_))
+                ),
+                "{dev}"
+            );
+        }
+        assert!(check_output_path(&src, dir.path()).is_err());
+        // Un fichero nuevo junto al origen sí (aquí no se escribe nada).
+        check_output_path(&src, &dir.path().join("salida.bin")).unwrap();
+        // Un rango del origen sigue siendo el mismo fichero.
+        let part = open_range(&src, 1, 4).unwrap();
+        assert!(check_output_path(&part, &img).is_err());
+        assert!(!dir.path().join("salida.bin").exists());
+    }
+
+    #[test]
+    fn create_output_is_atomic_and_never_overwrites_silently() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("origen.img");
+        std::fs::write(&img, vec![0u8; 4096]).unwrap();
+        let src = open_source(&img, 512).unwrap();
+        let out = dir.path().join("salida.bin");
+        let entries = || std::fs::read_dir(dir.path()).unwrap().count();
+        // Nuevo: se escribe en un temporal y aparece con el nombre final solo al confirmar.
+        let mut o = create_output(&src, &out, false).unwrap();
+        o.write_all(b"primero").unwrap();
+        assert!(o.temp_path().exists());
+        assert!(!out.exists());
+        let tmp = o.temp_path().to_path_buf();
+        assert_eq!(o.commit().unwrap(), out);
+        assert_eq!(std::fs::read(&out).unwrap(), b"primero");
+        assert!(!tmp.exists());
+        // Existe y no se pidió sobrescribir: error y el fichero no cambia.
+        match create_output(&src, &out, false) {
+            Err(ApiError::OutputExists(p)) => assert_eq!(p, out),
+            other => panic!("{:?}", other.map(|_| ())),
+        }
+        assert_eq!(std::fs::read(&out).unwrap(), b"primero");
+        // Con petición explícita, se sustituye.
+        let mut o = create_output(&src, &out, true).unwrap();
+        o.write_all(b"segundo").unwrap();
+        o.commit().unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"segundo");
+        // Fallo a mitad (sin confirmar): ni fichero final nuevo ni temporal.
+        let other = dir.path().join("otra.bin");
+        let mut o = create_output(&src, &other, false).unwrap();
+        o.write_all(&[7u8; 100_000]).unwrap();
+        let tmp = o.temp_path().to_path_buf();
+        drop(o);
+        assert!(!other.exists() && !tmp.exists());
+        // Sustitución fallida: el anterior se conserva intacto.
+        let mut o = create_output(&src, &out, true).unwrap();
+        o.write_all(b"parcial").unwrap();
+        drop(o);
+        assert_eq!(std::fs::read(&out).unwrap(), b"segundo");
+        assert_eq!(entries(), 2, "solo el origen y la salida");
+        // El origen nunca, ni con sobrescritura.
+        assert!(create_output(&src, &img, true).is_err());
+        assert_eq!(std::fs::read(&img).unwrap(), vec![0u8; 4096]);
     }
 }

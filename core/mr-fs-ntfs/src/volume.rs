@@ -11,6 +11,14 @@
 //! 3. **`$MFTMirr`.** Se comparan los primeros registros de la MFT (tantos como dice el `$DATA` del
 //!    registro 1, normalmente 4) con su copia; cada discrepancia se informa.
 //! 4. **`$Volume`.** Etiqueta y versión (registro 3), solo informativas.
+//!
+//! Si los runs del registro 0 no cubren toda la MFT y el registro 0 tiene `$ATTRIBUTE_LIST`, se
+//! siguen sus extensiones (con las mismas reglas que cualquier fichero, [`crate::file`]) para
+//! completar la disposición (`mft_extended`); si aun así falta, `mft_incomplete`.
+//!
+//! Ficheros y flujos (#21): [`NtfsVolume::file`] reúne los atributos de un registro base y sus
+//! extensiones; [`NtfsVolume::open_stream`] abre un flujo `$DATA` para leerlo con el mapa de
+//! validez por tramos ([`crate::stream`]).
 
 use std::fmt;
 use std::ops::Range;
@@ -22,10 +30,12 @@ use mr_part::Severity;
 
 use crate::attr::{types, utf16_lossy, AttrBody};
 use crate::boot::{parse_boot, same_bpb, BootError, BootNote, BootSector, BOOT_SIZE};
+use crate::file::{assemble, Geometry, NtfsFile, RecordSource as FileSource, StreamLayout};
 use crate::mft::{read_record_at, MftLayout, RecordOutcome, RecordState, Records, MAX_RECORDS};
 use crate::read::read_span;
 use crate::record::FileRecord;
 use crate::runs::{decode_runs, Run};
+use crate::stream::DataStream;
 use crate::NtfsError;
 
 /// Reintentos por sector en las lecturas del lector NTFS.
@@ -209,10 +219,14 @@ pub enum NtfsAnomaly {
         data_size: u64,
         record_size: u32,
     },
-    /// Los runs del registro 0 no cubren toda la MFT (extensiones no seguidas).
+    /// Los runs del registro 0 (y de sus extensiones, si las hay) no cubren toda la MFT.
     MftIncomplete {
         mapped_records: u64,
         record_count: u64,
+    },
+    /// La MFT se ha completado con los runs de extensiones de `$MFT` (`$ATTRIBUTE_LIST`).
+    MftExtended {
+        extensions: Vec<u64>,
     },
     /// El primer run de `$MFTMirr` no empieza en el LCN del arranque.
     MftMirrLcnMismatch {
@@ -248,6 +262,7 @@ impl NtfsAnomaly {
             NtfsAnomaly::MftLcnMismatch { .. } => "mft_lcn_mismatch",
             NtfsAnomaly::MftSizeNotMultiple { .. } => "mft_size_not_multiple",
             NtfsAnomaly::MftIncomplete { .. } => "mft_incomplete",
+            NtfsAnomaly::MftExtended { .. } => "mft_extended",
             NtfsAnomaly::MftMirrLcnMismatch { .. } => "mftmirr_lcn_mismatch",
             NtfsAnomaly::MftMirrRecordUnusable { .. } => "mftmirr_record_unusable",
             NtfsAnomaly::MirrorMismatch(_) => "mftmirr_mismatch",
@@ -275,6 +290,7 @@ impl NtfsAnomaly {
             | NtfsAnomaly::BootBackupShifted { .. }
             | NtfsAnomaly::BootNote(_)
             | NtfsAnomaly::MftMirrRecordUnusable { .. }
+            | NtfsAnomaly::MftExtended { .. }
             | NtfsAnomaly::VolumeRecordUnusable { .. } => Severity::Notice,
         }
     }
@@ -354,7 +370,11 @@ impl fmt::Display for NtfsAnomaly {
                 record_count,
             } => write!(
                 f,
-                "los runs del registro 0 solo cubren {mapped_records} de {record_count} registros (extensiones de $MFT no seguidas)"
+                "los runs de $MFT solo cubren {mapped_records} de {record_count} registros"
+            ),
+            NtfsAnomaly::MftExtended { extensions } => write!(
+                f,
+                "$MFT continúa en los registros de extensión {extensions:?} ($ATTRIBUTE_LIST)"
             ),
             NtfsAnomaly::MftMirrLcnMismatch { boot, runs } => write!(
                 f,
@@ -582,15 +602,112 @@ fn layout_from_record0(
             record_size: boot.mft_record_size,
         });
     }
-    let mapped = layout.mapped_records();
-    // Con $ATTRIBUTE_LIST la MFT puede seguir en registros de extensión que no se siguen aquí.
-    if mapped < layout.record_count {
+    Ok(layout)
+}
+
+/// Lector de registros y flujos sobre un origen y una disposición de la MFT.
+struct Reader<'a> {
+    dev: &'a dyn BlockDevice,
+    layout: &'a MftLayout,
+    retries: u32,
+    geometry: Geometry,
+}
+
+impl FileSource for Reader<'_> {
+    fn record_count(&self) -> u64 {
+        self.layout.record_count
+    }
+
+    fn record(
+        &self,
+        n: u64,
+    ) -> Result<Result<FileRecord, (RecordState, Option<String>)>, NtfsError> {
+        let o = read_record_at(self.dev, self.layout, n, self.retries)?;
+        let state = o.state();
+        let detail = o.detail();
+        Ok(o.into_record().ok_or((state, detail)))
+    }
+
+    fn attribute_list(
+        &self,
+        layout: &StreamLayout,
+    ) -> Result<(Vec<u8>, Option<String>), NtfsError> {
+        let s = DataStream::new(self.dev, self.retries, layout.clone(), 0, true);
+        let c = s.read(0, layout.data_size as usize)?;
+        let bad = c.untrusted().next().copied();
+        match bad {
+            None => Ok((c.data, None)),
+            Some(r) => {
+                let at = (r.offset - c.offset) as usize;
+                Ok((c.data[..at].to_vec(), Some(r.to_string())))
+            }
+        }
+    }
+
+    fn geometry(&self) -> Geometry {
+        self.geometry
+    }
+}
+
+fn geometry(boot: &BootSector) -> Geometry {
+    Geometry {
+        cluster_size: boot.cluster_size,
+        total_clusters: boot.total_clusters,
+    }
+}
+
+/// Completa la disposición de la MFT con las extensiones de `$MFT` (si el registro 0 tiene
+/// `$ATTRIBUTE_LIST`) y anota `mft_extended` o `mft_incomplete`.
+fn extend_mft(
+    dev: &dyn BlockDevice,
+    boot: &BootSector,
+    layout: MftLayout,
+    retries: u32,
+    anomalies: &mut Vec<NtfsAnomaly>,
+) -> Result<MftLayout, NtfsError> {
+    if layout.mapped_records() >= layout.record_count {
+        return Ok(layout);
+    }
+    let reader = Reader {
+        dev,
+        layout: &layout,
+        retries,
+        geometry: geometry(boot),
+    };
+    let extended = match read_record_at(dev, &layout, 0, retries)?.into_record() {
+        Some(r0)
+            if r0
+                .attributes()
+                .flatten()
+                .any(|a| a.type_code == types::ATTRIBUTE_LIST) =>
+        {
+            let f = assemble(&reader, r0)?;
+            f.stream_layout(types::DATA, "", geometry(boot))
+                .ok()
+                .filter(|l| l.issues.is_empty() && !f.extensions.is_empty())
+                .map(|l| (l.runs, f.extensions))
+        }
+        _ => None,
+    };
+    let mut best = layout.clone();
+    if let Some((runs, extensions)) = extended {
+        let candidate = MftLayout {
+            runs,
+            ..layout.clone()
+        };
+        if candidate.mapped_records() > layout.mapped_records() {
+            best = candidate;
+            anomalies.push(NtfsAnomaly::MftExtended { extensions });
+        }
+    }
+    let mapped = best.mapped_records();
+    if mapped < best.record_count {
         anomalies.push(NtfsAnomaly::MftIncomplete {
             mapped_records: mapped,
-            record_count: layout.record_count,
+            record_count: best.record_count,
         });
     }
-    Ok(layout)
+    Ok(best)
 }
 
 /// Bytes de un registro sin su matriz de secuencia de actualización (puede diferir entre copias).
@@ -766,6 +883,7 @@ impl NtfsVolume {
             }
         };
         anomalies.extend(mft_anoms);
+        let layout = extend_mft(d, &boot, layout, retries, &mut anomalies)?;
 
         // 3. $MFTMirr: posición y tamaño según el registro 1; comparación registro a registro.
         let mirror_default = DEFAULT_MIRROR_RECORDS.min(layout.record_count);
@@ -902,6 +1020,66 @@ impl NtfsVolume {
     /// Todos los registros de la MFT en orden, con su resultado.
     pub fn records(&self) -> Records<'_> {
         self.records_in(0..self.record_count())
+    }
+
+    /// Geometría (tamaño de clúster y clústeres del volumen).
+    pub fn geometry(&self) -> Geometry {
+        geometry(&self.info.boot)
+    }
+
+    fn reader(&self) -> Reader<'_> {
+        Reader {
+            dev: &*self.dev,
+            layout: &self.info.mft,
+            retries: self.retries,
+            geometry: self.geometry(),
+        }
+    }
+
+    /// Fichero del registro base `number`: sus atributos y los de sus registros de extensión
+    /// (`$ATTRIBUTE_LIST`), con las anomalías encontradas. Vale también para registros no en uso
+    /// (borrados). Error si el registro no es interpretable o es una extensión de otro.
+    pub fn file(&self, number: u64) -> Result<NtfsFile, NtfsError> {
+        let o = self.read_record(number)?;
+        let state = o.state();
+        let detail = o.detail();
+        let Some(rec) = o.into_record() else {
+            return Err(NtfsError::RecordUnusable {
+                number,
+                state,
+                detail,
+            });
+        };
+        if !rec.header().is_base() {
+            return Err(NtfsError::NotBaseRecord {
+                number,
+                base: rec.header().base_record,
+            });
+        }
+        assemble(&self.reader(), rec)
+    }
+
+    /// Abre el flujo `$DATA` `name` (`""` = el principal) del registro base `number`.
+    pub fn open_stream(&self, number: u64, name: &str) -> Result<DataStream<'_>, NtfsError> {
+        let f = self.file(number)?;
+        self.stream_of(&f, name)
+    }
+
+    /// Abre el flujo `$DATA` `name` de un fichero ya reunido.
+    pub fn stream_of(&self, file: &NtfsFile, name: &str) -> Result<DataStream<'_>, NtfsError> {
+        let layout = file
+            .stream_layout(types::DATA, name, self.geometry())
+            .map_err(|error| NtfsError::Stream {
+                number: file.number,
+                error,
+            })?;
+        Ok(DataStream::new(
+            &*self.dev,
+            self.retries,
+            layout,
+            file.number,
+            file.in_use(),
+        ))
     }
 
     /// Registros de `range` (acotado a la MFT) en orden, con su resultado.
