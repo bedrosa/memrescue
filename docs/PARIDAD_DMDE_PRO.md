@@ -110,10 +110,10 @@ Referencias abreviadas a documentos de investigación: `F1-05` = `investigacion/
 
 | ID | Funcionalidad | Descripción | Ref. DMDE | Evidencias | Verif. | Diseño MemRescue | Estado | Pruebas necesarias | Diferencias pendientes |
 |---|---|---|---|---|---|---|---|---|---|
-| RW-01 | Búsqueda RAW integrada en Full Scan | Resultados en carpeta RAW | Full Scan | MAN, F1-08 | M B | `mr-raw` | No iniciado | Imagen con ficheros conocidos sin FS | Lógica DMDE no verificada (INV-02) |
+| RW-01 | Búsqueda RAW integrada en Full Scan | Resultados en carpeta RAW | Full Scan | MAN, F1-08 | M B | `mr-raw` | No iniciado | Imagen con ficheros conocidos sin FS | Lógica interna de DMDE desconocida; diseño propio en INV-02 §7 |
 | RW-02 | Firmas con comodín, máscara de bits, offset variable ≤ 4096 | Definición | Full Scan | MAN | M B | ADR-009 | No iniciado | Pruebas unitarias del matcher | - |
 | RW-03 | Firma EOF, límites de tamaño, contenedores, "fiable" | Fin de fichero | Full Scan | MAN, F1-08 | M B | `mr-raw` | No iniciado | Ficheros truncados/concatenados | - |
-| RW-04 | Calculadores de tamaño por formato | JPEG, ZIP, OLE, MP4, PDF… | Implícito | F1-08 (tabla de tipos) | B | `mr-raw::formats` | No iniciado | Corpus por formato | Qué formatos calcula DMDE ? (INV-02) |
+| RW-04 | Calculadores de tamaño por formato | JPEG, ZIP, OLE, MP4, PDF… | Implícito | F1-08 (tabla de tipos) | B | `mr-raw::formats` | No iniciado | Corpus por formato | DMDE no publica qué formatos calcula (INV-02 §6); propuesta en INV-02 §4 y §7.5 |
 | RW-05 | Filtrado RAW con mapa de clusters | Ocultar lo ya hallado por FS | Full Scan | MAN | M B | `mr-raw` + `mr-vfs` | No iniciado | Imagen mixta | - |
 | RW-06 | Generar firma desde muestras + probar | Asistente | Full Scan | MAN, F1-04 | M B | `mr-raw` | No iniciado | Muestras sintéticas | - |
 | RW-07 | Marcadores de estado RAW (+EOF, sin EOF, tamaño estimado) | Panel | File panel | MAN | M | UI | No iniciado | - | - |
