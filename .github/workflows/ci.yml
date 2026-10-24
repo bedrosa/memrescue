@@ -116,6 +116,14 @@ jobs:
     name: .NET build and interop tests
     runs-on: windows-latest
     timeout-minutes: 40
+    # The interop tests of the NTFS file tree (#22) use the NTFS corpus artifact (ADR-024):
+    # downloading it needs actions: read, granted to this job only.
+    permissions:
+      contents: read
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -138,6 +146,8 @@ jobs:
           restore-keys: rust-dotnet-${{ runner.os }}-
       - name: Generate synthetic corpus (used by interop tests)
         run: python -I -X utf8 tests/generators/gen_partition_images.py tests/corpus/generated
+      - name: Fetch the NTFS corpus (used by the NTFS interop tests; SHA-256 checked against the versioned manifests)
+        run: python -I -X utf8 tools/fetch_ntfs_corpus.py
       - name: Build solution (warnings as errors, builds the native engine)
         run: dotnet build app/MemRescue.slnx -c Debug
       - name: Interop tests (C# against the real memrescue_core.dll)

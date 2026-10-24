@@ -38,6 +38,10 @@ pub const MR_ERR_OUT_OF_RANGE: i32 = 11;
 pub const MR_ERR_CORRUPT: i32 = 12;
 pub const MR_ERR_EXTERNAL_REFERENCE: i32 = 13;
 pub const MR_ERR_UNSUPPORTED_FEATURE: i32 = 14;
+/// Ruta NTFS que no existe (#22).
+pub const MR_ERR_NOT_FOUND: i32 = 15;
+/// La salida ya existe y no se pidió sustituirla (#22).
+pub const MR_ERR_ALREADY_EXISTS: i32 = 16;
 
 /// `mr_source_open`: leer como RAW aunque parezca un contenedor.
 pub const MR_OPEN_FORCE_RAW: u32 = 1;
@@ -413,9 +417,15 @@ fn api_error_code(e: &ApiError) -> i32 {
         ApiError::Ntfs(mr_api::mr_fs_ntfs::NtfsError::RecordOutOfRange { .. }) => {
             MR_ERR_OUT_OF_RANGE
         }
+        ApiError::Ntfs(mr_api::mr_fs_ntfs::NtfsError::NotFound { .. }) => MR_ERR_NOT_FOUND,
+        ApiError::Ntfs(
+            mr_api::mr_fs_ntfs::NtfsError::NotADirectory { .. }
+            | mr_api::mr_fs_ntfs::NtfsError::InvalidPath { .. },
+        ) => MR_ERR_INVALID_ARGUMENT,
+        ApiError::OutputExists(_) => MR_ERR_ALREADY_EXISTS,
         ApiError::Ntfs(_) => MR_ERR_CORRUPT,
         ApiError::Cancelled => MR_ERR_CANCELLED,
-        ApiError::InvalidArgument(_) | ApiError::OutputExists(_) => MR_ERR_INVALID_ARGUMENT,
+        ApiError::InvalidArgument(_) => MR_ERR_INVALID_ARGUMENT,
         ApiError::Spawn(_) => MR_ERR_IO,
     }
 }
@@ -455,6 +465,14 @@ enum Entry {
     },
     /// Búsqueda de particiones perdidas (el origen se conserva para abrir los volúmenes).
     Search(Box<SearchEntry>),
+    /// Volumen NTFS abierto (#22) con su origen.
+    Ntfs(Box<ntfs::NtfsEntry>),
+    /// Listado de un directorio NTFS.
+    NtfsListing(Box<mr_api::mr_fs_ntfs::DirListing>),
+    /// Árbol NTFS en segundo plano.
+    NtfsTree(Box<ntfs::TreeEntry>),
+    /// Copia de un fichero NTFS en segundo plano.
+    NtfsCopy(Box<ntfs::CopyEntry>),
 }
 
 /// Tarea de búsqueda de particiones con su resultado y el origen en que se hizo.
@@ -2541,7 +2559,12 @@ pub unsafe extern "C" fn mr_task_status_get(task: u64, out: *mut MrTaskStatus) -
                 Entry::Hash { task, .. } => (task.state(), task.progress()),
                 Entry::Verify { task, .. } => (task.state(), task.progress()),
                 Entry::Search(e) => (e.task.state(), e.task.progress()),
-                Entry::Source(_) | Entry::Partitions { .. } => return None,
+                Entry::NtfsTree(e) => (e.task.state(), e.task.progress()),
+                Entry::NtfsCopy(e) => (e.task.state(), e.task.progress()),
+                Entry::Source(_)
+                | Entry::Partitions { .. }
+                | Entry::Ntfs(_)
+                | Entry::NtfsListing(_) => return None,
             };
             Some(MrTaskStatus {
                 state: state as u32,
@@ -2574,7 +2597,18 @@ pub extern "C" fn mr_task_cancel(task: u64) -> i32 {
                 e.task.cancel();
                 true
             }
-            Entry::Source(_) | Entry::Partitions { .. } => false,
+            Entry::NtfsTree(e) => {
+                e.task.cancel();
+                true
+            }
+            Entry::NtfsCopy(e) => {
+                e.task.cancel();
+                true
+            }
+            Entry::Source(_)
+            | Entry::Partitions { .. }
+            | Entry::Ntfs(_)
+            | Entry::NtfsListing(_) => false,
         });
         if cancelled == Some(true) {
             MR_OK
@@ -2589,7 +2623,13 @@ pub extern "C" fn mr_task_free(task: u64) -> i32 {
     guard(|| {
         let mut map = registry().lock().unwrap_or_else(|e| e.into_inner());
         match map.get(&task) {
-            Some(Entry::Hash { .. } | Entry::Verify { .. } | Entry::Search(_)) => {}
+            Some(
+                Entry::Hash { .. }
+                | Entry::Verify { .. }
+                | Entry::Search(_)
+                | Entry::NtfsTree(_)
+                | Entry::NtfsCopy(_),
+            ) => {}
             _ => return bad_task(task),
         }
         // Si sigue en marcha se cancela; el hilo termina por su cuenta.
@@ -2597,11 +2637,18 @@ pub extern "C" fn mr_task_free(task: u64) -> i32 {
             Some(Entry::Hash { task, .. }) => task.cancel(),
             Some(Entry::Verify { task, .. }) => task.cancel(),
             Some(Entry::Search(e)) => e.task.cancel(),
+            Some(Entry::NtfsTree(e)) => e.task.cancel(),
+            Some(Entry::NtfsCopy(e)) => e.task.cancel(),
             _ => {}
         }
         MR_OK
     })
 }
 
+mod ntfs;
+pub use ntfs::*;
+
+#[cfg(test)]
+mod ntfs_tests;
 #[cfg(test)]
 mod tests;

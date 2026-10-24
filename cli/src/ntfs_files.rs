@@ -1,5 +1,5 @@
 //! `ntfs-cat` y `ntfs-stat`: contenido y atributos de un fichero NTFS por número de registro MFT
-//! (#21).
+//! (#21) o por ruta (#22); `ntfs-ls`: directorios y árbol (#22).
 
 use std::io::Write;
 use std::path::Path;
@@ -8,7 +8,14 @@ use mr_api::mr_fs_ntfs::attr::type_name;
 use mr_api::mr_fs_ntfs::file::{AttrValue, SegmentKind, StreamLayout};
 use mr_api::mr_fs_ntfs::runs::{merge_contiguous, sparse_ranges};
 use mr_api::mr_fs_ntfs::values::{filetime_to_unix, Times};
-use mr_api::mr_fs_ntfs::{CopyReport, NtfsFile, NtfsVolume};
+use std::collections::HashSet;
+use std::sync::Arc;
+
+use mr_api::mr_fs_ntfs::dir::{DirEntry, ROOT_RECORD};
+use mr_api::mr_fs_ntfs::{
+    CopyReport, EntryState, NtfsFile, NtfsVolume, RecordState, TreeAnomaly, TreeIssue, TreeNode,
+    TreeOptions, TreeStatus,
+};
 
 use crate::json_str;
 
@@ -442,4 +449,287 @@ pub fn stat_text(v: &NtfsVolume, f: &NtfsFile) {
             println!("  {}: {a}", a.code());
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// ntfs-ls (#22)
+// ---------------------------------------------------------------------------------------------
+
+fn entry_type(e: &DirEntry) -> &'static str {
+    if e.is_directory {
+        "dir"
+    } else {
+        "file"
+    }
+}
+
+fn entry_json(e: &DirEntry, path: &str) -> String {
+    format!(
+        "{{\"name\":{},\"path\":{},\"type\":\"{}\",\"record\":{},\"sequence\":{},\"parent\":{},\"size\":{},\"allocated_size\":{},{},\"attributes\":{},\"namespace\":\"{}\",\"dos_name\":{},\"name_lossy\":{},\"links\":{},\"system\":{},\"state\":\"{}\",\"state_detail\":{}}}",
+        json_str(&e.name),
+        json_str(path),
+        entry_type(e),
+        e.reference.record,
+        e.reference.sequence,
+        e.parent.record,
+        e.size,
+        e.allocated_size,
+        times_json(&e.times),
+        e.file_attributes,
+        e.namespace.code(),
+        e.dos_name.as_deref().map_or_else(|| "null".into(), json_str),
+        e.name_lossy,
+        e.link_count,
+        e.system,
+        e.state.code(),
+        if e.state.is_live() {
+            "null".into()
+        } else {
+            json_str(&e.state.to_string())
+        }
+    )
+}
+
+fn entry_text(e: &DirEntry, shown: &str) {
+    let modified = filetime_iso(e.times.modified).unwrap_or_else(|| "-".into());
+    let state = if e.state.is_live() {
+        String::new()
+    } else {
+        format!("   [{}: {}]", e.state.code(), e.state)
+    };
+    println!(
+        "{:<4} {:>12}  {:<28}  {:>8}-{:<5} {}{}{}",
+        if e.is_directory { "DIR" } else { "" },
+        if e.is_directory {
+            String::new()
+        } else {
+            e.size.to_string()
+        },
+        modified,
+        e.reference.record,
+        e.reference.sequence,
+        shown,
+        if e.system { "  (sistema)" } else { "" },
+        state
+    );
+}
+
+fn join(parent: &str, name: &str) -> String {
+    if parent == "/" {
+        format!("/{name}")
+    } else {
+        format!("{parent}/{name}")
+    }
+}
+
+/// `ntfs-ls`: contenido de un directorio (o la entrada de un fichero) y, con `-r`, el subárbol
+/// (con los huérfanos si se lista la raíz). Código 3 si hay nodos o registros ilegibles.
+pub fn ls(
+    v: &Arc<NtfsVolume>,
+    path: &str,
+    recursive: bool,
+    json: bool,
+) -> Result<(), (u8, String)> {
+    let op = |e: &dyn std::fmt::Display| (1u8, e.to_string());
+    let target = mr_api::ntfs_resolve(v, path).map_err(|e| op(&e))?;
+    // Ruta canónica (nombres tal como están en el volumen).
+    let canonical = mr_api::ntfs_path_of(v, target.record()).unwrap_or_else(|_| path.to_string());
+    if !target.is_directory {
+        if json {
+            println!(
+                "{{\"path\":{},\"entries\":[{}],\"anomalies\":[]}}",
+                json_str(&canonical),
+                entry_json(&target, &canonical)
+            );
+        } else {
+            entry_text(&target, &canonical);
+        }
+        return Ok(());
+    }
+    let unreadable = if recursive {
+        ls_tree(v, &target, &canonical, json)?
+    } else {
+        let l = mr_api::ntfs_list_dir(v, target.record()).map_err(|e| op(&e))?;
+        if json {
+            let entries: Vec<String> = l
+                .entries
+                .iter()
+                .map(|e| entry_json(e, &join(&canonical, &e.name)))
+                .collect();
+            let anomalies: Vec<String> = l
+                .anomalies
+                .iter()
+                .map(|a| {
+                    format!(
+                        "{{\"code\":\"{}\",\"node\":{},\"message\":{}}}",
+                        a.issue.code(),
+                        json_str(&a.node.to_string()),
+                        json_str(&a.issue.to_string())
+                    )
+                })
+                .collect();
+            println!(
+                "{{\"path\":{},\"directory\":{},\"entries\":[{}],\"anomalies\":[{}]}}",
+                json_str(&canonical),
+                target.record(),
+                entries.join(","),
+                anomalies.join(",")
+            );
+        } else {
+            println!(
+                "Directorio {canonical} (registro {}): {} entradas, {} vivas",
+                target.record(),
+                l.entries.len(),
+                l.live().count()
+            );
+            for e in &l.entries {
+                entry_text(e, &e.name);
+            }
+            for a in &l.anomalies {
+                println!("ANOMALÍA [{}] {a}", a.issue.code());
+            }
+        }
+        l.has_unreadable()
+    };
+    if unreadable {
+        return Err((
+            3,
+            "nodos de índice o registros con sectores ilegibles: no se interpretaron".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// `ntfs-ls -r`: el árbol del volumen (tarea con progreso) recortado al subárbol pedido.
+/// Devuelve si hubo nodos o registros ilegibles en él.
+fn ls_tree(
+    v: &Arc<NtfsVolume>,
+    target: &DirEntry,
+    canonical: &str,
+    json: bool,
+) -> Result<bool, (u8, String)> {
+    let op = |e: &dyn std::fmt::Display| (1u8, e.to_string());
+    let task = mr_api::start_ntfs_tree_task(
+        Arc::clone(v),
+        TreeOptions {
+            orphans: target.record() == ROOT_RECORD,
+            ..TreeOptions::default()
+        },
+    )
+    .map_err(|e| op(&e))?;
+    while task.state() == mr_api::task::TaskState::Running {
+        let (d, t) = task.progress();
+        if !json && t > 0 {
+            eprint!("\r{d}/{t}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    if !json {
+        eprintln!();
+    }
+    let t = task.wait().map_err(|e| op(&e))?;
+    // Subárbol: nodos que tienen como antecesor el del directorio pedido.
+    let start = t
+        .nodes
+        .iter()
+        .position(|n| n.entry.record() == target.record() && n.entry.state.is_live())
+        .ok_or_else(|| op(&format!("{canonical} no se alcanza desde la raíz")))?;
+    let mut inside = vec![false; t.nodes.len()];
+    inside[start] = true;
+    for i in start + 1..t.nodes.len() {
+        if let Some(p) = t.nodes[i].parent {
+            inside[i] = inside[p];
+        }
+    }
+    let dirs: HashSet<u64> = t
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(i, n)| inside[*i] && n.entry.is_directory)
+        .map(|(_, n)| n.entry.record())
+        .collect();
+    let anomalies: Vec<&TreeAnomaly> = t
+        .anomalies
+        .iter()
+        .filter(|a| dirs.contains(&a.directory))
+        .collect();
+    let unreadable = anomalies.iter().any(|a| match &a.issue {
+        TreeIssue::Index(i) => i.issue.is_unreadable(),
+        _ => false,
+    }) || t.nodes.iter().enumerate().any(|(i, n)| {
+        inside[i]
+            && matches!(
+                &n.entry.state,
+                EntryState::RecordUnusable { state, .. } if *state == RecordState::Unreadable
+            )
+    });
+    let nodes: Vec<&TreeNode> = t
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| inside[*i] && *i != start)
+        .map(|(_, n)| n)
+        .collect();
+    if json {
+        let entries: Vec<String> = nodes
+            .iter()
+            .map(|n| entry_json(&n.entry, &n.path))
+            .collect();
+        let anoms: Vec<String> = anomalies
+            .iter()
+            .map(|a| {
+                format!(
+                    "{{\"code\":\"{}\",\"path\":{},\"message\":{}}}",
+                    a.issue.code(),
+                    json_str(&a.path),
+                    json_str(&a.issue.to_string())
+                )
+            })
+            .collect();
+        let orphans: Vec<String> = t
+            .orphans
+            .iter()
+            .map(|o| {
+                format!(
+                    "{{\"record\":{},\"sequence\":{},\"name\":{},\"parent\":{},\"directory\":{},\"reason\":\"{}\",\"message\":{}}}",
+                    o.record,
+                    o.sequence,
+                    json_str(&o.name),
+                    o.parent.record,
+                    o.is_directory,
+                    o.reason.code(),
+                    json_str(&o.reason.to_string())
+                )
+            })
+            .collect();
+        println!(
+            "{{\"path\":{},\"status\":\"{}\",\"entries\":[{}],\"anomalies\":[{}],\"orphans\":[{}]}}",
+            json_str(canonical),
+            t.status.code(),
+            entries.join(","),
+            anoms.join(","),
+            orphans.join(",")
+        );
+    } else {
+        for n in &nodes {
+            entry_text(&n.entry, &n.path);
+        }
+        for a in &anomalies {
+            println!("ANOMALÍA [{}] {}: {}", a.issue.code(), a.path, a.issue);
+        }
+        for o in &t.orphans {
+            println!(
+                "HUÉRFANO registro {} «{}» (padre {}): [{}] {}",
+                o.record,
+                o.name,
+                o.parent.record,
+                o.reason.code(),
+                o.reason
+            );
+        }
+        if t.status != TreeStatus::Complete {
+            println!("Árbol incompleto: {}", t.status.code());
+        }
+    }
+    Ok(unreadable)
 }

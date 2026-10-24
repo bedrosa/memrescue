@@ -25,6 +25,9 @@ public static class Commands
     public static readonly RoutedUICommand OpenRange = new("Abrir rango de sectores como dispositivo", nameof(OpenRange), typeof(Commands),
         [new KeyGesture(Key.R, ModifierKeys.Control | ModifierKeys.Shift)]);
 
+    public static readonly RoutedUICommand OpenFileSystem = new("Abrir sistema de archivos NTFS del origen", nameof(OpenFileSystem), typeof(Commands),
+        [new KeyGesture(Key.F, ModifierKeys.Control | ModifierKeys.Shift)]);
+
     public static readonly RoutedUICommand CopyHex = new("Copiar volcado hexadecimal", nameof(CopyHex), typeof(Commands),
         [new KeyGesture(Key.C, ModifierKeys.Control | ModifierKeys.Shift)]);
 }

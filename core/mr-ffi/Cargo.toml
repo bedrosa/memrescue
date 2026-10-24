@@ -16,6 +16,7 @@ mr-api.workspace = true
 mr-io.workspace = true
 
 [dev-dependencies]
+mr-fs-ntfs = { workspace = true, features = ["test-support"] }
 mr-image.workspace = true
 tempfile.workspace = true
 

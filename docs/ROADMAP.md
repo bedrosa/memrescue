@@ -129,13 +129,19 @@ Milestone propio para no retrasar NTFS y la recuperación.
   - **Hecho (#20, ADR-025)**: arranque (estricto, con copia del último sector), localización de
     `$MFT`, registros FILE con fixups, cabeceras de atributo, lectura y enumeración de registros con
     estado, `$MFTMirr`; `mr_api::ntfs_open` y CLI `ntfs-info`; pruebas contra el corpus NTFS en la CI
-    (job `ntfs`). FFI e interfaz llegan con el árbol (#22).
+    (job `ntfs`). FFI e interfaz: con el árbol (#22, hecho).
   - **Hecho (#21, ADR-026)**: atributos tipados, `$ATTRIBUTE_LIST` (también de `$MFT`), runs de
     cualquier atributo, flujos residentes, no residentes, dispersos, con tamaño inicializado menor y
     comprimidos LZNT1 (oráculo de Windows), ADS; lectura con estado por tramo; `mr_api::ntfs_file`,
     `ntfs_read_stream`, `ntfs_copy_stream`; CLI `ntfs-stat` y `ntfs-cat`; SHA-256 de 439 flujos del
-    corpus. FFI e interfaz con el árbol (#22).
-  - Pendiente: índices `$I30` y árbol (#22); borrados (#23).
+    corpus. FFI e interfaz: con el árbol (#22, hecho).
+  - **Hecho (#22, ADR-028)**: índices `$I30` (raíz e `INDX` con fixups, VCN, límites, `$BITMAP`,
+    ciclos; nodos dañados tipados que no bloquean el resto), directorios contrastados con la MFT
+    (entradas reutilizadas o libres nunca como vivas), nombres DOS, enlaces duros, Unicode,
+    `$UpCase`, rutas y huérfanos; `mr_api::ntfs_list_dir`/`ntfs_resolve`/`ntfs_path_of`/árbol como
+    tarea; FFI (`mr_ntfs_*`), C# (`NtfsVolume`), CLI `ntfs-ls` y `ntfs-cat RUTA`; interfaz: pestaña
+    «Sistema de archivos» con árbol, lista, visor y «Guardar como…».
+  - Borrados (#23, ADR-027): la parte de la MFT está hecha; las entradas `INDX` residuales, pendientes.
 - Ficheros borrados (registros MFT no en uso, entradas INDX residuales).
 - **Paridad objetivo**: FS-01…FS-04.
 
@@ -217,9 +223,9 @@ Cada INV: alcance cerrado, fuentes en este orden: (1) especificación pública, 
 | ID | Tema | Origen | Antes de | Pregunta concreta | Punto de partida |
 |---|---|---|---|---|---|
 | INV-01 | Motor de recuperación | Área pendiente "arranque/recuperación" | M4 | **Hecha** (2026-10-18, solo fuentes públicas): `investigacion/dmde-fase2/INV-01-motor-de-recuperacion.md`, con propuesta propia de `mr-vfs`, `mr-recover` y `mr-report` y preguntas abiertas | Cadenas 0x833310–0x83fce8 (F1-08) |
-| INV-02 | Algoritmos RAW | Área "RAID/RAW" | M7 | Estructura de firma, granularidad del barrido, cálculo de tamaño por formato | Tabla 0x6d2167…, claves 0x6d9534 |
+| INV-02 | Algoritmos RAW | Área "RAID/RAW" | M7 | **Hecha** (2026-10-24, solo fuentes públicas): `investigacion/dmde-fase2/INV-02-busqueda-raw.md`, con propuesta propia de `mr-raw` (sintaxis de firmas, granularidad, tamaño por formato) y preguntas abiertas | Tabla 0x6d2167…, claves 0x6d9534 |
 | INV-03 | Puntuación de volúmenes candidatos | Pendiente NTFS | M6 | **Hecha** (2026-10-24, solo fuentes públicas): `investigacion/dmde-fase2/INV-03-escaneo-completo.md`, con propuesta propia de `mr-scan` (corridas, base de escaneo, geometría y puntuación por enlaces) y preguntas abiertas | `FUN_006a6d80`, `FUN_006a89b0`, `FUN_006a8c50` |
-| INV-03b | RAID: mapeo, delay, cálculo automático | Área "RAID/RAW" | M5 | Fórmulas de rotación y métrica de detección | Cadenas 0x6c1d64, 0x677594; manual RAID |
+| INV-03b | RAID: mapeo, delay, cálculo automático | Área "RAID/RAW" | M5 | **Hecha** (2026-10-24, solo fuentes públicas): `investigacion/dmde-fase2/INV-03b-raid.md`, con fórmulas de md y DDF, interpretación del delay, propuesta propia de `mr-raid` y de la detección, plan de corpus con md como oráculo y preguntas abiertas | Cadenas 0x6c1d64, 0x677594 (no consultadas); manual RAID |
 | INV-04 | FS no NTFS (uno por sesión) | Área "otros FS" | M8 | Validadores y escáneres de FAT, exFAT, HFS+, ReFS, Btrfs | Rangos del doc F1-03 |
 | INV-05 | MBR/EBR y búsqueda exprés de particiones | Área "otros FS" | M2 | **Hecha** (2026-10-17): `investigacion/dmde-fase2/INV-05-…md`. Bucle de candidatos: INV-05b (2026-10-18, `investigacion/dmde-fase2/INV-05b-…md`, propuesta propia) | 0x608b00–0x613300 |
 | INV-06 | Bucle de lectura con errores, CDB SCSI/ATA | Área "E/S" | M9 | Secuencia de reintentos/saltos/retroceso; opcodes | 0x4d6b00, 0x4d7730, 0x4d7f20, 0x4d9870 |

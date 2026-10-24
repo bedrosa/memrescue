@@ -309,10 +309,16 @@ impl Synth {
     /// runs (con clústeres de 512 B, el registro 15 queda partido entre ellos), `$MFTMirr` de 4
     /// registros y la copia del arranque en el último sector.
     pub fn new(spc: u8) -> Synth {
+        Synth::with_records(spc, SYNTH_RECORDS, SYNTH_INITIALIZED)
+    }
+
+    /// Como [`Synth::new`] con `records` registros en la MFT, de los que `initialized` están
+    /// dentro del tamaño inicializado (los 4 siguientes son basura que nunca debe leerse).
+    pub fn with_records(spc: u8, records: u64, initialized: u64) -> Synth {
         let c = 512 * u64::from(spc);
         let total_sectors = 2047u64;
         let rs = 1024u64;
-        let mft_bytes = SYNTH_RECORDS * rs;
+        let mft_bytes = records * rs;
         let clusters = mft_bytes / c;
         let first = (clusters / 2).max(1) - u64::from(c == 512);
         let second = clusters - first;
@@ -337,7 +343,7 @@ impl Synth {
         use crate::record::flags::{DIRECTORY, IN_USE};
         let si = || resident(0x10, "", &[0x10; 48]);
         let mut recs: Vec<Option<Vec<u8>>> = Vec::new();
-        for n in 0..SYNTH_RECORDS as u32 {
+        for n in 0..records as u32 {
             let r = match n {
                 0 => Some(record(
                     0,
@@ -353,7 +359,7 @@ impl Synth {
                             &encode_runs(&[(Some(lcn_a), first), (Some(lcn_b), second)]),
                             clusters * c,
                             mft_bytes,
-                            SYNTH_INITIALIZED * rs,
+                            initialized * rs,
                         ),
                     ],
                     1024,
@@ -405,9 +411,9 @@ impl Synth {
                 18 => Some(record(18, 2, 0, &[si()], 1024)),
                 19 => Some(record(19, 3, DIRECTORY, &[si()], 1024)),
                 20 => Some(record(20, 5, IN_USE, &[si()], 1024)),
-                24..=27 => Some(record(n, 1, 0, &[], 1024)),
                 // Más allá del tamaño inicializado: basura que nunca debe leerse.
-                28..=31 => Some(vec![0xEE; 1024]),
+                n if u64::from(n) >= initialized => Some(vec![0xEE; 1024]),
+                24..=27 => Some(record(n, 1, 0, &[], 1024)),
                 _ => None,
             };
             recs.push(r);
@@ -426,7 +432,7 @@ impl Synth {
             unreachable!()
         };
         let mut pieces = Vec::new();
-        for n in 0..SYNTH_RECORDS {
+        for n in 0..records {
             let mut p: Vec<(u64, u64)> = Vec::new();
             let mut b = n * rs;
             while b < (n + 1) * rs {
@@ -498,4 +504,519 @@ impl Synth {
             .flat_map(|&(d, l)| d / 512..(d + l) / 512)
             .collect()
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Índices de directorio y volumen con árbol (#22)
+// ---------------------------------------------------------------------------------------------
+
+/// Valor `$FILE_NAME` con el nombre en unidades UTF-16 (admite sustitutos sueltos).
+pub fn file_name_units(parent: u64, units: &[u16], ns: u8, attrs: u32, size: u64) -> Vec<u8> {
+    let mut v = vec![0u8; 0x42 + 2 * units.len()];
+    v[0..8].copy_from_slice(&parent.to_le_bytes());
+    for (i, t) in [11u64, 22, 33, 44].iter().enumerate() {
+        v[8 + 8 * i..16 + 8 * i].copy_from_slice(&t.to_le_bytes());
+    }
+    v[0x28..0x30].copy_from_slice(&size.next_multiple_of(8).to_le_bytes());
+    v[0x30..0x38].copy_from_slice(&size.to_le_bytes());
+    v[0x38..0x3C].copy_from_slice(&attrs.to_le_bytes());
+    v[0x40] = units.len() as u8;
+    v[0x41] = ns;
+    for (i, u) in units.iter().enumerate() {
+        v[0x42 + 2 * i..0x44 + 2 * i].copy_from_slice(&u.to_le_bytes());
+    }
+    v
+}
+
+/// `$FILE_NAME` de un nombre.
+pub fn file_name(parent: u64, name: &str, ns: u8, attrs: u32, size: u64) -> Vec<u8> {
+    let u: Vec<u16> = name.encode_utf16().collect();
+    file_name_units(parent, &u, ns, attrs, size)
+}
+
+/// Referencia en disco (número | secuencia << 48).
+pub fn fref(record: u64, sequence: u16) -> u64 {
+    record | (u64::from(sequence) << 48)
+}
+
+/// Entrada de índice: referencia, clave (`None` = última entrada) y subnodo.
+pub fn index_entry(reference: u64, key: Option<&[u8]>, subnode: Option<u64>) -> Vec<u8> {
+    let kl = key.map_or(0, <[u8]>::len);
+    let len = align8(0x10 + kl) + if subnode.is_some() { 8 } else { 0 };
+    let mut e = vec![0u8; len];
+    if key.is_some() {
+        e[0..8].copy_from_slice(&reference.to_le_bytes());
+    }
+    e[8..10].copy_from_slice(&(len as u16).to_le_bytes());
+    e[0x0A..0x0C].copy_from_slice(&(kl as u16).to_le_bytes());
+    let mut flags = 0u16;
+    if subnode.is_some() {
+        flags |= 1;
+    }
+    if key.is_none() {
+        flags |= 2;
+    }
+    e[0x0C..0x0E].copy_from_slice(&flags.to_le_bytes());
+    if let Some(k) = key {
+        e[0x10..0x10 + kl].copy_from_slice(k);
+    }
+    if let Some(v) = subnode {
+        e[len - 8..].copy_from_slice(&v.to_le_bytes());
+    }
+    e
+}
+
+/// Entrada con clave `$FILE_NAME` (nombre, espacio de nombres, padre).
+pub fn named_entry(
+    reference: u64,
+    parent: u64,
+    name: &str,
+    ns: u8,
+    subnode: Option<u64>,
+) -> Vec<u8> {
+    index_entry(
+        reference,
+        Some(&file_name(parent, name, ns, 0x20, 0)),
+        subnode,
+    )
+}
+
+/// Valor de `$INDEX_ROOT` de `$I30` con las entradas dadas (la última debe ser la final).
+pub fn index_root_value(entries: &[Vec<u8>], block_size: u32, large: bool) -> Vec<u8> {
+    let body: Vec<u8> = entries.concat();
+    let mut v = vec![0u8; 0x20];
+    v[0..4].copy_from_slice(&0x30u32.to_le_bytes());
+    v[4..8].copy_from_slice(&1u32.to_le_bytes());
+    v[8..12].copy_from_slice(&block_size.to_le_bytes());
+    v[0x0C] = 1;
+    let len = (0x10 + body.len()) as u32;
+    v[0x10..0x14].copy_from_slice(&0x10u32.to_le_bytes());
+    v[0x14..0x18].copy_from_slice(&len.to_le_bytes());
+    v[0x18..0x1C].copy_from_slice(&len.to_le_bytes());
+    v[0x1C] = u8::from(large);
+    v.extend_from_slice(&body);
+    v
+}
+
+/// Nodo `INDX` protegido (VCN, entradas, tamaño, indicador de subnodos).
+pub fn indx_block(vcn: u64, entries: &[Vec<u8>], block_size: usize, has_subnodes: bool) -> Vec<u8> {
+    let mut b = vec![0u8; block_size];
+    let count = block_size / 512 + 1;
+    b[0..4].copy_from_slice(b"INDX");
+    b[4..6].copy_from_slice(&0x28u16.to_le_bytes());
+    b[6..8].copy_from_slice(&(count as u16).to_le_bytes());
+    b[0x10..0x18].copy_from_slice(&vcn.to_le_bytes());
+    let first = align8(0x28 + 2 * count);
+    let eo = (first - 0x18) as u32;
+    let body: Vec<u8> = entries.concat();
+    let il = eo + body.len() as u32;
+    b[0x18..0x1C].copy_from_slice(&eo.to_le_bytes());
+    b[0x1C..0x20].copy_from_slice(&il.to_le_bytes());
+    b[0x20..0x24].copy_from_slice(&((block_size - 0x18) as u32).to_le_bytes());
+    b[0x24] = u8::from(has_subnodes);
+    b[0x28..0x2A].copy_from_slice(&0x0101u16.to_le_bytes());
+    b[first..first + body.len()].copy_from_slice(&body);
+    protect(&mut b);
+    b
+}
+
+/// Atributo residente con identificador.
+pub fn res(type_code: u32, name: &str, value: &[u8], id: u16) -> Vec<u8> {
+    with_id(resident(type_code, name, value), id)
+}
+
+/// Clúster de los nodos `INDX` de la raíz en [`tree_volume`] (VCN 0 y 1).
+pub const TREE_ROOT_INDX_LCN: u64 = 200;
+/// Clúster del nodo `INDX` (VCN 0) de `/Docs` en [`tree_volume`].
+pub const TREE_DOCS_INDX_LCN: u64 = 202;
+/// Clúster de `ñandú.bin` en [`tree_volume`].
+pub const TREE_DATA_LCN: u64 = 210;
+/// Clúster de `$UpCase` en [`tree_volume`] (32 clústeres).
+pub const TREE_UPCASE_LCN: u64 = 220;
+
+/// Contenido de `ñandú.bin`.
+pub fn tree_data() -> Vec<u8> {
+    (0..3000u32).map(|i| (i * 7 % 251) as u8).collect()
+}
+
+/// Nodos `INDX` de la raíz de [`tree_volume`]: VCN 0 (interior) y VCN 1 (hoja).
+pub fn tree_root_nodes() -> [Vec<u8>; 2] {
+    let root = fref(5, 5);
+    let vcn0 = indx_block(
+        0,
+        &[
+            named_entry(fref(18, 1), root, "Medio.txt", 1, Some(1)),
+            named_entry(fref(18, 1), root, "MEDIO~1.TXT", 2, None),
+            named_entry(fref(28, 1), root, "Ágil.txt", 3, None),
+            index_entry(0, None, None),
+        ],
+        4096,
+        true,
+    );
+    let vcn1 = indx_block(
+        1,
+        &[
+            named_entry(root, root, ".", 3, None),
+            named_entry(fref(17, 1), root, "a.txt", 1, None),
+            index_entry(
+                fref(16, 1),
+                Some(&file_name(root, "Docs", 3, 0x1000_0000, 0)),
+                None,
+            ),
+            index_entry(0, None, None),
+        ],
+        4096,
+        false,
+    );
+    [vcn0, vcn1]
+}
+
+/// Atributo `$FILE_NAME` residente (identificador 1).
+fn fname_attr(parent: u64, name: &str, ns: u8, dir: bool, id: u16) -> Vec<u8> {
+    let attrs = if dir { 0x1000_0000 } else { 0x20 };
+    res(0x30, "", &file_name(parent, name, ns, attrs, 0), id)
+}
+
+/// Volumen sintético con árbol de directorios (clústeres de 4 KiB, nodos de 4 KiB, 40 registros):
+///
+/// ```text
+/// /                     raíz: $INDEX_ROOT + 2 nodos INDX (VCN 0 interior, VCN 1 hoja), $BITMAP
+/// /a.txt          (17)  enlace duro con /Docs/Informe.txt
+/// /Docs           (16)  $INDEX_ROOT y un nodo INDX hoja
+/// /Docs/b<D800>c  (22)  nombre con un sustituto suelto
+/// /Docs/fuera.txt       → registro 99 (fuera de la MFT): referencia no válida
+/// /Docs/Informe.txt (17, POSIX)
+/// /Docs/reusado.txt     → registro 23 con secuencia 1; el registro tiene la 2: reutilizado
+/// /Docs/roto.txt        → registro 25 (BAAD): no utilizable
+/// /Docs/Sub       (19)
+/// /Docs/Sub/deep.txt (21)
+/// /Docs/viejo.txt       → registro 24 (no en uso): residual
+/// /Docs/ñandú.bin (20)  no residente (3000 bytes en el clúster 210)
+/// /Medio.txt      (18)  con nombre DOS MEDIO~1.TXT (entrada aparte)
+/// /Ágil.txt       (28)  Win32 y DOS en una entrada
+/// huérfanos: 23 «otro.txt» (su padre /Docs no lo lista), 26 (padre 21, que no es un
+///            directorio), 27 (padre 24, no en uso)
+/// ```
+///
+/// Con `with_upcase`, `$UpCase` (registro 10) es la tabla de [`upcase_table`]; si no, el
+/// registro 10 no tiene datos y se usa el plegado simple.
+pub fn tree_volume(with_upcase: bool) -> Synth {
+    use crate::record::flags::{DIRECTORY, IN_USE};
+    let mut s = Synth::with_records(8, 40, 36);
+    let si = || res(0x10, "", &[0x10; 72], 0);
+    let root = fref(5, 5);
+    let docs = fref(16, 1);
+    let [vcn0, vcn1] = tree_root_nodes();
+    s.put_clusters(TREE_ROOT_INDX_LCN, &vcn0);
+    s.put_clusters(TREE_ROOT_INDX_LCN + 1, &vcn1);
+    let root_rec = record(
+        5,
+        5,
+        IN_USE | DIRECTORY,
+        &[
+            si(),
+            fname_attr(root, ".", 3, true, 1),
+            res(
+                0x90,
+                "$I30",
+                &index_root_value(&[index_entry(0, None, Some(0))], 4096, true),
+                2,
+            ),
+            with_id(
+                non_resident(
+                    0xA0,
+                    "$I30",
+                    0,
+                    1,
+                    &encode_runs(&[(Some(TREE_ROOT_INDX_LCN), 2)]),
+                    8192,
+                    8192,
+                    8192,
+                ),
+                3,
+            ),
+            res(0xB0, "$I30", &[0b11, 0, 0, 0, 0, 0, 0, 0], 4),
+        ],
+        1024,
+    );
+    s.put_record(5, &root_rec);
+    let docs_node = indx_block(
+        0,
+        &[
+            index_entry(
+                fref(22, 1),
+                Some(&file_name_units(docs, &[0x62, 0xD800, 0x63], 1, 0x20, 0)),
+                None,
+            ),
+            named_entry(fref(99, 1), docs, "fuera.txt", 1, None),
+            index_entry(
+                fref(17, 1),
+                Some(&file_name(docs, "Informe.txt", 0, 0x20, 4)),
+                None,
+            ),
+            named_entry(fref(23, 1), docs, "reusado.txt", 1, None),
+            named_entry(fref(25, 1), docs, "roto.txt", 1, None),
+            index_entry(
+                fref(19, 1),
+                Some(&file_name(docs, "Sub", 3, 0x1000_0000, 0)),
+                None,
+            ),
+            named_entry(fref(24, 1), docs, "viejo.txt", 1, None),
+            named_entry(fref(20, 1), docs, "ñandú.bin", 3, None),
+            index_entry(0, None, None),
+        ],
+        4096,
+        false,
+    );
+    s.put_clusters(TREE_DOCS_INDX_LCN, &docs_node);
+    let docs_index = index_root_value(&[index_entry(0, None, Some(0))], 4096, true);
+
+    s.put_record(
+        16,
+        &record(
+            16,
+            1,
+            IN_USE | DIRECTORY,
+            &[
+                si(),
+                fname_attr(root, "Docs", 3, true, 1),
+                res(0x90, "$I30", &docs_index, 2),
+                with_id(
+                    non_resident(
+                        0xA0,
+                        "$I30",
+                        0,
+                        0,
+                        &encode_runs(&[(Some(TREE_DOCS_INDX_LCN), 1)]),
+                        4096,
+                        4096,
+                        4096,
+                    ),
+                    3,
+                ),
+                res(0xB0, "$I30", &[1, 0, 0, 0, 0, 0, 0, 0], 4),
+            ],
+            1024,
+        ),
+    );
+    let mut hard = record(
+        17,
+        1,
+        IN_USE,
+        &[
+            si(),
+            fname_attr(root, "a.txt", 1, false, 1),
+            fname_attr(docs, "Informe.txt", 0, false, 2),
+            res(0x80, "", b"hola", 3),
+        ],
+        1024,
+    );
+    // Dos enlaces.
+    crate::record::apply_fixups(&mut hard).unwrap();
+    hard[0x12] = 2;
+    protect(&mut hard);
+    s.put_record(17, &hard);
+    s.put_record(
+        18,
+        &record(
+            18,
+            1,
+            IN_USE,
+            &[
+                si(),
+                fname_attr(root, "Medio.txt", 1, false, 1),
+                fname_attr(root, "MEDIO~1.TXT", 2, false, 2),
+                res(0x80, "", b"medio", 3),
+            ],
+            1024,
+        ),
+    );
+    let sub_index = index_root_value(
+        &[
+            named_entry(fref(21, 1), fref(19, 1), "deep.txt", 3, None),
+            index_entry(0, None, None),
+        ],
+        4096,
+        false,
+    );
+    s.put_record(
+        19,
+        &record(
+            19,
+            1,
+            IN_USE | DIRECTORY,
+            &[
+                si(),
+                fname_attr(docs, "Sub", 3, true, 1),
+                res(0x90, "$I30", &sub_index, 2),
+            ],
+            1024,
+        ),
+    );
+    let data = tree_data();
+    let mut cl = data.clone();
+    cl.resize(4096, 0);
+    s.put_clusters(TREE_DATA_LCN, &cl);
+    s.put_record(
+        20,
+        &record(
+            20,
+            1,
+            IN_USE,
+            &[
+                si(),
+                fname_attr(docs, "ñandú.bin", 3, false, 1),
+                with_id(
+                    non_resident(
+                        0x80,
+                        "",
+                        0,
+                        0,
+                        &encode_runs(&[(Some(TREE_DATA_LCN), 1)]),
+                        4096,
+                        data.len() as u64,
+                        data.len() as u64,
+                    ),
+                    2,
+                ),
+            ],
+            1024,
+        ),
+    );
+    s.put_record(
+        21,
+        &record(
+            21,
+            1,
+            IN_USE,
+            &[
+                si(),
+                fname_attr(fref(19, 1), "deep.txt", 3, false, 1),
+                res(0x80, "", b"profundo", 2),
+            ],
+            1024,
+        ),
+    );
+    s.put_record(
+        22,
+        &record(
+            22,
+            1,
+            IN_USE,
+            &[
+                si(),
+                res(
+                    0x30,
+                    "",
+                    &file_name_units(docs, &[0x62, 0xD800, 0x63], 1, 0x20, 0),
+                    1,
+                ),
+                res(0x80, "", b"sustituto", 2),
+            ],
+            1024,
+        ),
+    );
+    s.put_record(
+        23,
+        &record(
+            23,
+            2,
+            IN_USE,
+            &[
+                si(),
+                fname_attr(docs, "otro.txt", 1, false, 1),
+                res(0x80, "", b"otro", 2),
+            ],
+            1024,
+        ),
+    );
+    s.put_record(
+        24,
+        &record(
+            24,
+            2,
+            0,
+            &[si(), fname_attr(docs, "viejo.txt", 1, false, 1)],
+            1024,
+        ),
+    );
+    let mut baad = record(25, 1, IN_USE, &[si()], 1024);
+    baad[..4].copy_from_slice(b"BAAD");
+    s.put_record(25, &baad);
+    s.put_record(
+        26,
+        &record(
+            26,
+            1,
+            IN_USE,
+            &[si(), fname_attr(fref(21, 1), "colgado.txt", 1, false, 1)],
+            1024,
+        ),
+    );
+    s.put_record(
+        27,
+        &record(
+            27,
+            1,
+            IN_USE,
+            &[si(), fname_attr(fref(24, 1), "perdido.txt", 1, false, 1)],
+            1024,
+        ),
+    );
+    s.put_record(
+        28,
+        &record(
+            28,
+            1,
+            IN_USE,
+            &[
+                si(),
+                fname_attr(root, "Ágil.txt", 3, false, 1),
+                res(0x80, "", b"agil", 2),
+            ],
+            1024,
+        ),
+    );
+    if with_upcase {
+        s.put_clusters(TREE_UPCASE_LCN, &upcase_table());
+        s.put_record(
+            10,
+            &record(
+                10,
+                10,
+                IN_USE,
+                &[
+                    si(),
+                    fname_attr(root, "$UpCase", 3, false, 1),
+                    with_id(
+                        non_resident(
+                            0x80,
+                            "",
+                            0,
+                            31,
+                            &encode_runs(&[(Some(TREE_UPCASE_LCN), 32)]),
+                            131_072,
+                            131_072,
+                            131_072,
+                        ),
+                        2,
+                    ),
+                ],
+                1024,
+            ),
+        );
+    }
+    s
+}
+
+/// Tabla `$UpCase` de pruebas: identidad salvo ASCII, `á`, `ñ` y `ú`.
+pub fn upcase_table() -> Vec<u8> {
+    let mut t: Vec<u16> = (0..=u16::MAX).collect();
+    for c in u16::from(b'a')..=u16::from(b'z') {
+        t[usize::from(c)] = c - 32;
+    }
+    t[0xE1] = 0xC1;
+    t[0xF1] = 0xD1;
+    t[0xFA] = 0xDA;
+    t.iter().flat_map(|x| x.to_le_bytes()).collect()
 }

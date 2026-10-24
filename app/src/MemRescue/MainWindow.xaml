@@ -17,6 +17,7 @@
         <CommandBinding Command="local:Commands.LastSector" Executed="LastSector_Executed" CanExecute="HasSource_CanExecute" />
         <CommandBinding Command="local:Commands.CopyHex" Executed="CopyHex_Executed" CanExecute="HasSource_CanExecute" />
         <CommandBinding Command="local:Commands.OpenRange" Executed="OpenRange_Executed" CanExecute="HasSource_CanExecute" />
+        <CommandBinding Command="local:Commands.OpenFileSystem" Executed="OpenFileSystem_Executed" CanExecute="HasSource_CanExecute" />
     </Window.CommandBindings>
 
     <DockPanel>
@@ -37,6 +38,9 @@
                 <MenuItem Header="Construir _RAID virtual…" IsEnabled="False" InputGestureText="(M5)" ToolTip="Pendiente: RAID virtual (hito M5)" />
                 <MenuItem Header="_Particiones…" AutomationProperties.AutomationId="PartitionsMenuItem" Click="ShowPartitionsTab_Click"
                           ToolTip="Tabla de particiones del origen seleccionado (MBR/EBR) con su confianza y anomalías; cada partición se puede abrir como dispositivo" />
+                <MenuItem Header="Abrir sistema de _archivos NTFS del origen" AutomationProperties.AutomationId="OpenFileSystemMenuItem"
+                          Command="local:Commands.OpenFileSystem"
+                          ToolTip="Abre el sistema de archivos NTFS que empieza en el origen seleccionado (imagen sin tabla, partición o volumen abiertos como dispositivo): árbol de directorios y ficheros" />
                 <MenuItem Header="_Bloquear volúmenes…" IsEnabled="False" InputGestureText="(M9)" ToolTip="Pendiente (hito M9)" />
                 <MenuItem Header="Parámetros de _E/S…" IsEnabled="False" InputGestureText="(M9)" ToolTip="Pendiente: política de errores en dispositivos reales (hito M9)" />
                 <Separator />
@@ -65,7 +69,8 @@
             </MenuItem>
             <MenuItem Header="_Ventanas">
                 <MenuItem x:Name="LogMenuItem" Header="_Registro de actividad" IsCheckable="True" IsChecked="True" Click="ToggleLog_Click" />
-                <MenuItem Header="Árbol de _directorios" IsEnabled="False" InputGestureText="(M10)" ToolTip="Pendiente (hito M10)" />
+                <MenuItem Header="Árbol de _directorios" AutomationProperties.AutomationId="FileSystemMenuItem" Click="ShowFileSystemTab_Click"
+                          ToolTip="Pestaña «Sistema de archivos»: árbol de directorios y ficheros del volumen NTFS abierto" />
                 <MenuItem Header="_Panel de ficheros" IsEnabled="False" InputGestureText="(M10)" ToolTip="Pendiente (hito M10)" />
                 <MenuItem Header="Panel de _búsqueda" IsEnabled="False" InputGestureText="(M10)" ToolTip="Pendiente (hito M10)" />
             </MenuItem>
@@ -240,6 +245,9 @@
                             <Button x:Name="OpenPartitionButton" Content="Abrir en el visor" IsEnabled="False"
                                     AutomationProperties.AutomationId="OpenPartitionButton" Click="OpenPartition_Click"
                                     ToolTip="Abre la partición seleccionada como un origen independiente (solo lectura) y muestra su primer sector" />
+                            <Button x:Name="OpenPartitionFileSystemButton" Content="Abrir sistema de archivos" IsEnabled="False" Margin="6,0,0,0"
+                                    AutomationProperties.AutomationId="OpenPartitionFileSystemButton" Click="OpenPartitionFileSystem_Click"
+                                    ToolTip="Abre la partición seleccionada como origen y muestra su sistema de archivos NTFS (árbol de directorios y ficheros)" />
                             <Button x:Name="RefreshPartitionsButton" Content="Volver a leer" Margin="6,0,0,0"
                                     AutomationProperties.AutomationId="RefreshPartitionsButton" Click="RefreshPartitions_Click"
                                     ToolTip="Vuelve a leer la tabla de particiones del origen seleccionado" />
@@ -288,6 +296,9 @@
                                     <Button x:Name="OpenFoundVolumeButton" Content="Abrir volumen en el visor" Margin="6,0,0,0" IsEnabled="False"
                                             AutomationProperties.AutomationId="OpenFoundVolumeButton" Click="OpenFoundVolume_Click"
                                             ToolTip="Abre el volumen encontrado seleccionado como un origen independiente (solo lectura)" />
+                                    <Button x:Name="OpenFoundFileSystemButton" Content="Abrir sistema de archivos" Margin="6,0,0,0" IsEnabled="False"
+                                            AutomationProperties.AutomationId="OpenFoundFileSystemButton" Click="OpenFoundFileSystem_Click"
+                                            ToolTip="Abre el volumen NTFS encontrado seleccionado como origen y muestra su sistema de archivos" />
                                     <ProgressBar x:Name="SearchProgressBar" Width="140" Height="14" Margin="10,0,0,0" Minimum="0" Maximum="100"
                                                  AutomationProperties.AutomationId="SearchProgressBar"
                                                  AutomationProperties.Name="Progreso de la búsqueda (lecturas respecto al presupuesto)" />
@@ -324,6 +335,64 @@
                                     </ListView.View>
                                 </ListView>
                             </DockPanel>
+                        </Grid>
+                    </DockPanel>
+                </TabItem>
+
+                <!-- Sistema de archivos NTFS del origen seleccionado (#22): árbol de directorios y ficheros. -->
+                <TabItem x:Name="FileSystemTab" Header="Sistema de archivos">
+                    <DockPanel Margin="6">
+                        <TextBlock x:Name="FsVolumeText" DockPanel.Dock="Top" Margin="0,0,0,4" TextWrapping="Wrap"
+                                   Text="Abra el sistema de archivos NTFS de un origen (Disco → Abrir sistema de archivos NTFS del origen, o desde la pestaña Particiones)."
+                                   AutomationProperties.AutomationId="FsVolumeText" />
+                        <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Margin="0,0,0,6">
+                            <Button x:Name="FsOpenInViewerButton" Content="Abrir en el visor" IsEnabled="False"
+                                    AutomationProperties.AutomationId="FsOpenInViewerButton" Click="FsOpenInViewer_Click"
+                                    ToolTip="Abre el fichero seleccionado como un origen de solo lectura en el visor de sectores (los tramos no fiables se muestran como ilegibles)" />
+                            <Button x:Name="FsSaveAsButton" Content="Guardar como…" IsEnabled="False"
+                                    AutomationProperties.AutomationId="FsSaveAsButton" Click="FsSaveAs_Click"
+                                    ToolTip="Copia el fichero seleccionado a otro lugar (nunca sobre el origen; si el destino existe se pide confirmación; escritura atómica)" />
+                            <TextBlock x:Name="FsPathLabel" Text="Ruta:" VerticalAlignment="Center" Margin="12,0,4,0" />
+                            <TextBox x:Name="FsPathBox" Width="260" VerticalContentAlignment="Center" KeyDown="FsPathBox_KeyDown"
+                                     AutomationProperties.AutomationId="FsPathBox"
+                                     AutomationProperties.LabeledBy="{Binding ElementName=FsPathLabel}"
+                                     ToolTip="Ruta desde la raíz del volumen (sin distinguir mayúsculas). Intro para ir." />
+                            <Button x:Name="FsGoButton" Content="Ir" Margin="4,0,0,0" IsEnabled="False"
+                                    AutomationProperties.AutomationId="FsGoButton" Click="FsGo_Click" />
+                        </StackPanel>
+                        <TextBlock x:Name="FsStatusText" DockPanel.Dock="Bottom" Margin="0,4,0,0" TextWrapping="Wrap"
+                                   AutomationProperties.AutomationId="FsStatusText" />
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="240" MinWidth="120" />
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <TreeView x:Name="FsTree" Grid.Column="0" AutomationProperties.AutomationId="FsTree"
+                                      AutomationProperties.Name="Árbol de directorios"
+                                      SelectedItemChanged="FsTree_SelectedItemChanged" />
+                            <GridSplitter Grid.Column="1" Width="4" HorizontalAlignment="Stretch" Background="{StaticResource BorderBrush}" />
+                            <ListView x:Name="FsFileList" Grid.Column="2" SelectionMode="Single" VirtualizingPanel.IsVirtualizing="False"
+                                      AutomationProperties.AutomationId="FsFileList" AutomationProperties.Name="Ficheros del directorio"
+                                      SelectionChanged="FsFileList_SelectionChanged" MouseDoubleClick="FsFileList_MouseDoubleClick">
+                                <ListView.ItemContainerStyle>
+                                    <Style TargetType="ListViewItem">
+                                        <Setter Property="AutomationProperties.Name" Value="{Binding AutomationName}" />
+                                        <Setter Property="AutomationProperties.AutomationId" Value="{Binding AutomationId}" />
+                                        <Setter Property="ToolTip" Value="{Binding AutomationName}" />
+                                    </Style>
+                                </ListView.ItemContainerStyle>
+                                <ListView.View>
+                                    <GridView>
+                                        <GridViewColumn Header="Nombre" Width="230" DisplayMemberBinding="{Binding Name}" />
+                                        <GridViewColumn Header="Tamaño" Width="90" DisplayMemberBinding="{Binding SizeText}" />
+                                        <GridViewColumn Header="Modificado (UTC)" Width="130" DisplayMemberBinding="{Binding ModifiedText}" />
+                                        <GridViewColumn Header="Creado (UTC)" Width="130" DisplayMemberBinding="{Binding CreatedText}" />
+                                        <GridViewColumn Header="Registro" Width="80" DisplayMemberBinding="{Binding RecordText}" />
+                                        <GridViewColumn Header="Estado" Width="170" DisplayMemberBinding="{Binding StateText}" />
+                                    </GridView>
+                                </ListView.View>
+                            </ListView>
                         </Grid>
                     </DockPanel>
                 </TabItem>

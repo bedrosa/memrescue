@@ -247,6 +247,7 @@ version = "0.2.0"
 dependencies = [
  "mr-api",
  "mr-common",
+ "mr-fs-ntfs",
  "mr-image",
  "mr-io",
  "tempfile",

@@ -27,7 +27,7 @@ memrescue-cli.exe (Rust) ──────────────── llamad
 | Retorno | `int32_t mr_status`: 0 = `MR_OK`; ver tabla de códigos |
 | Cadenas de entrada | UTF-8, puntero + longitud en bytes; no requieren terminador. Puntero nulo solo con longitud 0 |
 | Cadenas de salida | El llamador aporta `(buf, cap, out_len)`. Si cabe, el motor escribe UTF-8 + `\0` y `*out_len` = longitud sin `\0`. Si no, `MR_ERR_BUFFER_TOO_SMALL` y `*out_len` = longitud necesaria (el cliente reintenta con `out_len + 1`) |
-| Estructuras | `#[repr(C)]`, campos de ancho fijo, relleno explícito (`reserved`). Tamaños comprobados por pruebas en ambos lados: `mr_image_info` = 32 B, `mr_task_status` = 24 B, `mr_verify_report` = 72 B, `mr_verify_options` = 48 B, `mr_read_options` = 32 B, `mr_partition_table_info` = 80 B, `mr_partition_info` = 96 B, `mr_partition_anomaly` = 40 B |
+| Estructuras | `#[repr(C)]`, campos de ancho fijo, relleno explícito (`reserved`). Tamaños comprobados por pruebas en ambos lados: `mr_image_info` = 32 B, `mr_task_status` = 24 B, `mr_verify_report` = 72 B, `mr_verify_options` = 48 B, `mr_read_options` = 32 B, `mr_partition_table_info` = 80 B, `mr_partition_info` = 96 B, `mr_partition_anomaly` = 40 B y las de NTFS (#22, abajo) |
 | Enteros | `uint64_t` para tamaños y LBA; `uint32_t` para enumeraciones y máscaras |
 | Booleanos | No se usan en la ABI (evita discrepancias de tamaño) |
 
@@ -61,6 +61,8 @@ memrescue-cli.exe (Rust) ──────────────── llamad
 | 12 | `MR_ERR_CORRUPT` | Estructura del contenedor dañada o incoherente (cabeceras, sumas, tablas fuera del fichero…) |
 | 13 | `MR_ERR_EXTERNAL_REFERENCE` | El contenedor necesita otro fichero (padre, extensión, descriptor); **nunca** se abre automáticamente |
 | 14 | `MR_ERR_UNSUPPORTED_FEATURE` | Variante del formato aún no soportada (VMDK COWD o comprimido sin marcadores, VHDX con registro pendiente…) |
+| 15 | `MR_ERR_NOT_FOUND` | Ruta NTFS que no existe (solo `mr_ntfs_resolve`, #22) |
+| 16 | `MR_ERR_ALREADY_EXISTS` | La salida de una copia ya existe y no se pidió sustituirla (solo `mr_ntfs_copy_start`, #22) |
 | 99 | `MR_ERR_PANIC` | Error interno capturado; el proceso **no** se cae |
 
 - `mr_last_error` devuelve el mensaje del **último error del hilo que llama** (almacenamiento local de
@@ -178,6 +180,35 @@ Consultar el resultado antes del final → `MR_ERR_NOT_FINISHED`; handle de otro
 `GetResult()` (`PartitionSearchResult` con `FoundVolume`, `FoundTable` y anomalías) y
 `OpenVolume(index, applyShift)`.
 
+## Sistema de archivos NTFS (ampliación compatible de la ABI 3, issue #22, ADR-028)
+
+Funciones nuevas; ninguna firma, estructura ni significado existente cambia. Mismos patrones que las
+particiones: handles del registro (volumen, listado, tareas), estructuras de salida versionadas por
+`struct_size` (`mr_ntfs_volume_info` 72 B, `mr_ntfs_entry` 104 B, `mr_ntfs_listing_info` 32 B,
+`mr_ntfs_tree_info` 40 B, `mr_ntfs_orphan` 40 B, `mr_ntfs_copy_report` 56 B), consultas por índice y
+tareas con `mr_task_status_get` / `mr_task_cancel` / `mr_task_free`. Códigos nuevos que solo devuelven
+estas funciones: 15 `MR_ERR_NOT_FOUND` (ruta que no existe) y 16 `MR_ERR_ALREADY_EXISTS` (salida que ya
+existe sin `MR_NTFS_COPY_OVERWRITE`).
+
+| Función | Descripción |
+|---|---|
+| `mr_ntfs_open(source, out_volume)` | Abre el volumen NTFS que empieza en el origen (imagen sin tabla, partición, volumen encontrado). Sobrevive al cierre del origen. No NTFS → `MR_ERR_CORRUPT` |
+| `mr_ntfs_volume_info(volume, out)` | Serie, registros MFT, clústeres, tamaños, versión (`MR_NTFS_VERSION_KNOWN`), confianza, `MR_NTFS_BOOT_FROM_BACKUP`, `MR_NTFS_UPCASE_FROM_VOLUME` (si no, plegado simple), LCN de `$MFT`, nº de anomalías |
+| `mr_ntfs_volume_label` / `mr_ntfs_volume_anomaly_text` | Etiqueta; anomalía `"<código>\n<descripción>"` |
+| `mr_ntfs_list_dir(volume, record, out_listing)` | Lista el directorio (5 = raíz) en un handle de listado. Registro sin `$I30` → `MR_ERR_INVALID_ARGUMENT`; registro no utilizable → `MR_ERR_CORRUPT` |
+| `mr_ntfs_listing_info` / `_entry` / `_entry_name` / `_anomaly_text` / `_free` | Recuentos (entradas, vivas, anomalías, `unreadable`); `mr_ntfs_entry` por índice (orden de colación): `state` (`MR_NTFS_ENTRY_LIVE` 1, `STALE_NOT_IN_USE` 2, `STALE_REUSED` 3, `RECORD_UNUSABLE` 4 con `record_state`, `INVALID_REFERENCE` 5; 16-31 reservados para #23), registro y secuencia, padre, tamaños, 4 FILETIME, atributos DOS, `flags` (`DIRECTORY`, `SYSTEM`, `NAME_LOSSY`, `HAS_DOS_NAME`, `TIMES_FROM_INDEX`), espacio de nombres, enlaces, secuencia actual; nombre en UTF-8 (U+FFFD en las unidades sueltas) |
+| `mr_ntfs_resolve(volume, path, len, out)` | Ruta absoluta (`/` o `\`) sin distinguir mayúsculas → `mr_ntfs_entry`. No existe → `MR_ERR_NOT_FOUND`; componente que no es un directorio o ruta mal formada → `MR_ERR_INVALID_ARGUMENT` |
+| `mr_ntfs_path_of(volume, record, buf, cap, out_len)` | Ruta por las referencias al padre; huérfano → `MR_ERR_CORRUPT` con el motivo |
+| `mr_ntfs_tree_start(volume, flags, out_task)` | Árbol completo (tarea; progreso = entradas + registros revisados; cancelada con resultado parcial). `MR_NTFS_TREE_NO_ORPHANS` omite la búsqueda de huérfanos |
+| `mr_ntfs_tree_result` / `_node` / `_node_path` / `_anomaly_text` / `_orphan` / `_orphan_text` | Estado (`COMPLETE`, `LIMIT`, `CANCELLED`), nodos en anchura (0 = raíz; padre `MR_NTFS_ROOT_PARENT`, profundidad, entrada, ruta), anomalías `"<código>\n<ruta>\n<descripción>"` y huérfanos (`MR_NTFS_ORPHAN_*` 1-10, nombre y motivo) |
+| `mr_ntfs_open_stream(volume, record, stream, len, out_source)` | Flujo `$DATA` como origen de sectores de 512 B (visor): tramos no fiables → sectores ilegibles con relleno; sectores enteros tras el final → dispersos. Conserva la ruta de la imagen. Se cierra con `mr_source_close` |
+| `mr_ntfs_copy_start(volume, record, stream, len, out_path, len, flags, out_task)` / `mr_ntfs_copy_result` | Copia como tarea (progreso en bytes, cancelable) con la política de `create_output`: nunca el origen ni sus segmentos ni un dispositivo ni un directorio (`MR_ERR_INVALID_ARGUMENT` / `MR_ERR_PATH_REJECTED`), salida existente → `MR_ERR_ALREADY_EXISTS` salvo `MR_NTFS_COPY_OVERWRITE`, temporal y renombrado final. Informe: bytes, no fiables (patrón de relleno o posiblemente sobrescritos, #23; los segundos también aparte), dispersos, sin inicializar, `MR_NTFS_COPY_RECORD_NOT_IN_USE` |
+
+En C#: `Source.OpenNtfs()` devuelve `NtfsVolume` (`EngineHandle`: `Info`, `ListDirectory(record)`,
+`Resolve(path)`, `PathOf(record)`, `StartTree(orphans)` → `NtfsTreeTask.GetResult()`,
+`OpenStream(record, stream)` → `Source`, `StartCopy(record, path, stream, overwrite)` →
+`NtfsCopyTask.GetReport()`); `EngineStatus.NotFound` y `AlreadyExists`.
+
 ## Modo tolerante de contenedores (`MR_OPEN_TOLERANT`, ADR-020)
 
 Ampliación compatible de la ABI 3 (nuevo bit de `flags`; las estructuras y la versión no cambian). Sin el
@@ -209,6 +240,7 @@ después de liberarlos.
 
 ## Pruebas que garantizan el contrato
 
+- Rust (`core/mr-ffi/src/ntfs_tests.rs`, 5 pruebas, #22): tamaños y desplazamientos de las 6 estructuras NTFS, volumen sintético con árbol (`mr_fs_ntfs::testvol`, característica `test-support`): datos y etiqueta, volumen que sobrevive al cierre del origen, listado por índice con cada estado (vivo, referencia no válida, reutilizado, registro dañado con `record_state`, libre) y nombre con sustituto suelto, índices fuera de límites, handles de otro tipo, `struct_size` incorrecto, registro que no es un directorio; `mr_ntfs_resolve` sin distinguir mayúsculas y `MR_ERR_NOT_FOUND`; `mr_ntfs_path_of` y huérfano; árbol como tarea con progreso, nodos, rutas, huérfanos y opción sin huérfanos; fichero como origen leído con `mr_source_read_mapped`; copia como tarea con informe, `MR_ERR_ALREADY_EXISTS`, rechazo de la propia imagen, de opciones desconocidas y de rutas de dispositivo, sustitución con `MR_NTFS_COPY_OVERWRITE` e imagen intacta.
 - Rust (`core/mr-ffi/src/tests.rs`, 33 pruebas): búsqueda de particiones perdidas (tamaños y desplazamientos de las 4 estructuras, flujo completo con apertura de volúmenes también tras cerrar el origen, opciones versionadas y validadas, presupuesto agotado, familias, desplazamiento con anomalías con signo y apertura solo con `MR_PARTITION_OPEN_APPLY_SHIFT`, cancelación con resultado parcial, handles de otro tipo), tamaños de estructuras (incluidas las de particiones), tabla GPT sintética (copia, GUID de disco, nombre, GUID único, nombre de tipo, apertura) y GPT desplazada (copia de respaldo, `image_shifted` con signo, apertura rechazada sin `MR_PARTITION_OPEN_APPLY_SHIFT` y correcta con él), tablas de particiones por índice (esquema, confianza, anomalías de tabla y de partición, nombres de tipo con búfer pequeño, apertura de una partición y de una recortada, tabla que sobrevive a su origen, `struct_size` incorrecto, punteros nulos, handles de otro tipo, EBR ilegible como anomalía), verificación extendida con
   códigos de error simulados (origen `FaultyDevice` registrado con `mr_api::source_from_device`) y
   validación de `mr_verify_options`, protocolo de búfer pequeño, rutas
@@ -222,5 +254,5 @@ después de liberarlos.
 - C# (`app/tests/MemRescue.Core.Interop.Tests`): los mismos contratos desde .NET contra la DLL
   real (política de errores y `ErrorCodeList` en `VerifyPolicyTests`; patrones de relleno, preferencias y
   paleta en `FillPatternTests`, incluidos VHD fijo construido según la especificación, descriptor VMDK malicioso, rangos, estados y
-  divididas y modo tolerante con un VHD dinámico dañado; particiones en `PartitionTests` con un disco MBR sintético y el corpus completo; búsqueda de particiones perdidas en `PartitionSearchTests` con discos sintéticos y los 38 manifiestos), finalizadores, rutas no ASCII, cancelación, base de datos de trabajo, inmutabilidad del origen y el
+  divididas y modo tolerante con un VHD dinámico dañado; particiones en `PartitionTests` con un disco MBR sintético y el corpus completo; búsqueda de particiones perdidas en `PartitionSearchTests` con discos sintéticos y los 38 manifiestos; árbol NTFS en `NtfsTests` contra el corpus NTFS: árbol de los 10 manifiestos, rutas, ficheros como origen, copia con SHA-256, salida existente y origen rechazados, entradas a registros dañados), finalizadores, rutas no ASCII, cancelación, base de datos de trabajo, inmutabilidad del origen y el
   corpus sintético (lectura de marcadores en LBA exactas y cabeceras GPT).

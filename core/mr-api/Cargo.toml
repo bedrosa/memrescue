@@ -17,6 +17,7 @@ mr-fs-ntfs.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+mr-fs-ntfs = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true

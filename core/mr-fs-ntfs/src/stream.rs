@@ -27,6 +27,7 @@
 //! **Memoria acotada**: cada lectura pide como mucho [`MAX_STREAM_READ`] bytes; el disco se lee
 //! por tramos de [`DISK_PIECE`] y una unidad de compresión ocupa como mucho 64 KiB.
 
+use std::borrow::Cow;
 use std::fmt;
 
 use mr_io::BlockDevice;
@@ -325,7 +326,7 @@ pub enum CopyError {
 pub struct DataStream<'v> {
     dev: &'v dyn BlockDevice,
     retries: u32,
-    layout: StreamLayout,
+    layout: Cow<'v, StreamLayout>,
     record: u64,
     record_in_use: bool,
     fill: [u8; 4],
@@ -353,7 +354,27 @@ impl<'v> DataStream<'v> {
         DataStream {
             dev,
             retries,
-            layout,
+            layout: Cow::Owned(layout),
+            record,
+            record_in_use,
+            fill: DEFAULT_FILL,
+            suspect: Vec::new(),
+        }
+    }
+
+    /// Flujo sobre una disposición prestada (sin copiarla): para lectores que conservan la
+    /// disposición y abren el flujo en cada lectura.
+    pub(crate) fn borrowed(
+        dev: &'v dyn BlockDevice,
+        retries: u32,
+        layout: &'v StreamLayout,
+        record: u64,
+        record_in_use: bool,
+    ) -> Self {
+        DataStream {
+            dev,
+            retries,
+            layout: Cow::Borrowed(layout),
             record,
             record_in_use,
             fill: DEFAULT_FILL,
