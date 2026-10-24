@@ -60,7 +60,7 @@ memrescue-cli.exe (Rust) ──────────────── llamad
 | 11 | `MR_ERR_OUT_OF_RANGE` | LBA, recuento o rango fuera del origen; petición mayor de 64 MiB |
 | 12 | `MR_ERR_CORRUPT` | Estructura del contenedor dañada o incoherente (cabeceras, sumas, tablas fuera del fichero…) |
 | 13 | `MR_ERR_EXTERNAL_REFERENCE` | El contenedor necesita otro fichero (padre, extensión, descriptor); **nunca** se abre automáticamente |
-| 14 | `MR_ERR_UNSUPPORTED_FEATURE` | Variante del formato aún no soportada (VMDK streamOptimized, VHDX con registro pendiente…) |
+| 14 | `MR_ERR_UNSUPPORTED_FEATURE` | Variante del formato aún no soportada (VMDK COWD o comprimido sin marcadores, VHDX con registro pendiente…) |
 | 99 | `MR_ERR_PANIC` | Error interno capturado; el proceso **no** se cae |
 
 - `mr_last_error` devuelve el mensaje del **último error del hilo que llama** (almacenamiento local de

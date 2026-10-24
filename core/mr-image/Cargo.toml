@@ -9,6 +9,7 @@ rust-version.workspace = true
 [dependencies]
 mr-io.workspace = true
 mr-common.workspace = true
+miniz_oxide.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

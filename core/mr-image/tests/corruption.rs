@@ -1,9 +1,12 @@
 //! Pruebas de corrupción de contenedores con ficheros sintéticos construidos aquí según las
 //! especificaciones públicas (independientes de los generadores de las pruebas unitarias):
 //!
-//! - Inversión aleatoria **determinista** (semilla fija) de 1 a 4 bytes en VHDX, VMDK e imágenes
-//!   divididas, dirigida sobre todo a las estructuras (en VHDX, a veces con las sumas CRC-32C
-//!   recalculadas para que la alteración llegue más allá de la comprobación de integridad).
+//! - Inversión aleatoria **determinista** (semilla fija) de 1 a 4 bytes en VHDX, VMDK
+//!   (monolithicSparse y streamOptimized) e imágenes divididas, dirigida sobre todo a las
+//!   estructuras (en VHDX, a veces con las sumas CRC-32C recalculadas para que la alteración llegue
+//!   más allá de la comprobación de integridad).
+//! - VMDK streamOptimized: alteraciones solo dentro de los granos comprimidos (marcador y datos),
+//!   comparando cada grano legible con el contenido original.
 //! - Truncado en cada frontera de estructura de VHDX (cabeceras, tablas de regiones, registro,
 //!   metadatos, BAT, bloques) y de VMDK (cabecera, descriptor, GD, GT, granos), a ±1 byte.
 //! - Fichero acortado después de abrir (VHDX, VMDK y dividida).
@@ -735,6 +738,101 @@ fn build_vmdk() -> Synthetic {
 }
 
 // ---------------------------------------------------------------------------------------------
+// VMDK (streamOptimized)
+// ---------------------------------------------------------------------------------------------
+
+/// Granos comprimidos: (grano, desplazamiento del marcador, bytes comprimidos), en orden de fichero.
+type StreamGrains = Vec<(u64, u64, u64)>;
+
+/// streamOptimized con el GD en la cabecera (como qemu-img): cabecera, descriptor, GD, GT, granos
+/// comprimidos con marcador (mismos granos que el monolithicSparse) y fin de flujo.
+fn build_vmdk_stream_layout() -> (Synthetic, StreamGrains) {
+    let desc_sectors = 4u64;
+    let gd_sector = 1 + desc_sectors;
+    let grains = VMDK_CAPACITY / VMDK_GRAIN;
+    let gd_entries = grains.div_ceil(512);
+    let gt_first = gd_sector + 1;
+    let data_first = gt_first + 4 * gd_entries;
+    let grain_bytes = VMDK_GRAIN * 512;
+    let mut f = vec![0u8; (data_first * 512) as usize];
+    put(&mut f, 0, b"KDMV");
+    put(&mut f, 4, &3u32.to_le_bytes());
+    // Prueba de fin de línea + comprimido + marcadores.
+    put(&mut f, 8, &(1u32 | 1 << 16 | 1 << 17).to_le_bytes());
+    put(&mut f, 12, &VMDK_CAPACITY.to_le_bytes());
+    put(&mut f, 20, &VMDK_GRAIN.to_le_bytes());
+    put(&mut f, 28, &1u64.to_le_bytes());
+    put(&mut f, 36, &desc_sectors.to_le_bytes());
+    put(&mut f, 44, &512u32.to_le_bytes());
+    put(&mut f, 56, &gd_sector.to_le_bytes());
+    put(&mut f, 64, &data_first.to_le_bytes());
+    put(&mut f, 73, b"\n \r\n");
+    put(&mut f, 77, &1u16.to_le_bytes()); // deflate
+    let desc = format!(
+        "# Disk DescriptorFile\nversion=1\nCID=12345678\nparentCID=ffffffff\n\
+         createType=\"streamOptimized\"\n\n# Extent description\n\
+         RW {VMDK_CAPACITY} SPARSE \"flujo.vmdk\"\n\n# The Disk Data Base\n#DDB\n\
+         ddb.virtualHWVersion = \"4\"\n"
+    );
+    put(&mut f, 512, desc.as_bytes());
+    for i in 0..gd_entries {
+        put(
+            &mut f,
+            gd_sector * 512 + 4 * i,
+            &((gt_first + 4 * i) as u32).to_le_bytes(),
+        );
+    }
+    let gte_at = |g: u64| gt_first * 512 + 4 * g;
+    let mut virt = vec![0u8; (VMDK_CAPACITY * 512) as usize];
+    let mut grains_out = Vec::new();
+    let mut boundaries = Vec::new();
+    let mut targets = vec![
+        (0, 80),
+        (512, desc.len() as u64),
+        (gd_sector * 512, 4 * gd_entries),
+    ];
+    for g in VMDK_DATA_GRAINS {
+        let at = f.len() as u64;
+        put(&mut f, gte_at(g), &((at / 512) as u32).to_le_bytes());
+        let vo0 = g * grain_bytes;
+        let content: Vec<u8> = (0..grain_bytes).map(|k| pattern(vo0 + k)).collect();
+        virt[vo0 as usize..(vo0 + grain_bytes) as usize].copy_from_slice(&content);
+        let z = miniz_oxide::deflate::compress_to_vec_zlib(&content, 6);
+        f.extend_from_slice(&(g * VMDK_GRAIN).to_le_bytes());
+        f.extend_from_slice(&(z.len() as u32).to_le_bytes());
+        f.extend_from_slice(&z);
+        f.resize(f.len().div_ceil(512) * 512, 0);
+        grains_out.push((g, at, z.len() as u64));
+        boundaries.extend([at, at + 12 + z.len() as u64 / 2]);
+        targets.extend([(gte_at(g), 4), (at, 12)]);
+    }
+    f.extend_from_slice(&[0u8; 512]); // fin de flujo
+    boundaries.extend([
+        4,
+        80,
+        512,
+        512 + desc.len() as u64,
+        gd_sector * 512,
+        gd_sector * 512 + 4 * gd_entries,
+        gt_first * 512,
+        (gt_first + 4) * 512,
+        data_first * 512,
+    ]);
+    let s = Synthetic {
+        file: f,
+        virt,
+        boundaries,
+        targets,
+        data_map: Vec::new(),
+    };
+    (s, grains_out)
+}
+
+fn build_vmdk_stream() -> Synthetic {
+    build_vmdk_stream_layout().0
+}
+
+// ---------------------------------------------------------------------------------------------
 // Pruebas genéricas de contenedor
 // ---------------------------------------------------------------------------------------------
 
@@ -772,14 +870,18 @@ fn pick_flips(rng: &mut Rng, s: &Synthetic) -> Vec<(usize, u8)> {
 }
 
 /// Abre en ambos modos y comprueba las garantías comunes. Devuelve si cada modo abrió.
-fn check_both_modes(open: Opener, path: &Path, ctx: &str) -> (bool, bool) {
+///
+/// `complete`: lo que el modo estricto abre (o el tolerante sin descartes) se lee entero. No vale
+/// para streamOptimized, cuyos granos solo se descomprimen al leerlos: un grano dañado da error
+/// de lectura con la imagen abierta.
+fn check_both_modes(open: Opener, path: &Path, ctx: &str, complete: bool) -> (bool, bool) {
     let strict = open_checked(open, path, false, ctx);
     let strict_truth = strict.as_ref().map(|d| {
         assert_eq!(d.discarded(), 0, "el modo estricto no descarta ({ctx})");
         let t = exercise(d.as_ref(), ctx);
         // Lo que el modo estricto acepta se lee entero.
         assert!(
-            t.iter().all(Option::is_some),
+            !complete || t.iter().all(Option::is_some),
             "el modo estricto abrió una imagen con sectores ilegibles ({ctx})"
         );
         t
@@ -787,7 +889,7 @@ fn check_both_modes(open: Opener, path: &Path, ctx: &str) -> (bool, bool) {
     let tolerant = open_checked(open, path, true, ctx);
     if let Some(d) = &tolerant {
         let t = exercise(d.as_ref(), ctx);
-        if d.discarded() == 0 {
+        if complete && d.discarded() == 0 {
             assert!(
                 t.iter().all(Option::is_some),
                 "sin descartes, todo es legible ({ctx})"
@@ -816,6 +918,7 @@ fn random_flips(
     seed: u64,
     iters: u32,
     reseal: Option<Reseal>,
+    complete: bool,
 ) {
     with_watchdog(move |note| {
         let s = build();
@@ -823,7 +926,10 @@ fn random_flips(
         let path = dir.path().join(name);
         write_file(&path, &s.file);
         // La imagen intacta abre en los dos modos y se lee como se construyó.
-        assert_eq!(check_both_modes(open, &path, "intacta"), (true, true));
+        assert_eq!(
+            check_both_modes(open, &path, "intacta", complete),
+            (true, true)
+        );
         let d = open_checked(open, &path, false, "intacta").unwrap();
         assert_eq!(d.size(), s.virt.len() as u64);
         let t = exercise(d.as_ref(), "intacta");
@@ -848,7 +954,7 @@ fn random_flips(
             let ctx = format!("{name}, semilla {seed:#x}, iteración {it}, alteraciones {flips:?}");
             note(ctx.clone());
             patch(&path, &img, &ranges);
-            let (a, b) = check_both_modes(open, &path, &ctx);
+            let (a, b) = check_both_modes(open, &path, &ctx, complete);
             opened_strict += u32::from(a);
             opened_tolerant += u32::from(b);
             assert_file_is(&path, &img, &ctx);
@@ -1004,6 +1110,7 @@ fn vhdx_random_byte_flips() {
         0x5648_4458_0001,
         300,
         Some((vhdx_seal, vhdx_crc_fields)),
+        true,
     );
 }
 
@@ -1016,6 +1123,7 @@ fn vhdx_with_pending_log_random_byte_flips() {
         0x5648_4458_4C4F_4701,
         300,
         Some((vhdx_log_seal, vhdx_log_crc_fields)),
+        true,
     );
 }
 
@@ -1026,7 +1134,103 @@ fn vhdx_with_pending_log_shrunk_after_open() {
 
 #[test]
 fn vmdk_random_byte_flips() {
-    random_flips("f.vmdk", build_vmdk, open_vmdk, 0x564D_444B_0001, 400, None);
+    random_flips(
+        "f.vmdk",
+        build_vmdk,
+        open_vmdk,
+        0x564D_444B_0001,
+        400,
+        None,
+        true,
+    );
+}
+
+#[test]
+fn vmdk_stream_random_byte_flips() {
+    random_flips(
+        "f-flujo.vmdk",
+        build_vmdk_stream,
+        open_vmdk,
+        0x564D_444B_5301,
+        400,
+        None,
+        false,
+    );
+}
+
+/// Alteraciones solo dentro de los granos comprimidos (marcador y datos): los marcadores dañados
+/// impiden abrir en modo estricto o descartan el grano en modo tolerante; los datos dañados dan
+/// error al leer el grano. Ningún grano legible difiere del contenido original: si el flujo zlib
+/// sigue siendo válido, el Adler-32 de los datos descomprimidos detecta el cambio (salvo una
+/// colisión, que VMDK no puede detectar porque no guarda otra suma).
+#[test]
+fn vmdk_stream_flips_in_compressed_grains_never_yield_wrong_data() {
+    with_watchdog(|note| {
+        let (s, grains) = build_vmdk_stream_layout();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("g-flujo.vmdk");
+        write_file(&path, &s.file);
+        let grain_bytes = VMDK_GRAIN * 512;
+        let mut rng = Rng::new(0x564D_444B_5302);
+        let mut img = s.file.clone();
+        let (mut unreadable, mut rejected) = (0u32, 0u32);
+        for it in 0..300 {
+            let mut ranges = Vec::new();
+            let mut touched = Vec::new();
+            for _ in 0..1 + rng.below(3) {
+                let (g, at, size) = grains[rng.below(grains.len() as u64) as usize];
+                // Casi siempre en los datos comprimidos; a veces en el marcador.
+                let p = if rng.below(6) == 0 {
+                    at + rng.below(12)
+                } else {
+                    at + 12 + rng.below(size)
+                } as usize;
+                img[p] ^= (rng.below(255) + 1) as u8;
+                ranges.push((p, 1));
+                touched.push(g);
+            }
+            let ctx = format!("granos comprimidos, iteración {it}, granos {touched:?}");
+            note(ctx.clone());
+            patch(&path, &img, &ranges);
+            for tolerant in [false, true] {
+                let Some(d) = open_checked(open_vmdk, &path, tolerant, &ctx) else {
+                    assert!(!tolerant, "el modo tolerante debía abrir ({ctx})");
+                    rejected += 1;
+                    continue;
+                };
+                for &(g, _, _) in &grains {
+                    let vo = g * grain_bytes;
+                    let mut buf = vec![0u8; grain_bytes as usize];
+                    match d.read_at(vo, &mut buf) {
+                        Ok(()) => assert!(
+                            buf[..] == s.virt[vo as usize..(vo + grain_bytes) as usize],
+                            "grano {g} leído con datos distintos de los originales ({ctx})"
+                        ),
+                        Err(IoError::Read { .. }) => {
+                            // Un grano sano solo es ilegible si el tolerante lo descartó (un
+                            // marcador alterado que invade su zona).
+                            assert!(
+                                touched.contains(&g) || d.discarded() > 0,
+                                "grano {g} sano ilegible ({ctx})"
+                            );
+                            unreadable += 1;
+                        }
+                        Err(e) => panic!("error inesperado en el grano {g} ({ctx}): {e:?}"),
+                    }
+                }
+                let _ = exercise(d.as_ref(), &ctx);
+            }
+            assert_file_is(&path, &img, &ctx);
+            for &(o, l) in &ranges {
+                img[o..o + l].copy_from_slice(&s.file[o..o + l]);
+            }
+            patch(&path, &img, &ranges);
+        }
+        eprintln!(
+            "granos comprimidos: {unreadable} lecturas de grano ilegibles, {rejected} aperturas estrictas rechazadas"
+        );
+        assert!(unreadable > 0 && rejected > 0);
+    });
 }
 
 #[test]
@@ -1040,6 +1244,13 @@ fn vmdk_truncated_at_every_structure_boundary() {
 }
 
 #[test]
+fn vmdk_stream_truncated_at_every_structure_boundary() {
+    // Fronteras hasta el último grano: un corte que solo quita el fin de flujo deja los datos
+    // completos y se lee entero en ambos modos (pruebas unitarias y contra qemu-img).
+    truncation_at_boundaries("t-flujo.vmdk", build_vmdk_stream, open_vmdk);
+}
+
+#[test]
 fn vhdx_shrunk_after_open() {
     shrink_after_open("s.vhdx", build_vhdx, open_vhdx);
 }
@@ -1047,6 +1258,63 @@ fn vhdx_shrunk_after_open() {
 #[test]
 fn vmdk_shrunk_after_open() {
     shrink_after_open("s.vmdk", build_vmdk, open_vmdk);
+}
+
+/// streamOptimized acortado con la imagen abierta: un grano cuyo marcador o datos comprimidos
+/// quedan fuera del nuevo final da error; los demás se leen como el original.
+#[test]
+fn vmdk_stream_shrunk_after_open() {
+    with_watchdog(|note| {
+        let (s, grains) = build_vmdk_stream_layout();
+        let full = s.file.len() as u64;
+        let grain_bytes = VMDK_GRAIN * 512;
+        let mut cuts: Vec<u64> = grains
+            .iter()
+            .flat_map(|&(_, at, size)| [at, at + 12 + size / 2, at + 12 + size - 1])
+            .chain([0, 600, full - 1])
+            .collect();
+        cuts.sort_unstable();
+        cuts.dedup();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s-flujo.vmdk");
+        for cut in cuts {
+            for tolerant in [false, true] {
+                let ctx = format!(
+                    "streamOptimized acortado a {cut} de {full} bytes tras abrir (tolerante = {tolerant})"
+                );
+                note(ctx.clone());
+                write_file(&path, &s.file);
+                let d =
+                    open_checked(open_vmdk, &path, tolerant, &ctx).expect("la imagen intacta abre");
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_len(cut)
+                    .unwrap();
+                for g in 0..VMDK_CAPACITY / VMDK_GRAIN {
+                    let vo = g * grain_bytes;
+                    let mut buf = vec![0u8; grain_bytes as usize];
+                    let r = d.read_at(vo, &mut buf);
+                    let lost = grains
+                        .iter()
+                        .find(|x| x.0 == g)
+                        .is_some_and(|&(_, at, size)| at + 12 + size > cut);
+                    if lost {
+                        assert!(r.is_err(), "grano {g} fuera del fichero leído ({ctx})");
+                    } else {
+                        r.unwrap_or_else(|e| panic!("grano {g} ({ctx}): {e}"));
+                        assert!(
+                            buf[..] == s.virt[vo as usize..(vo + grain_bytes) as usize],
+                            "grano {g} ({ctx})"
+                        );
+                    }
+                }
+                let _ = exercise(d.as_ref(), &ctx);
+                assert_eq!(std::fs::metadata(&path).unwrap().len(), cut);
+            }
+        }
+    });
 }
 
 /// Segmentos de una imagen dividida (el último más corto y no alineado al sector).

@@ -1,4 +1,5 @@
-//! VMDK de extensión dispersa con descriptor incrustado (`monolithicSparse`), en **solo lectura**.
+//! VMDK de extensión dispersa con descriptor incrustado (`monolithicSparse` y `streamOptimized`), en
+//! **solo lectura**.
 //!
 //! Basado en la especificación pública de VMware «Virtual Disk Format 1.1». Estructura:
 //! - Sector 0: cabecera de extensión dispersa (`KDMV`, little-endian).
@@ -21,12 +22,19 @@
 //!   y la ubicación del GD siguen siendo críticos (`Corrupt` en ambos modos).
 //! - Nunca se abren otros ficheros: padres, extensiones adicionales, descriptores separados y
 //!   rutas del descriptor solo aparecen como texto (saneado y truncado) en los errores.
-//! - Se rechazan con [`IoError::UnsupportedFeature`]: streamOptimized (compresión, marcadores o
-//!   GD al final), `COWD` (ESX antiguo), versiones e indicadores desconocidos y descriptores de
-//!   texto separados (monolithicFlat, twoGbMaxExtent*, vmfs…).
+//! - streamOptimized ([`crate::vmdk_stream`]): las entradas de GT apuntan al marcador de un grano
+//!   comprimido (deflate en formato zlib). Al abrir se lee y valida el marcador de cada grano (LBA
+//!   igual a su posición en la GT, tamaño comprimido acotado y dentro del fichero) y su zona del
+//!   fichero (marcador + datos comprimidos) entra en la detección de solapes. Con `gdOffset` =
+//!   GD_AT_END el GD se toma del pie. Los granos se descomprimen al leerlos (caché acotada); un
+//!   grano que no se descomprime o no mide lo esperado da error de lectura, nunca datos.
+//! - Se rechazan con [`IoError::UnsupportedFeature`]: compresión sin marcadores (o al revés),
+//!   algoritmos distintos de deflate, `COWD` (ESX antiguo), versiones e indicadores desconocidos y
+//!   descriptores de texto separados (monolithicFlat, twoGbMaxExtent*, vmfs…).
 
 use crate::budget::{Budget, TABLE_CHUNK};
 use crate::tolerant::{self, Damage, Hit, Zone};
+use crate::vmdk_stream::{self, GrainCache, MarkerReader};
 use crate::MAX_TABLE_BYTES;
 use mr_io::{Allocation, AllocationRun, BlockDevice, IoError, Result};
 use std::fs::File;
@@ -402,13 +410,23 @@ impl SparseHeader {
                 self.version
             )));
         }
-        if self.flags & (FLAG_COMPRESSED | FLAG_MARKERS) != 0
-            || self.gd_offset == GD_AT_END
-            || self.compress_algorithm != 0
-        {
-            return Err(unsupported(
-                "streamOptimized (granos comprimidos, marcadores o directorio al final)",
-            ));
+        if self.is_stream() {
+            let both = FLAG_COMPRESSED | FLAG_MARKERS;
+            if self.flags & both != both {
+                return Err(unsupported(if self.flags & both == 0 {
+                    "directorio al final o algoritmo de compresión sin granos comprimidos"
+                } else if self.flags & FLAG_MARKERS == 0 {
+                    "granos comprimidos sin marcadores (solo se admite streamOptimized)"
+                } else {
+                    "marcadores sin granos comprimidos"
+                }));
+            }
+            if self.compress_algorithm != vmdk_stream::COMPRESSION_DEFLATE {
+                return Err(unsupported(format!(
+                    "algoritmo de compresión {} desconocido (se admite 1, deflate)",
+                    self.compress_algorithm
+                )));
+            }
         }
         let unknown = self.flags & !KNOWN_FLAGS;
         if unknown != 0 {
@@ -443,7 +461,67 @@ impl SparseHeader {
                 self.capacity
             )));
         }
+        if self.is_stream() && self.grain_size > vmdk_stream::MAX_STREAM_GRAIN_SECTORS {
+            return Err(unsupported(format!(
+                "granos comprimidos de {} sectores (máximo {})",
+                self.grain_size,
+                vmdk_stream::MAX_STREAM_GRAIN_SECTORS
+            )));
+        }
         Ok(())
+    }
+
+    /// `true` si la cabecera es de streamOptimized (o lo intenta): granos comprimidos,
+    /// marcadores, algoritmo de compresión o GD al final.
+    fn is_stream(&self) -> bool {
+        self.flags & (FLAG_COMPRESSED | FLAG_MARKERS) != 0
+            || self.compress_algorithm != 0
+            || self.gd_offset == GD_AT_END
+    }
+
+    /// Pie de un streamOptimized con GD al final: los últimos 1536 bytes (marcador del pie, pie y
+    /// fin de flujo). El pie es una copia de la cabecera con el `gdOffset` real; los campos que
+    /// definen la geometría deben coincidir. Estructura crítica (`Corrupt` en ambos modos).
+    fn read_footer(&self, file: &File, file_len: u64) -> Result<u64> {
+        let tail_len = vmdk_stream::FOOTER_TAIL_BYTES;
+        if file_len < HEADER_LEN as u64 + tail_len {
+            return Err(corrupt(format!(
+                "directorio al final, pero el fichero ({file_len} bytes) no tiene sitio para el pie"
+            )));
+        }
+        let at = file_len - tail_len;
+        let mut tail = vec![0u8; tail_len as usize];
+        read_exact_at(file, at, &mut tail)?;
+        vmdk_stream::check_footer_markers(&tail)
+            .map_err(|e| corrupt(format!("pie (byte {at}): {e}")))?;
+        let mut raw = [0u8; HEADER_LEN];
+        raw.copy_from_slice(&tail[512..1024]);
+        if raw[..4] != *MAGIC {
+            return Err(corrupt("pie sin la firma «KDMV»"));
+        }
+        let footer = Self::parse(&raw);
+        footer
+            .validate()
+            .map_err(|e| corrupt(format!("pie no válido: {}", detail(e))))?;
+        let geometry = FLAG_COMPRESSED | FLAG_MARKERS | FLAG_ZEROED_GTE;
+        let same = footer.capacity == self.capacity
+            && footer.grain_size == self.grain_size
+            && footer.num_gtes_per_gt == self.num_gtes_per_gt
+            && footer.descriptor_offset == self.descriptor_offset
+            && footer.descriptor_size == self.descriptor_size
+            && footer.compress_algorithm == self.compress_algorithm
+            && footer.flags & geometry == self.flags & geometry;
+        if !same {
+            return Err(corrupt(
+                "el pie no coincide con la cabecera (capacidad, grano, descriptor, compresión o indicadores)",
+            ));
+        }
+        if footer.gd_offset == GD_AT_END {
+            return Err(corrupt(
+                "el pie también sitúa el directorio de granos al final",
+            ));
+        }
+        Ok(footer.gd_offset)
     }
 }
 
@@ -476,11 +554,25 @@ enum Grain {
     Sparse,
     /// Desplazamiento en bytes del grano dentro del fichero.
     Data(u64),
+    /// streamOptimized: desplazamiento del marcador del grano y tamaño comprimido.
+    Compressed { offset: u64, size: u32 },
     /// Descartado en modo tolerante: no fiable.
     Discarded,
 }
 
-/// Disco VMDK monolithicSparse abierto en solo lectura.
+/// Resultado de cargar las tablas: `(gt_slot, gtes, tamaños comprimidos, granos descartados)`.
+type LoadedTables = (Vec<u32>, Vec<u32>, Vec<u32>, u64);
+
+/// Estado propio de un streamOptimized.
+struct Stream {
+    /// Tamaño comprimido de cada grano, en paralelo a `gtes` (0 si no tiene datos).
+    sizes: Vec<u32>,
+    /// El GD se tomó del pie.
+    gd_in_footer: bool,
+    cache: GrainCache,
+}
+
+/// Disco VMDK monolithicSparse o streamOptimized abierto en solo lectura.
 pub struct VmdkImage {
     file: File,
     header: SparseHeader,
@@ -500,6 +592,8 @@ pub struct VmdkImage {
     tolerant: bool,
     /// Granos descartados en modo tolerante.
     discarded: u64,
+    /// `Some` en streamOptimized.
+    stream: Option<Stream>,
 }
 
 impl std::fmt::Debug for VmdkImage {
@@ -537,6 +631,7 @@ impl VmdkImage {
         }
         let header = SparseHeader::parse(&head);
         header.validate()?;
+        let stream = header.is_stream();
 
         // Descriptor incrustado.
         if header.descriptor_offset == 0 {
@@ -560,7 +655,24 @@ impl VmdkImage {
         let mut desc_raw = vec![0u8; desc_bytes as usize];
         read_exact_at(&file, desc_off, &mut desc_raw)?;
         let descriptor = parse_descriptor(&descriptor_text(&desc_raw))?;
-        Self::validate_descriptor(&descriptor, header.capacity)?;
+        Self::validate_descriptor(&descriptor, header.capacity, stream)?;
+
+        let mut zones = vec![
+            Zone::fixed(0, HEADER_LEN as u64),
+            Zone::fixed(desc_off, desc_bytes),
+        ];
+        // streamOptimized: GD del pie si la cabecera lo deja al final. Con el GD en la cabecera no
+        // se exige el marcador de fin de flujo: qemu-img no siempre lo escribe, y un fichero
+        // truncado deja fuera algún grano o tabla (lo detectan sus propias comprobaciones).
+        let gd_in_footer = header.gd_offset == GD_AT_END;
+        let gd_offset = if gd_in_footer {
+            let gd_offset = header.read_footer(&file, file_len)?;
+            let tail = vmdk_stream::FOOTER_TAIL_BYTES;
+            zones.push(Zone::fixed(file_len - tail, tail));
+            gd_offset
+        } else {
+            header.gd_offset
+        };
 
         // Directorio de granos.
         let grain_bytes = header.grain_size * SECTOR;
@@ -574,19 +686,15 @@ impl VmdkImage {
                     "directorio de granos demasiado grande ({gd_entries} entradas; límite {MAX_TABLE_BYTES} bytes)"
                 ))
             })?;
-        if header.gd_offset == 0 && gd_entries > 0 {
+        if gd_offset == 0 && gd_entries > 0 {
             return Err(corrupt("gdOffset = 0"));
         }
         let mut budget = Budget::new(FORMAT);
         budget.add_tables(gd_bytes);
         let mut gd: Vec<u32> = budget.vec(gd_entries, "directorio de granos")?;
-        let mut zones = vec![
-            Zone::fixed(0, HEADER_LEN as u64),
-            Zone::fixed(desc_off, desc_bytes),
-        ];
         if gd_entries > 0 {
             let gd_off =
-                Self::checked_region("directorio de granos", header.gd_offset, gd_bytes, file_len)?;
+                Self::checked_region("directorio de granos", gd_offset, gd_bytes, file_len)?;
             if desc_off < gd_off + gd_bytes && gd_off < desc_off + desc_bytes {
                 return Err(corrupt(
                     "el descriptor y el directorio de granos se solapan",
@@ -612,7 +720,7 @@ impl VmdkImage {
         }
         let size = header.capacity * SECTOR;
         let grain_span = |g: u64| -> u64 { grain_bytes.min(size - g * grain_bytes) };
-        let (gt_slot, gtes, discarded) = Self::load_tables(
+        let (gt_slot, gtes, sizes, discarded) = Self::load_tables(
             &file,
             file_len,
             &header,
@@ -623,6 +731,11 @@ impl VmdkImage {
             tolerant,
             &mut budget,
         )?;
+        let stream = stream.then(|| Stream {
+            sizes,
+            gd_in_footer,
+            cache: GrainCache::new(grain_bytes),
+        });
 
         Ok(Self {
             file,
@@ -635,11 +748,14 @@ impl VmdkImage {
             header,
             tolerant,
             discarded,
+            stream,
         })
     }
 
-    /// Valida las GT del GD principal `gd` y sus granos, y devuelve `(gt_slot, gtes, descartados)`.
-    /// `gd` se reutiliza como `gt_slot` (cada entrada se lee antes de sobrescribirla).
+    /// Valida las GT del GD principal `gd` y sus granos, y devuelve
+    /// `(gt_slot, gtes, tamaños comprimidos, descartados)`. `gd` se reutiliza como `gt_slot` (cada
+    /// entrada se lee antes de sobrescribirla). Los tamaños comprimidos solo existen en
+    /// streamOptimized (vacío en monolithicSparse).
     ///
     /// Correspondencia inequívoca: cada GT (2 KiB) y cada grano (su parte útil) quedan enteros dentro
     /// del fichero y no solapan la cabecera, el descriptor, el GD, otra GT ni otro grano. Si un grano
@@ -656,7 +772,8 @@ impl VmdkImage {
         zones: &[Zone],
         tolerant: bool,
         budget: &mut Budget,
-    ) -> Result<(Vec<u32>, Vec<u32>, u64)> {
+    ) -> Result<LoadedTables> {
+        let stream = header.is_stream();
         // `[sector × 512, + bytes)` dentro del fichero (sin construir el mensaje de error).
         let fits = |sector: u32, bytes: u64| {
             (u64::from(sector) * SECTOR)
@@ -721,6 +838,14 @@ impl VmdkImage {
             )));
         }
         budget.add_tables(gt_table_bytes);
+        // streamOptimized: el tamaño comprimido de cada grano sale de su marcador (4 bytes por
+        // entrada de GT leídos del fichero, como otra tabla).
+        let mut sizes: Vec<u32> = Vec::new();
+        let mut markers = MarkerReader::new();
+        if stream {
+            budget.add_tables(gt_table_bytes);
+            sizes = budget.vec(present * GTES_PER_GT, "tamaños comprimidos de los granos")?;
+        }
 
         // 2) Entradas de las GT válidas. Las posiciones en `gtes` (< 2^26, porque las GT ocupan
         //    como mucho MAX_TABLE_BYTES) identifican los granos en el registro de daños y en la
@@ -772,6 +897,33 @@ impl VmdkImage {
                         })?;
                         GRAIN_DISCARDED
                     }
+                } else if stream {
+                    let off = u64::from(entry) * SECTOR;
+                    let why = if fits(entry, vmdk_stream::GRAIN_MARKER_LEN) {
+                        let (lba, size) =
+                            vmdk_stream::grain_marker(&markers.read(file, off, file_len)?);
+                        vmdk_stream::check_grain_marker(
+                            g,
+                            lba,
+                            size,
+                            header.grain_size,
+                            off,
+                            file_len,
+                        )
+                        .map(|()| size)
+                    } else {
+                        Err(format!(
+                            "el marcador del grano {g} (sector {entry}) está fuera del fichero ({file_len} bytes)"
+                        ))
+                    };
+                    match why {
+                        Ok(size) => {
+                            allocated += 1;
+                            sizes.push(size);
+                        }
+                        Err(e) => grain_damage.add(p, || e)?,
+                    }
+                    entry
                 } else {
                     if fits(entry, grain_span(g)) {
                         allocated += 1;
@@ -790,6 +942,9 @@ impl VmdkImage {
                     entry
                 };
                 gtes.push(value);
+                if stream && sizes.len() < gtes.len() {
+                    sizes.push(0);
+                }
             }
         }
         gt_damage.release(budget);
@@ -809,7 +964,12 @@ impl VmdkImage {
         );
         let span = |p: u32| -> (u64, u64) {
             let start = u64::from(gtes[p as usize]) * SECTOR;
-            (start, start + grain_span(grain_of(p)))
+            let len = if stream {
+                vmdk_stream::GRAIN_MARKER_LEN + u64::from(sizes[p as usize])
+            } else {
+                grain_span(grain_of(p))
+            };
+            (start, start + len)
         };
         // GT solapadas por un grano: como mucho una por GT presente.
         let mut bad_gts: Vec<u32> = Vec::new();
@@ -856,7 +1016,7 @@ impl VmdkImage {
             .count() as u64;
         grain_damage.release(budget);
         budget.release(slot_gd);
-        Ok((gt_slot, gtes, discarded))
+        Ok((gt_slot, gtes, sizes, discarded))
     }
 
     /// Comprueba que `[sector × 512, + bytes)` está dentro del fichero y devuelve el desplazamiento.
@@ -911,8 +1071,9 @@ impl VmdkImage {
         unsupported(detail)
     }
 
-    /// Semántica del descriptor incrustado de un monolithicSparse.
-    fn validate_descriptor(d: &VmdkDescriptor, capacity: u64) -> Result<()> {
+    /// Semántica del descriptor incrustado de un monolithicSparse o streamOptimized (`stream`: la
+    /// cabecera es de streamOptimized; el `createType` debe coincidir con ella).
+    fn validate_descriptor(d: &VmdkDescriptor, capacity: u64, stream: bool) -> Result<()> {
         if let Some(parent) = d.parent_reference() {
             return Err(external(&parent));
         }
@@ -920,14 +1081,19 @@ impl VmdkImage {
             .create_type
             .as_deref()
             .ok_or_else(|| corrupt("descriptor sin createType"))?;
-        if create.eq_ignore_ascii_case("streamOptimized") {
-            return Err(unsupported("streamOptimized"));
-        }
-        if !create.eq_ignore_ascii_case("monolithicSparse") {
+        let is_stream_type = create.eq_ignore_ascii_case("streamOptimized");
+        if !is_stream_type && !create.eq_ignore_ascii_case("monolithicSparse") {
             return Err(unsupported(format!(
-                "createType «{}» en una extensión dispersa (solo se admite monolithicSparse)",
+                "createType «{}» en una extensión dispersa (se admiten monolithicSparse y streamOptimized)",
                 sanitize(create)
             )));
+        }
+        if is_stream_type != stream {
+            return Err(corrupt(if stream {
+                "cabecera de streamOptimized (granos comprimidos) con createType monolithicSparse"
+            } else {
+                "createType streamOptimized con una cabecera sin granos comprimidos"
+            }));
         }
         let ext = match d.extents.as_slice() {
             [] => return Err(corrupt("descriptor sin extensiones")),
@@ -985,11 +1151,24 @@ impl VmdkImage {
 
     /// Variante legible.
     pub fn describe(&self) -> String {
-        let mut s = format!(
-            "VMDK monolithicSparse (cabecera v{}), granos de {} KiB",
-            self.header.version,
-            self.grain_bytes / 1024
-        );
+        let mut s = match &self.stream {
+            None => format!(
+                "VMDK monolithicSparse (cabecera v{}), granos de {} KiB",
+                self.header.version,
+                self.grain_bytes / 1024
+            ),
+            Some(st) => {
+                let mut s = format!(
+                    "VMDK streamOptimized (cabecera v{}), granos de {} KiB comprimidos con deflate",
+                    self.header.version,
+                    self.grain_bytes / 1024
+                );
+                if st.gd_in_footer {
+                    s.push_str(", directorio de granos en el pie");
+                }
+                s
+            }
+        };
         if self.header.flags & FLAG_ZEROED_GTE != 0 {
             s.push_str(", granos a cero");
         }
@@ -1023,24 +1202,102 @@ impl VmdkImage {
             .gt_slot
             .get(gd_idx)
             .ok_or_else(|| corrupt(format!("grano {g} fuera del directorio")))?;
-        let entry = match slot {
+        let (p, entry) = match slot {
             GT_ABSENT => return Ok(Grain::Sparse),
             GT_DISCARDED => return Ok(Grain::Discarded),
             k => {
-                let p = u64::from(k) * GTES_PER_GT + g % GTES_PER_GT;
-                usize::try_from(p)
-                    .ok()
-                    .and_then(|p| self.gtes.get(p))
+                let p = usize::try_from(u64::from(k) * GTES_PER_GT + g % GTES_PER_GT)
+                    .map_err(|_| corrupt("posición de grano"))?;
+                let entry = self
+                    .gtes
+                    .get(p)
                     .copied()
-                    .ok_or_else(|| corrupt(format!("grano {g} fuera de las tablas")))?
+                    .ok_or_else(|| corrupt(format!("grano {g} fuera de las tablas")))?;
+                (p, entry)
             }
         };
         Ok(match entry {
             0 => Grain::Sparse,
             GRAIN_DISCARDED => Grain::Discarded,
             // Validado al abrir: dentro del fichero y sin solapes.
-            sector => Grain::Data(u64::from(sector) * SECTOR),
+            sector => {
+                let offset = u64::from(sector) * SECTOR;
+                match &self.stream {
+                    None => Grain::Data(offset),
+                    Some(st) => {
+                        Grain::Compressed {
+                            offset,
+                            size: st.sizes.get(p).copied().ok_or_else(|| {
+                                corrupt(format!("grano {g} sin tamaño comprimido"))
+                            })?,
+                        }
+                    }
+                }
+            }
         })
+    }
+}
+
+impl VmdkImage {
+    /// Copia en `chunk` los bytes `within..` del grano comprimido `g` (marcador en `offset`, `size`
+    /// bytes comprimidos), descomprimiéndolo si no está en la caché. `pos` es el desplazamiento
+    /// virtual de `chunk`. El marcador se vuelve a comprobar (el fichero pudo cambiar tras abrirlo).
+    fn read_compressed(
+        &self,
+        g: u64,
+        offset: u64,
+        size: u32,
+        within: u64,
+        pos: u64,
+        chunk: &mut [u8],
+    ) -> Result<()> {
+        let Some(st) = &self.stream else {
+            return Err(corrupt(format!(
+                "grano comprimido {g} en un monolithicSparse"
+            )));
+        };
+        let data = match st.cache.get(g) {
+            Some(d) => d,
+            None => {
+                // Acotado al abrir: size ≤ 2 × grano (≤ 32 MiB).
+                let mut raw = vec![0u8; vmdk_stream::GRAIN_MARKER_LEN as usize + size as usize];
+                read_exact_at(&self.file, offset, &mut raw)?;
+                let (lba, now) = vmdk_stream::grain_marker(
+                    raw[..vmdk_stream::GRAIN_MARKER_LEN as usize]
+                        .try_into()
+                        .map_err(|_| corrupt("marcador de grano"))?,
+                );
+                let len = chunk.len();
+                let damaged = |why: &str| vmdk_stream::damaged_read(g, pos, len, why);
+                if lba != g * self.header.grain_size || now != size {
+                    return Err(damaged(&format!(
+                        "el marcador ha cambiado desde la apertura (LBA {lba}, {now} bytes)"
+                    )));
+                }
+                let tail = self.grain_bytes.min(self.size - g * self.grain_bytes);
+                let out = vmdk_stream::inflate_grain(
+                    &raw[vmdk_stream::GRAIN_MARKER_LEN as usize..],
+                    self.grain_bytes as usize,
+                    tail as usize,
+                )
+                .map_err(|why| damaged(&why))?;
+                st.cache.insert(g, out)
+            }
+        };
+        let src = usize::try_from(within)
+            .ok()
+            .and_then(|w| data.get(w..w + chunk.len()))
+            .ok_or_else(|| {
+                vmdk_stream::damaged_read(g, pos, chunk.len(), "lectura fuera del grano")
+            })?;
+        chunk.copy_from_slice(src);
+        Ok(())
+    }
+
+    /// Caché de granos descomprimidos (pruebas).
+    #[cfg(test)]
+    pub(crate) fn stream_cache(&self) -> Option<&GrainCache> {
+        self.stream.as_ref().map(|s| &s.cache)
     }
 }
 
@@ -1073,6 +1330,9 @@ impl BlockDevice for VmdkImage {
             match self.resolve(g)? {
                 Grain::Sparse => chunk.fill(0),
                 Grain::Data(base) => read_exact_at(&self.file, base + within, chunk)?,
+                Grain::Compressed { offset, size } => {
+                    self.read_compressed(g, offset, size, within, pos, chunk)?
+                }
                 Grain::Discarded => {
                     return Err(tolerant::discarded_read(FORMAT, "grano", g, pos, n));
                 }
@@ -1112,7 +1372,9 @@ impl BlockDevice for VmdkImage {
                 _ => {
                     let kind = match self.resolve(g)? {
                         Grain::Sparse => Allocation::Sparse,
-                        Grain::Data(_) | Grain::Discarded => Allocation::Data,
+                        Grain::Data(_) | Grain::Compressed { .. } | Grain::Discarded => {
+                            Allocation::Data
+                        }
                     };
                     (kind, (g + 1).saturating_mul(spg))
                 }
@@ -1413,10 +1675,10 @@ mod tests {
         let mut b = Builder::new(64);
         b.descriptor = descriptor(64).replace("parentCID=ffffffff", "parentCID=a1b2c3d4");
         assert!(external_ref(b.open()).contains("a1b2c3d4"));
-        // streamOptimized u otros tipos declarados en el descriptor.
+        // streamOptimized en el descriptor sin cabecera comprimida (incoherente) u otros tipos.
         let mut b = Builder::new(64);
         b.descriptor = descriptor(64).replace("monolithicSparse", "streamOptimized");
-        assert!(is_unsupported(b.open()));
+        assert!(is_corrupt(b.open()));
         let mut b = Builder::new(64);
         b.descriptor = descriptor(64).replace("monolithicSparse", "vmfsSparse");
         assert!(is_unsupported(b.open()));
@@ -1500,12 +1762,11 @@ mod tests {
     }
 
     #[test]
-    fn stream_optimized_is_unsupported() {
-        for flags in [
-            FLAG_COMPRESSED,
-            FLAG_MARKERS,
-            FLAG_COMPRESSED | FLAG_MARKERS,
-        ] {
+    fn partial_stream_optimized_headers() {
+        // Compresión sin marcadores o al revés, GD al final y algoritmo sin indicadores: no
+        // soportados. Con los dos indicadores y deflate, la cabecera de streamOptimized no casa
+        // con el createType monolithicSparse de este descriptor: incoherente.
+        for flags in [FLAG_COMPRESSED, FLAG_MARKERS] {
             let mut b = Builder::new(64);
             b.flags |= flags;
             b.version = 3;
@@ -1517,6 +1778,11 @@ mod tests {
         let mut raw = Builder::new(64).build();
         raw[77] = 1; // compressAlgorithm = deflate
         assert!(is_unsupported(open_bytes(&raw)));
+        let mut b = Builder::new(64);
+        b.flags |= FLAG_COMPRESSED | FLAG_MARKERS;
+        let mut raw = b.build();
+        raw[77] = 1;
+        assert!(is_corrupt(open_bytes(&raw)));
     }
 
     #[test]
