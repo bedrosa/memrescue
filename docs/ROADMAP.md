@@ -217,7 +217,7 @@ Cada INV: alcance cerrado, fuentes en este orden: (1) especificación pública, 
 | ID | Tema | Origen | Antes de | Pregunta concreta | Punto de partida |
 |---|---|---|---|---|---|
 | INV-01 | Motor de recuperación | Área pendiente "arranque/recuperación" | M4 | **Hecha** (2026-10-18, solo fuentes públicas): `investigacion/dmde-fase2/INV-01-motor-de-recuperacion.md`, con propuesta propia de `mr-vfs`, `mr-recover` y `mr-report` y preguntas abiertas | Cadenas 0x833310–0x83fce8 (F1-08) |
-| INV-02 | Algoritmos RAW | Área "RAID/RAW" | M7 | Estructura de firma, granularidad del barrido, cálculo de tamaño por formato | Tabla 0x6d2167…, claves 0x6d9534 |
+| INV-02 | Algoritmos RAW | Área "RAID/RAW" | M7 | **Hecha** (2026-10-24, solo fuentes públicas): `investigacion/dmde-fase2/INV-02-busqueda-raw.md`, con propuesta propia de `mr-raw` (sintaxis de firmas, granularidad, tamaño por formato) y preguntas abiertas | Tabla 0x6d2167…, claves 0x6d9534 |
 | INV-03 | Puntuación de volúmenes candidatos | Pendiente NTFS | M6 | Métrica de % / Check / votos | `FUN_006a6d80`, `FUN_006a89b0`, `FUN_006a8c50` |
 | INV-03b | RAID: mapeo, delay, cálculo automático | Área "RAID/RAW" | M5 | Fórmulas de rotación y métrica de detección | Cadenas 0x6c1d64, 0x677594; manual RAID |
 | INV-04 | FS no NTFS (uno por sesión) | Área "otros FS" | M8 | Validadores y escáneres de FAT, exFAT, HFS+, ReFS, Btrfs | Rangos del doc F1-03 |
