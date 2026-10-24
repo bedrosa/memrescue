@@ -39,8 +39,10 @@ USO:
                                 [--save-backup F [--overwrite]]
   memrescue-cli partition-backup-check <copia> <imagen> [ORIGEN] [--json]
   memrescue-cli ntfs-info <imagen> [ORIGEN] [--json]
-  memrescue-cli ntfs-stat <imagen> --record N [ORIGEN] [--json]
-  memrescue-cli ntfs-cat <imagen> --record N [--stream NOMBRE] [-o SALIDA [--overwrite]] [ORIGEN]
+  memrescue-cli ntfs-ls <imagen> [RUTA] [-r] [ORIGEN] [--json]
+  memrescue-cli ntfs-stat <imagen> (--record N | RUTA) [ORIGEN] [--json]
+  memrescue-cli ntfs-cat <imagen> (--record N | RUTA) [--stream NOMBRE] [-o SALIDA [--overwrite]]
+                         [ORIGEN]
   memrescue-cli ntfs-deleted <imagen> [ORIGEN] [--json]
   memrescue-cli ntfs-recover <imagen> --record N -o SALIDA [--stream NOMBRE] [--overwrite] [ORIGEN]
   memrescue-cli sectors <imagen> --lba N [--count M] [--retries N] [--jump N] [--read-back]
@@ -119,9 +121,20 @@ VOLUMEN NTFS (ntfs-info):
   Las LBA de los sectores ilegibles son relativas al origen abierto (la partición, si la hay).
   Código de salida 3 si algún registro tiene sectores ilegibles.
 
-FICHEROS NTFS (ntfs-stat, ntfs-cat), por número de registro MFT (el árbol de directorios llega
-con #22):
+DIRECTORIOS NTFS (ntfs-ls):
+  RUTA               directorio o fichero desde la raíz del volumen («/» por defecto; también
+                     con «\\»), sin distinguir mayúsculas según $UpCase del volumen
+  -r, --recursive    todo el subárbol (y, desde la raíz, los registros en uso que no cuelgan
+                     de ella: huérfanos, con el motivo)
+  Cada entrada del índice $I30 se contrasta con la MFT: «live» solo si el registro está en uso
+  con la secuencia del índice; las demás (registro libre, reutilizado, dañado o ilegible,
+  referencia no válida) se listan con su estado, nunca como ficheros vivos. Los nodos de índice
+  dañados se informan y se saltan; el resto se lista. Código 3 si algún nodo o registro tiene
+  sectores ilegibles.
+
+FICHEROS NTFS (ntfs-stat, ntfs-cat), por número de registro MFT o por ruta:
   --record N         registro base del fichero (también no en uso: ficheros borrados)
+  RUTA               ruta del fichero (como en ntfs-ls); no se combina con --record
   --stream NOMBRE    flujo alternativo ($DATA con nombre); sin él, el flujo principal
   -o, --output F     fichero de salida de ntfs-cat (sin él, la salida estándar). Se rechazan el
                      propio origen (o uno de sus segmentos), las rutas de dispositivo y los
@@ -197,6 +210,8 @@ struct Args {
     overwrite: bool,
     /// Copia del particionado (`partitions`, `find-partitions`).
     save_backup: Option<PathBuf>,
+    /// Subárbol completo (`ntfs-ls -r`).
+    recursive: bool,
 }
 
 /// Analiza `--skip-codes`: códigos positivos separados por comas (decimal o `0x…`), sin
@@ -266,6 +281,7 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
         output: None,
         overwrite: false,
         save_backup: None,
+        recursive: false,
     };
     while let Some(s) = it.next() {
         match s.as_str() {
@@ -344,6 +360,7 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
             "--save-backup" => {
                 a.save_backup = Some(it.next().ok_or("falta el valor de --save-backup")?.into());
             }
+            "-r" | "--recursive" => a.recursive = true,
             "-o" | "--output" => {
                 a.output = Some(it.next().ok_or("falta el valor de -o")?.into());
             }
@@ -815,6 +832,9 @@ fn run(args: Vec<String>) -> Result<(), (u8, String)> {
     if cmd == "ntfs-recover" && a.json {
         return Err(usage("ntfs-recover no admite --json"));
     }
+    if cmd != "ntfs-ls" && a.recursive {
+        return Err(usage("-r solo se aplica a ntfs-ls"));
+    }
     if cmd == "ntfs-cat" && a.json {
         return Err(usage(
             "ntfs-cat no admite --json (escribe el contenido del flujo)",
@@ -1109,11 +1129,37 @@ fn run(args: Vec<String>) -> Result<(), (u8, String)> {
             let stream = a.stream.clone().unwrap_or_default();
             ntfs_deleted::recover(&v, &src, record, &stream, &out, a.overwrite)?;
         }
+        "ntfs-ls" => {
+            let (p, path) = match a.positional.as_slice() {
+                [p] => (p.clone(), "/".to_string()),
+                [p, r] => (p.clone(), r.clone()),
+                _ => return Err(usage("se esperaba la imagen y, opcionalmente, una ruta")),
+            };
+            let src = open_src(&a, &p).map_err(|e| op(&e))?;
+            let v = std::sync::Arc::new(mr_api::ntfs_open(&src).map_err(|e| op(&e))?);
+            ntfs_files::ls(&v, &path, a.recursive, a.json)?;
+        }
         "ntfs-stat" | "ntfs-cat" => {
-            let p = one(&a)?;
-            let record = a.record.ok_or_else(|| usage("falta --record N"))?;
+            let (p, path) = match (a.positional.as_slice(), a.record) {
+                ([p], Some(_)) => (p.clone(), None),
+                ([p, r], None) => (p.clone(), Some(r.clone())),
+                ([_, _], Some(_)) => return Err(usage("--record y RUTA no se pueden combinar")),
+                ([_], None) => return Err(usage("falta --record N o RUTA")),
+                _ => return Err(usage("se esperaba la imagen y --record N o una ruta")),
+            };
             let src = open_src(&a, &p).map_err(|e| op(&e))?;
             let v = mr_api::ntfs_open(&src).map_err(|e| op(&e))?;
+            let record = match (a.record, path) {
+                (Some(r), _) => r,
+                (None, Some(path)) => {
+                    let e = mr_api::ntfs_resolve(&v, &path).map_err(|e| op(&e))?;
+                    if cmd == "ntfs-cat" && e.is_directory {
+                        return Err(op(&format!("{path} es un directorio")));
+                    }
+                    e.record()
+                }
+                (None, None) => unreachable!("validado arriba"),
+            };
             if cmd == "ntfs-cat" {
                 let stream = a.stream.clone().unwrap_or_default();
                 ntfs_files::cat(&v, &src, record, &stream, a.output.as_deref(), a.overwrite)?;

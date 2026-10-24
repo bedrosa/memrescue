@@ -1,4 +1,4 @@
-//! `ntfs-info`, `ntfs-stat` y `ntfs-cat` contra el corpus NTFS (ADR-024; esquema en `docs/PRUEBAS.md` §1.2).
+//! `ntfs-info`, `ntfs-stat`, `ntfs-cat` y `ntfs-ls` contra el corpus NTFS (ADR-024; esquema en `docs/PRUEBAS.md` §1.2).
 //!
 //! Requieren las imágenes descargadas (`python -I -X utf8 tools/fetch_ntfs_corpus.py`;
 //! `MR_NTFS_CORPUS` para otra ubicación). Se ejecutan con
@@ -387,4 +387,148 @@ fn ntfs_cat_reports_unreadable_ranges_and_refuses_unsafe_outputs() {
     assert!(out.contains("«con_flujos.txt»"), "{out}");
     assert!(out.contains("«Zone.Identifier»: 26 B, residente"), "{out}");
     assert!(out.contains("«resumen»: 20000 B, no residente"), "{out}");
+}
+
+/// Valores de una clave en las entradas de un JSON plano de `ntfs-ls` (`"clave":"valor"` o
+/// número), en orden.
+fn json_values(json: &str, key: &str) -> Vec<String> {
+    let pat = format!("\"{key}\":");
+    json.match_indices(&pat)
+        .map(|(i, _)| {
+            let rest = &json[i + pat.len()..];
+            if let Some(s) = rest.strip_prefix('"') {
+                // Cadena JSON sin comillas escapadas (las rutas del corpus no las tienen).
+                s[..s.find('"').unwrap()].to_string()
+            } else {
+                rest[..rest.find([',', '}']).unwrap()].to_string()
+            }
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "requiere el corpus NTFS (tools/fetch_ntfs_corpus.py)"]
+fn ntfs_ls_recursive_matches_the_live_paths_of_every_manifest() {
+    let mut dir: Vec<PathBuf> = std::fs::read_dir(repo().join("tests/corpus/ntfs/manifests"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    dir.sort();
+    let mut total = 0;
+    for mf in dir {
+        let m = manifest(&mf);
+        let name = m["name"].clone();
+        let img = image_path(&m["file"]);
+        let mut args = vec!["ntfs-ls", img.as_str(), "/", "-r", "--json"];
+        if m.contains_key("has.partition") {
+            args.extend(["--partition", "1"]);
+        }
+        let (code, out, err) = run_bytes(&args);
+        assert_eq!(code, 0, "{name}: {err}");
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("\"status\":\"complete\""), "{name}");
+        assert!(out.contains("\"orphans\":[]"), "{name}");
+        // Entradas vivas que no son del sistema: ruta, tipo y registro.
+        let paths = json_values(&out, "path");
+        let types = json_values(&out, "type");
+        let records = json_values(&out, "record");
+        let states = json_values(&out, "state");
+        let system = json_values(&out, "system");
+        // El primer "path" es el del listado; el resto, uno por entrada.
+        let mut got: Vec<(String, String, String)> = (0..types.len())
+            .filter(|&i| states[i] == "live" && system[i] == "false")
+            .map(|i| (paths[i + 1].clone(), types[i].clone(), records[i].clone()))
+            .collect();
+        got.sort();
+        let mut want: Vec<(String, String, String)> = file_entries(&mf)
+            .into_iter()
+            .map(|(f, _)| f)
+            .filter(|f| f["state"] == "live" && f.get("mft_damaged").is_none())
+            .map(|f| {
+                (
+                    f["path"].clone(),
+                    f["type"].clone(),
+                    f["mft_record"].clone(),
+                )
+            })
+            .collect();
+        want.sort();
+        assert_eq!(got, want, "{name}");
+        // ntfs_damaged_mft: las entradas que apuntan a registros dañados se informan.
+        let damaged = (0..types.len())
+            .filter(|&i| states[i] == "record_unusable")
+            .count();
+        let want_damaged = file_entries(&mf)
+            .iter()
+            .filter(|(f, _)| f.get("mft_damaged").is_some())
+            .count();
+        assert_eq!(damaged, want_damaged, "{name}");
+        total += got.len();
+    }
+    assert_eq!(total, 503);
+}
+
+#[test]
+#[ignore = "requiere el corpus NTFS (tools/fetch_ntfs_corpus.py)"]
+fn ntfs_cat_and_ls_accept_paths() {
+    let mut checked = 0;
+    for (name, part) in [("ntfs_basic", false), ("ntfs_mbr", true)] {
+        let img = image_path(&format!("{name}.img"));
+        let mf = repo().join(format!("tests/corpus/ntfs/manifests/{name}.manifest.toml"));
+        for (f, _) in file_entries(&mf) {
+            let path = f["path"].clone();
+            // Sin distinguir mayúsculas y con el separador de Windows.
+            let upper = path.to_uppercase().replace('/', "\\");
+            if f["type"] == "file" {
+                let mut args = vec!["ntfs-cat", img.as_str(), upper.as_str()];
+                if part {
+                    args.extend(["--partition", "1"]);
+                }
+                let (code, out, err) = run_bytes(&args);
+                assert_eq!(code, 0, "{name} {path}: {err}");
+                assert_eq!(sha256(&out), f["sha256"], "{name} {path}");
+                checked += 1;
+            } else {
+                let mut args = vec!["ntfs-ls", img.as_str(), upper.as_str(), "--json"];
+                if part {
+                    args.extend(["--partition", "1"]);
+                }
+                let (code, out, err) = run_bytes(&args);
+                assert_eq!(code, 0, "{name} {path}: {err}");
+                let out = String::from_utf8(out).unwrap();
+                // La ruta mostrada es la canónica (nombres del volumen).
+                assert!(
+                    out.starts_with(&format!(
+                        "{{\"path\":\"{path}\",\"directory\":{},",
+                        f["mft_record"]
+                    )),
+                    "{name} {path}: {out}"
+                );
+            }
+        }
+        let mut args = vec!["ntfs-cat", img.as_str(), "/no/existe.txt"];
+        if part {
+            args.extend(["--partition", "1"]);
+        }
+        let (code, _, err) = run_bytes(&args);
+        assert_eq!(code, 1, "{err}");
+        assert!(err.contains("no existe /no"), "{err}");
+    }
+    assert!(checked > 100, "{checked}");
+    // Texto de ntfs-ls y ntfs-stat por ruta.
+    let img = image_path("ntfs_basic.img");
+    let (code, out, _) = run_bytes(&["ntfs-ls", &img, "/datos"]);
+    assert_eq!(code, 0);
+    let out = String::from_utf8(out).unwrap();
+    assert!(
+        out.starts_with("Directorio /datos (registro 72): 6 entradas, 6 vivas"),
+        "{out}"
+    );
+    assert!(out.contains("vacío.txt"), "{out}");
+    let (code, out, _) = run_bytes(&["ntfs-stat", &img, "/configuración.ini", "--json"]);
+    assert_eq!(code, 0);
+    assert!(String::from_utf8(out).unwrap().contains("\"record\":77"));
+    // Un directorio no se puede volcar con ntfs-cat.
+    let (code, _, err) = run_bytes(&["ntfs-cat", &img, "/datos"]);
+    assert_eq!(code, 1, "{err}");
 }

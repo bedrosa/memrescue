@@ -27,9 +27,14 @@
 //! - [`ntfs_deleted`] / [`start_ntfs_deleted_task`]: ficheros borrados de la MFT con su
 //!   recuperabilidad (cancelable, con progreso); [`ntfs_recover_record`] y [`ntfs_recover_stream`]:
 //!   recuperación de un borrado con el estado de cada tramo (#23).
+//! - [`ntfs_list_dir`], [`ntfs_resolve`], [`ntfs_path_of`] y [`start_ntfs_tree_task`] (#22):
+//!   directorios contrastados con la MFT, rutas y árbol completo cancelable con progreso;
+//!   [`ntfs_stream_source`] presenta un fichero como origen (visor) y [`ntfs_copy_file`] /
+//!   [`start_ntfs_copy_task`] lo copian con la política de [`create_output`].
 //! - [`start_hash_task`]: hashes del fichero completo en segundo plano.
 //! - [`start_verify_task`]: lectura completa tolerante a errores con mapa de validez por sector.
 
+mod ntfs;
 pub mod task;
 
 use mr_common::{HashAlgorithm, MultiHasher};
@@ -48,6 +53,10 @@ pub use mr_image::OpenOptions;
 pub use mr_part;
 pub use mr_part::search::{SearchOptions, SearchResult};
 pub use mr_part::{Partition, PartitionTable};
+pub use ntfs::{
+    ntfs_copy_file, ntfs_list_dir, ntfs_path_of, ntfs_resolve, ntfs_stream_source, ntfs_tree,
+    start_ntfs_copy_task, start_ntfs_tree_task, NtfsCopyResult, STREAM_SOURCE_SECTOR,
+};
 
 #[derive(Debug, Error)]
 pub enum ApiError {

@@ -61,6 +61,11 @@ impl TaskContext {
     pub fn finish_cancelled_with_result(&self) {
         self.partial.store(true, Ordering::Relaxed);
     }
+    /// Marca la cancelación sin tarea (pruebas de operaciones síncronas).
+    #[cfg(test)]
+    pub(crate) fn cancel_for_tests(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
 }
 
 /// Tarea con resultado de tipo `T`.

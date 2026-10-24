@@ -25,6 +25,10 @@ public enum EngineStatus
     ExternalReference = 13,
     /// <summary>Variante del formato aún no soportada.</summary>
     UnsupportedFeature = 14,
+    /// <summary>Ruta NTFS que no existe.</summary>
+    NotFound = 15,
+    /// <summary>La salida ya existe y no se pidió sustituirla.</summary>
+    AlreadyExists = 16,
     Panic = 99,
 }
 
@@ -406,6 +410,16 @@ public sealed class Source : EngineHandle
         // Si la lectura de las listas falla, el finalizador de la tabla libera el handle.
         Engine.Check(NativeMethods.mr_source_partitions(Handle, out var h));
         return new PartitionTable(h, this);
+    }
+
+    /// <summary>
+    /// Abre el sistema de archivos NTFS que empieza en el origen (imagen sin tabla, partición o volumen
+    /// encontrado). Si no es NTFS, <see cref="EngineStatus.Corrupt"/>.
+    /// </summary>
+    public NtfsVolume OpenNtfs()
+    {
+        Engine.Check(NativeMethods.mr_ntfs_open(Handle, out var h));
+        return new NtfsVolume(h, Path);
     }
 
     /// <summary>

@@ -748,3 +748,59 @@ escritura en un clúster libre sin asignarlo no se detecta (el contenido se da p
 evaluación no lee los datos: los sectores ilegibles aparecen al recuperar. Numeración provisional:
 puede cambiar al integrar las ramas paralelas.
 
+---
+
+## ADR-028 · Árbol NTFS: entradas contrastadas con la MFT, nodos dañados que no bloquean y fichero como origen (Aceptada, 2026-10-24)
+
+**Contexto.** Issue #22 (FS-02, M3): leer los índices `$I30` (raíz residente y nodos `INDX` de
+`$INDEX_ALLOCATION` con su `$BITMAP`), construir el árbol de directorios, resolver rutas y llevar el
+árbol a la FFI, C# y la interfaz. Hay que decidir qué se hace con nodos dañados, con entradas que
+apuntan a registros reutilizados o libres, cómo se comparan los nombres y cómo se abre o se copia un
+fichero desde la interfaz sin romper las reglas de ADR-019 y ADR-026. #23 añadirá los borrados.
+
+**Decisión** (detalle en `formatos/ntfs.md`):
+1. **Nodo a nodo**: cada `INDX` se comprueba por separado (firma, secuencia de actualización sin
+   tolerancia con `apply_fixups`, VCN de la cabecera igual al del puntero, cabecera y entradas dentro
+   de los bytes en uso, entrada final presente, bit de `$BITMAP` a 1) y un nodo que no cumple se
+   informa con su anomalía tipada y se salta; los demás se siguen leyendo. Un sector no fiable dentro
+   de un nodo lo deja sin interpretar (ADR-019). Límites explícitos de profundidad (32), nodos
+   (2^20) y entradas (2^22); un nodo al que se vuelve a llegar es un ciclo y no se sigue.
+2. **Entrada viva solo si la MFT lo confirma**: el registro existe, es interpretable, es base, está en
+   uso y tiene la secuencia de la referencia. Si no, la entrada se lista con su estado (registro
+   libre, reutilizado, no utilizable, referencia no válida), nunca como fichero vivo; #23 las
+   expondrá como residuales (los códigos 16-31 del estado quedan reservados en la ABI).
+3. **Nombres**: las entradas DOS de un registro que tiene otra entrada no DOS en el mismo directorio
+   no se listan (nombre corto aparte); los enlaces duros aparecen en cada directorio; UTF-16 con
+   sustitución de las unidades sueltas (U+FFFD), marcado, y comparaciones con las unidades
+   originales. Colación de `$I30` con `$UpCase` del volumen si es válida (128 KiB, comprobación
+   ASCII); si no, un plegado simple documentado y señalado.
+4. **Rutas**: la búsqueda baja por el árbol B según la colación y, si el camino tiene nodos dañados,
+   desordenados o solo hay coincidencias sin distinguir mayúsculas, recorre el índice entero. La ruta
+   de un registro sube por las referencias al padre con detección de ciclos y profundidad máxima; un
+   padre ausente, ilegible, libre, reutilizado o que no es un directorio deja el fichero huérfano con
+   su motivo. El árbol completo (tarea cancelable con progreso) informa además los registros en uso
+   que no se alcanzan desde la raíz (huérfanos), así que lo que cuelga de un nodo perdido no
+   desaparece.
+5. **Fichero como origen**: para el visor, un flujo se presenta como un origen de sectores de 512 B
+   (tamaño redondeado; los sectores enteros tras el final son dispersos y los bytes del último sector
+   tras el final son ceros); un tramo no fiable del flujo es un error de lectura, así que el visor lo
+   muestra como ilegible con el patrón de relleno. El origen conserva la ruta y los segmentos de la
+   imagen, de modo que una salida nunca puede ser la imagen.
+6. **Copia («Guardar como…»)**: tarea con progreso y cancelación sobre `mr_api::create_output`
+   (nunca el origen ni un dispositivo ni un directorio; sin sustituir un fichero existente salvo
+   petición explícita, que en la interfaz es la confirmación del cuadro de guardar; temporal y
+   renombrado final). Los tramos no fiables se escriben con el patrón y se informan. Códigos nuevos
+   de la ABI: 15 `MR_ERR_NOT_FOUND` y 16 `MR_ERR_ALREADY_EXISTS`, que solo devuelven las funciones
+   nuevas.
+
+**Alternativas.** Descartar el directorio entero ante un nodo dañado (se perdería todo lo legible);
+listar las entradas del índice sin contrastarlas (presentaría como vivos ficheros reutilizados o
+borrados); comparar nombres con un plegado propio siempre (no coincidiría con NTFS en volúmenes con
+`$UpCase` propia); presentar el fichero al visor con su tamaño exacto (el último sector parcial no se
+vería); copiar en el hilo de la interfaz sin cancelación.
+
+**Consecuencias.** El árbol de los 10 manifiestos del corpus coincide con sus rutas vivas (503, 95
+con caracteres no ASCII) y cada ruta se resuelve a su registro y a su SHA-256; las entradas de
+`ntfs_damaged_mft` que apuntan a registros dañados se informan; un nodo `INDX` ilegible del corpus
+no bloquea el resto (lo perdido aparece como huérfano con su ruta). Los índices distintos de `$I30`
+(`$SII`, `$SDH`, `$O`, `$R`, `$Q`) quedan fuera; la búsqueda por colación solo se usa para `$I30`.

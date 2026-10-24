@@ -1,7 +1,7 @@
 # NTFS: sector de arranque, MFT, registros FILE, atributos y datos
 
-Crate: `core/mr-fs-ntfs` (`mr_fs_ntfs::NtfsVolume`). Solo lectura. Issues #20 y #21 (M3), paridad
-FS-01, FS-03 y FS-04, ADR-025 y ADR-026. Los índices y el árbol son de #22; los borrados (qué datos
+Crate: `core/mr-fs-ntfs` (`mr_fs_ntfs::NtfsVolume`). Solo lectura. Issues #20, #21 y #22 (M3),
+paridad FS-01 a FS-04, ADR-025, ADR-026 y ADR-028 (índices, árbol y rutas). Los borrados (qué datos
 siguen disponibles y con qué fiabilidad) son de #23 (FS-16, ADR-027): la parte de la MFT está hecha
 y las entradas `INDX` residuales, pendientes.
 
@@ -78,15 +78,14 @@ stream.with_suspect_clusters(tramos)    // lo leído de esos clústeres: possibl
   [--overwrite] [ORIGEN]` (política de salida de `ntfs-cat -o`; en la salida de errores, la
   recuperabilidad, los tramos posiblemente sobrescritos con LCN y dueño y los tramos con patrón;
   código 3 si algún byte no es fiable).
-- FFI e interfaz: **pendientes** (#22, cuando aparezca el árbol de ficheros). `mr-ffi` solo traduce
-  los nuevos errores (`MR_ERR_CORRUPT`, `MR_ERR_OUT_OF_RANGE` o el código de E/S).
+- FFI e interfaz: con el árbol (#22, ver «Índices, directorios y rutas»).
 
 Módulos y frontera con los siguientes issues:
 
 | Módulo | Contenido | Lo amplía |
 |---|---|---|
 | `boot` | `parse_boot`, codificaciones de clúster y de tamaño de registro | - |
-| `record` | `apply_fixups` (sirve también para `INDX`), `FileRecord`, cabecera, `FileReference` | #22 (INDX) |
+| `record` | `apply_fixups` (sirve también para `INDX`), `FileRecord`, cabecera, `FileReference` | - |
 | `attr` | iterador acotado de cabeceras de atributo (residente/no residente, nombre) | - |
 | `values` | `$STANDARD_INFORMATION`, `$FILE_NAME`, `$OBJECT_ID`, `$VOLUME_INFORMATION`, entradas de `$ATTRIBUTE_LIST` | #22 (`$FILE_NAME` de los índices) |
 | `runs` | `decode_runs`, `decode_extent`, `merge_contiguous`, `sparse_ranges` | - |
@@ -97,7 +96,107 @@ Módulos y frontera con los siguientes issues:
 | `recover` (#23) | `recovery_stream`, `recover_stream`, `RecoveryReport` | M4 |
 | `lznt1` | descompresor [MS-XCA] | - |
 | `mft` | `MftLayout` (tramos en disco de cada registro), `RecordOutcome`, `Records` | #22, #23 |
-| `volume` | apertura, copia del arranque, `$MFTMirr`, `$Volume`, extensiones de `$MFT`, `file`, `open_stream` | - |
+| `volume` | apertura, copia del arranque, `$MFTMirr`, `$Volume`, extensiones de `$MFT`, `file`, `open_stream`, `attribute_stream`, `stream_view`, `upcase` | - |
+| `index` (#22) | `$INDEX_ROOT`, nodos `INDX`, `$BITMAP`, `IndexReader` (`walk`, `find`), `IndexIssue` | #23 (entradas residuales del espacio libre de los nodos) |
+| `dir` (#22) | `DirEntry`, `EntryState`, `list_dir`, `lookup`, `resolve_path`, `path_of`, `tree`, huérfanos | #23 (borrados en el árbol) |
+| `upcase` (#22) | `$UpCase`, plegado simple, colación | - |
+| `testvol` | volúmenes sintéticos (también para otros crates con la característica `test-support`) | - |
+
+## Índices, directorios y rutas (#22, ADR-028)
+
+```rust
+volume.list_dir(record) -> Result<DirListing, NtfsError>     // entradas contrastadas con la MFT + anomalías
+volume.lookup(dir, "nombre") -> Result<Option<DirEntry>, _>  // sin distinguir mayúsculas
+volume.resolve_path("/a/b") -> Result<DirEntry, NtfsError>   // NotFound, NotADirectory, InvalidPath
+volume.path_of(record) -> Result<String, NtfsError>          // Orphan { reason }
+volume.tree(&TreeOptions, &dyn TreeObserver) -> Result<Tree, _>  // nodos, anomalías, huérfanos
+volume.upcase() -> Arc<Upcase>                                // $UpCase o plegado simple
+index::IndexReader::open(&volume, &file)                      // $I30: walk() y find()
+```
+
+- API: `mr_api::ntfs_list_dir`, `ntfs_resolve`, `ntfs_path_of`, `ntfs_tree` y
+  `start_ntfs_tree_task` (cancelable, con progreso), `ntfs_stream_source` (un fichero como origen de
+  512 B para el visor) y `ntfs_copy_file` / `start_ntfs_copy_task` (copia con `create_output`). FFI
+  `mr_ntfs_*` y C# `NtfsVolume` (`API_FFI.md`). CLI: `ntfs-ls <imagen> [RUTA] [-r] [--json]` y
+  `ntfs-cat` / `ntfs-stat` con una RUTA en lugar de `--record`. Interfaz: pestaña «Sistema de
+  archivos» (desde Disco → Abrir sistema de archivos NTFS del origen o desde la pestaña Particiones
+  sobre una partición o un volumen encontrado) con árbol, lista (nombre, tamaño, fechas, registro y
+  estado), «Abrir en el visor» y «Guardar como…».
+
+**`$INDEX_ROOT`** (residente, nombre `$I30`): tipo indexado 0x30 (`$FILE_NAME`), colación 1 (nombres
+de fichero), tamaño de nodo potencia de 2 entre 512 B y 64 KiB (si difiere del arranque se informa,
+`index_block_size_mismatch`, y manda el del índice) y la cabecera de nodo en 0x10.
+
+**Cabecera de nodo** (raíz en 0x10, `INDX` en 0x18): primera entrada ≥ 0x10 y múltiplo de 8, bytes
+en uso ≥ primera entrada, en uso ≤ asignados ≤ lo que queda del nodo (`index_header_bounds`).
+
+**Entradas**: longitud ≥ 0x10 (0x18 con subnodo), múltiplo de 8 y dentro de los bytes en uso
+(`index_entry_length`); clave dentro de la entrada y no vacía salvo en la última
+(`index_entry_key_length`); la clave es un `$FILE_NAME` válido (si no, `index_entry_key`: esa entrada
+se ignora y el resto se lee); el recorrido termina en la entrada con el indicador de última
+(`index_missing_last_entry`). Tras el primer error de estructura el recorrido del nodo se detiene y
+las entradas anteriores se conservan (se contrastan igual con la MFT).
+
+**Nodos `INDX`** (`$INDEX_ALLOCATION` de `$I30`, leído por el mapa de validez como cualquier flujo):
+VCN en clústeres si el nodo mide al menos un clúster y en unidades de 512 B si es menor; puntero a
+subnodo alineado al tamaño del nodo y dentro del flujo (`index_subnode_out_of_range`); bit a 1 en
+`$BITMAP` de `$I30` (`index_node_unallocated`: su contenido es residual y no se lista; sin `$BITMAP`
+legible se informa `index_bitmap_unusable` y no se comprueba); bytes fiables
+(`index_block_unreadable`, ADR-019); firma `INDX` (`index_block_signature`); secuencia de
+actualización con `apply_fixups`, sin tolerancia (`index_block_fixup_mismatch`,
+`index_block_usa_invalid`); VCN de la cabecera igual al del puntero (`index_block_vcn`). Un nodo que
+no cumple se informa y se salta; el resto del árbol B se sigue leyendo.
+
+**Recorrido**: profundidad máxima 32 (`index_depth`), 2^20 nodos (`index_node_limit`) y 2^22 entradas
+(`index_entry_limit`); un nodo al que se vuelve a llegar no se sigue (`index_loop`); entradas de un
+nodo fuera del orden de colación, `index_order` (informativo, y la búsqueda recorre todo el índice).
+
+**Contraste con la MFT** (`EntryState`): `live` solo si el registro existe, es interpretable, es base,
+está en uso y su secuencia es la de la referencia; si no, `stale_not_in_use` (libre: borrado),
+`stale_reused` (otra secuencia), `record_unusable` (con el estado del registro: dañado, ilegible...) o
+`invalid_reference` (fuera de la MFT o extensión). Solo las vivas son ficheros; las demás se listan
+con su estado (#23 las expondrá como residuales). Además: `entry_name_not_in_record` (el registro no
+tiene ese nombre en este directorio), `entry_parent_mismatch` (la clave dice estar en otro
+directorio), `entry_duplicate` y `entry_self_reference` (la entrada «.» de la raíz no se lista ni se
+informa). Tamaño, fechas y atributos salen del registro (`$DATA` principal y
+`$STANDARD_INFORMATION`); si el registro no es utilizable, de la clave del índice
+(`times_from_index`).
+
+**Nombres**: las entradas DOS de un registro con otra entrada no DOS en el mismo directorio no se
+listan (`dos_name`); Win32 y DOS en una entrada se lista una vez; los enlaces duros aparecen en cada
+directorio (y dos veces si están en el mismo). UTF-16 decodificado con U+FFFD en las unidades sueltas
+(`name_lossy`); las comparaciones usan las unidades originales. Son de sistema los registros 0-15 y
+el contenido de `$Extend`.
+
+**`$UpCase` y colación**: tabla del registro 10 si mide 128 KiB, es legible con datos fiables y pasa
+la comprobación ASCII; si no, plegado simple (`char::to_uppercase` de un solo carácter del plano
+básico; sustitutos sin cambio) y `UpcaseSource::SimpleFold` con el motivo. Colación: unidades
+plegadas una a una, el más corto antes a igualdad de prefijo; a igualdad, desempate por las unidades
+sin plegar (orden estable).
+
+**Rutas**: `/` o `\`, componentes vacíos ignorados, `.` y `..` rechazados. Cada componente se busca
+bajando por el árbol B según la colación; si el camino tiene un nodo dañado o desordenado, si solo
+hay coincidencias sin distinguir mayúsculas (puede haber una exacta en otro nodo) o si el nombre es
+8.3, se recorre el índice entero. Se prefiere la coincidencia exacta y después la que no distingue
+mayúsculas; solo entradas vivas. `path_of` sube por el `$FILE_NAME` preferido (no DOS) de cada
+registro con detección de ciclos y 1024 niveles; vale para registros no en uso, pero cada antecesor
+debe ser un directorio en uso con la secuencia de la referencia (si no, `Orphan` con el motivo:
+`orphan_parent_out_of_range`, `_unusable`, `_not_in_use`, `_reused`, `_not_directory`, `orphan_loop`,
+`orphan_too_deep`, `orphan_no_name`).
+
+**Árbol**: en anchura desde la raíz, solo se recorren directorios vivos; un directorio alcanzado dos
+veces no se vuelve a recorrer (`tree_loop`), profundidad máxima configurable (256, `tree_depth`),
+nodos máximos (10 millones, estado `limit`), cancelable (estado `cancelled` con el árbol parcial).
+Después revisa toda la MFT (registros 16 en adelante) y lista como huérfanos los registros base en
+uso con nombre que no se alcanzaron, con el motivo (los anteriores más `orphan_not_indexed`: el
+padre es alcanzable pero su índice no lo lista, p. ej. por un nodo perdido; y `orphan_parent_orphan`).
+Así lo que colgaba de un nodo dañado no desaparece y su ruta se puede reconstruir con `path_of`.
+
+**Fichero como origen** (visor): sectores de 512 B; tamaño redondeado al sector (los bytes tras el
+final del flujo en el último sector son ceros y los sectores enteros tras el final, dispersos); un
+tramo no fiable del flujo es un error de lectura, así que la lectura tolerante lo entrega con el
+patrón y el estado ilegible. Conserva la ruta y los segmentos de la imagen (una salida nunca puede
+ser la imagen).
 
 ## Lectura con el mapa de validez
 
@@ -449,7 +548,20 @@ son el estado de cada registro.
   `PRUEBAS.md`. 439 flujos
   con el SHA-256 del manifiesto (419 vivos, 12 borrados, 3 sobrescritos con `recovered_sha256` y 5
   flujos alternativos), con tamaño, residencia, runs, dispersos y tamaño inicializado.
-- CLI: `cli/tests/cli.rs` (origen sin NTFS, argumentos de `ntfs-cat`/`ntfs-stat`) y
+- #22 (`core/mr-fs-ntfs/src/dir_tests.rs`, 13, y `upcase`, 2): volumen sintético con árbol
+  (`testvol::tree_volume`: raíz con dos nodos `INDX`, `/Docs` con un nodo hoja, nombres DOS, enlace
+  duro, sustituto suelto, entradas a registros libres, reutilizados, dañados y fuera de la MFT,
+  huérfanos de cada tipo, `$UpCase` opcional): listados con cada estado, DOS, enlaces duros, Unicode,
+  rutas sin distinguir mayúsculas (con `$UpCase` y con plegado simple), `path_of`, ciclos y padres
+  reutilizados; cada daño de nodo (fixups, USA, VCN, firma, cabecera, sector ilegible, bit de
+  `$BITMAP`, puntero fuera de rango, ciclo, `$BITMAP` ausente) con el resto listado y lo perdido como
+  huérfano; nodos de 1 KiB con VCN de 512 B; ciclo de directorios, profundidad, límite de nodos y
+  cancelación; reglas de cabecera y entradas; fuzzing de 20 000 nodos y 300 volúmenes mutados.
+  Corpus (`ntfs_corpus.rs`, 3 más): árbol de los 10 manifiestos, cada ruta viva resuelta con su
+  SHA-256 y un nodo `INDX` ilegible del corpus. `mr-api` (4: listado, árbol con cancelación, fichero
+  como origen, copia con la política de salida), `mr-ffi` (5), C# (`NtfsTests`), CLI (`ntfs-ls -r
+  --json` de las 10 imágenes, `ntfs-cat RUTA`) e interfaz (`NtfsUiTests`).
+- CLI: `cli/tests/cli.rs` (origen sin NTFS, argumentos de `ntfs-cat`/`ntfs-stat`/`ntfs-ls`) y
   `cli/tests/ntfs_corpus.rs` (`ntfs-info --json` de las 10 imágenes, `ntfs-cat` y `ntfs-stat --json`
   de 116 flujos, imagen truncada con código 3 y patrón solo en los bytes no fiables, salidas
   rechazadas).
@@ -474,6 +586,14 @@ son el estado de cada registro.
   comprueba con los vectores de Windows y volúmenes sintéticos, y las extensiones con volúmenes
   sintéticos.
 - No se reparan registros desde `$MFTMirr` salvo el registro 0 para localizar la MFT.
+- Solo se interpretan índices `$I30` (nombres de fichero); `$SII`, `$SDH`, `$O`, `$Q` y `$R` no.
+- Las entradas residuales del espacio libre de los nodos `INDX` (más allá de los bytes en uso) y los
+  nodos libres según `$BITMAP` no se leen: son de #23.
+- El corpus de ntfs-3g tiene índices de uno o dos niveles y sin nombres DOS: los árboles B profundos,
+  los nodos menores que un clúster y los nombres 8.3 se comprueban con volúmenes sintéticos.
+- La copia de un fichero desde la interfaz o la FFI hereda la limitación de `create_output`: un enlace
+  duro a la imagen no se detecta.
+- El plegado simple (sin `$UpCase` utilizable) no coincide con Windows en todos los caracteres.
 - No se busca la MFT si el registro 0 falla en las dos copias (lo hará el escaneo de M6).
 - El corpus es de ntfs-3g: sin volúmenes de Windows, sin clústeres grandes ni sectores de 4 KiB
   reales (cubiertos solo por las pruebas sintéticas).

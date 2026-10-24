@@ -460,6 +460,8 @@ pub struct NtfsVolume {
     dev: Arc<dyn BlockDevice>,
     info: VolumeInfo,
     retries: u32,
+    /// Tabla de mayúsculas (`$UpCase`), cargada la primera vez que se compara un nombre.
+    upcase: std::sync::OnceLock<Arc<crate::upcase::Upcase>>,
 }
 
 impl fmt::Debug for NtfsVolume {
@@ -985,7 +987,12 @@ impl NtfsVolume {
             version,
             anomalies,
         };
-        Ok(NtfsVolume { dev, info, retries })
+        Ok(NtfsVolume {
+            dev,
+            info,
+            retries,
+            upcase: std::sync::OnceLock::new(),
+        })
     }
 
     pub fn info(&self) -> &VolumeInfo {
@@ -1059,6 +1066,11 @@ impl NtfsVolume {
         assemble(&self.reader(), rec)
     }
 
+    /// Fichero a partir de un registro base ya leído (evita leerlo otra vez).
+    pub(crate) fn file_from_record(&self, rec: FileRecord) -> Result<NtfsFile, NtfsError> {
+        assemble(&self.reader(), rec)
+    }
+
     /// Abre el flujo `$DATA` `name` (`""` = el principal) del registro base `number`.
     pub fn open_stream(&self, number: u64, name: &str) -> Result<DataStream<'_>, NtfsError> {
         let f = self.file(number)?;
@@ -1080,6 +1092,48 @@ impl NtfsVolume {
             file.number,
             file.in_use(),
         ))
+    }
+
+    /// Abre el flujo del atributo `type_code` con nombre `name` (p. ej. `$INDEX_ALLOCATION` o
+    /// `$BITMAP` de `$I30`) de un fichero ya reunido.
+    pub fn attribute_stream(
+        &self,
+        file: &NtfsFile,
+        type_code: u32,
+        name: &str,
+    ) -> Result<DataStream<'_>, NtfsError> {
+        let layout = file
+            .stream_layout(type_code, name, self.geometry())
+            .map_err(|error| NtfsError::Stream {
+                number: file.number,
+                error,
+            })?;
+        Ok(DataStream::new(
+            &*self.dev,
+            self.retries,
+            layout,
+            file.number,
+            file.in_use(),
+        ))
+    }
+
+    /// Flujo sobre una disposición conservada por el llamador (sin copiarla).
+    pub fn stream_view<'a>(
+        &'a self,
+        layout: &'a StreamLayout,
+        record: u64,
+        record_in_use: bool,
+    ) -> DataStream<'a> {
+        DataStream::borrowed(&*self.dev, self.retries, layout, record, record_in_use)
+    }
+
+    /// Tabla de mayúsculas para comparar nombres: `$UpCase` del volumen si es válida; si no, el
+    /// plegado simple documentado en [`crate::upcase`].
+    pub fn upcase(&self) -> Arc<crate::upcase::Upcase> {
+        Arc::clone(
+            self.upcase
+                .get_or_init(|| Arc::new(crate::upcase::Upcase::load(self))),
+        )
     }
 
     /// Registros de `range` (acotado a la MFT) en orden, con su resultado.

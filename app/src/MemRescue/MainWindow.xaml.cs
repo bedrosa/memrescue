@@ -43,8 +43,14 @@ public sealed class SourceEntry(Source source, ImageFormat detected, bool forced
 
     public PartitionSearchResult? SearchResult { get; set; }
 
+    /// <summary>Sistema de archivos NTFS abierto (a petición) y los directorios ya listados.</summary>
+    public NtfsVolume? Ntfs { get; set; }
+
+    public Dictionary<ulong, NtfsDirectoryListing> FsListings { get; } = [];
+
     public void Dispose()
     {
+        Ntfs?.Dispose();
         Search?.Dispose();
         Partitions?.Dispose();
         Source.Dispose();
@@ -457,8 +463,10 @@ public partial class MainWindow : Window
             PositionText.Text = "";
             UntrustedBanner.Visibility = Visibility.Collapsed;
             TolerantBanner.Visibility = Visibility.Collapsed;
+            ShowFileSystem(null);
             return;
         }
+        ShowFileSystem(s);
         TolerantBanner.Visibility = s.Tolerant ? Visibility.Visible : Visibility.Collapsed;
         TolerantBannerText.Text = s.Tolerant
             ? $"MODO TOLERANTE: {s.Source.Description}. Los bloques descartados se muestran como ilegibles (patrón de relleno), nunca como datos."
@@ -498,6 +506,7 @@ public partial class MainWindow : Window
         PartitionAnomaliesList.Items.Clear();
         PartitionSchemeText.Text = message;
         OpenPartitionButton.IsEnabled = false;
+        OpenPartitionFileSystemButton.IsEnabled = false;
         ShowFoundVolumes(Selected);
     }
 
@@ -573,12 +582,16 @@ public partial class MainWindow : Window
             PartitionAnomaliesList.Items.Add("(ninguna)");
         }
         OpenPartitionButton.IsEnabled = false;
+        OpenPartitionFileSystemButton.IsEnabled = false;
         ShowFoundVolumes(s);
         return t;
     }
 
-    private void PartitionsList_SelectionChanged(object sender, SelectionChangedEventArgs e) =>
+    private void PartitionsList_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
         OpenPartitionButton.IsEnabled = PartitionsList.SelectedItem is PartitionRow;
+        OpenPartitionFileSystemButton.IsEnabled = PartitionsList.SelectedItem is PartitionRow;
+    }
 
     private void PartitionsList_MouseDoubleClick(object sender, MouseButtonEventArgs e) => OpenPartition_Click(sender, e);
 
@@ -648,6 +661,7 @@ public partial class MainWindow : Window
         var searching = _searchCts is not null;
         FindPartitionsButton.IsEnabled = s is not null && !searching;
         OpenFoundVolumeButton.IsEnabled = false;
+        OpenFoundFileSystemButton.IsEnabled = false;
         if (s?.SearchResult is not { } r)
         {
             FoundVolumesList.ItemsSource = null;
@@ -740,8 +754,14 @@ public partial class MainWindow : Window
         }
     }
 
-    private void FoundVolumesList_SelectionChanged(object sender, SelectionChangedEventArgs e) =>
+    private void FoundVolumesList_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
         OpenFoundVolumeButton.IsEnabled = FoundVolumesList.SelectedItem is FoundVolumeRow { Volume.Partial: false };
+        OpenFoundFileSystemButton.IsEnabled = FoundVolumesList.SelectedItem is FoundVolumeRow
+        {
+            Volume: { Partial: false, FileSystem: FoundFileSystem.Ntfs },
+        };
+    }
 
     private void FoundVolumesList_MouseDoubleClick(object sender, MouseButtonEventArgs e) => OpenFoundVolume_Click(sender, e);
 
@@ -1420,8 +1440,9 @@ public partial class MainWindow : Window
             $"MemRescue {typeof(MainWindow).Assembly.GetName().Version}\n" +
             $"Motor {Engine.EngineVersion} (ABI {Engine.AbiVersion})\n\n" +
             "Herramienta de recuperación de datos y edición de disco.\n" +
-            "Versión de desarrollo (hito M2 en curso): imágenes RAW, VHD, VHDX, VMDK monolithicSparse y divididas en solo lectura, " +
-            "rangos y particiones MBR/EBR como dispositivo, visor de sectores con estado de validez, hashes y comprobación de legibilidad.",
+            "Versión de desarrollo (hito M3 en curso): imágenes RAW, VHD, VHDX, VMDK monolithicSparse y divididas en solo lectura, " +
+            "rangos y particiones MBR/GPT como dispositivo, búsqueda de particiones perdidas, sistema de archivos NTFS (árbol de " +
+            "directorios, visor y copia de ficheros), visor de sectores con estado de validez, hashes y comprobación de legibilidad.",
             "Acerca de MemRescue", MessageBoxButton.OK, MessageBoxImage.Information);
 
     private void Exit_Click(object sender, RoutedEventArgs e) => Close();
