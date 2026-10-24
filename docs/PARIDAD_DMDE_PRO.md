@@ -95,8 +95,8 @@ Referencias abreviadas a documentos de investigación: `F1-05` = `investigacion/
 | SC-01 | Full Scan multi-FS | Escaneo del dispositivo/rango | Tools → Full Scan | MAN, F1-04 | M B | `mr-scan` | No iniciado | Imágenes con particiones borradas | - |
 | SC-02 | Escaneo "a saltos" (grueso→fino) | Resultados grandes primero | Full Scan | MAN, F1-05 §5.4 | M D (NTFS) | `mr-scan` | No iniciado | Medir tiempo a primer resultado | - |
 | SC-03 | Pausa/reanudación y logs | Guardar/cargar/autoguardado | Full Scan | MAN, F1-09 | M B | SQLite (ADR-008) | No iniciado | Interrumpir y reanudar | Formato propio |
-| SC-04 | Candidatos/versiones de volumen con calidad | %, Check, Min. Size, indicadores | Full Scan | MAN | M B | `mr-scan` | No iniciado | Imágenes con volúmenes redimensionados | Métrica exacta de DMDE ? (INV-03) |
-| SC-05 | Escáner NTFS (FILE/INDX, agrupación) | Fragmentos MFT/INDX | Full Scan | F1-05 §5.4 | D | `mr-fs-ntfs::scan` | No iniciado | MFT parcialmente sobrescrita | Puntuación ? (INV-03) |
+| SC-04 | Candidatos/versiones de volumen con calidad | %, Check, Min. Size, indicadores | Full Scan | MAN | M B | `mr-scan` | No iniciado | Imágenes con volúmenes redimensionados | Métrica de DMDE desconocida; métrica propia en INV-03 §8.8 |
+| SC-05 | Escáner NTFS (FILE/INDX, agrupación) | Fragmentos MFT/INDX | Full Scan | F1-05 §5.4 | D | `mr-fs-ntfs::scan` | No iniciado | MFT parcialmente sobrescrita | Diseño propio en INV-03 §8.5 y §8.7 |
 | SC-06 | Escáneres FAT/exFAT/Ext/HFS/ReFS/APFS/Btrfs | Fragmentos por FS | Full Scan | MAN, F1-07 | M B | `mr-fs-*::scan` | No iniciado | Imágenes dañadas por FS | INV-04 |
 | SC-07 | Reconstrucción FS virtual: modos rápido/defecto/completo/personalizado | Árbol reconstruido | All Found/Virtual FS | MAN | M B | `mr-vfs` | No iniciado | Comparar árboles esperados | - |
 | SC-08 | Más/Menos resultados | Ajuste de extras | Reconstrucción | MAN | M B | `mr-vfs` | No iniciado | Monotonía (más ⊇ menos) | - |
