@@ -1,4 +1,5 @@
-//! Pruebas cruzadas del lector VMDK contra `qemu-img` como referencia independiente.
+//! Pruebas cruzadas del lector VMDK (monolithicSparse y streamOptimized) contra `qemu-img` como
+//! referencia independiente.
 //!
 //! `qemu-img` se toma de `MR_QEMU_IMG` o de `.tools\qemu\bin\qemu-img.exe` del repositorio
 //! principal. Solo se usan `create`, `convert`, `info` y `map` sobre ficheros temporales sintéticos.
@@ -131,10 +132,20 @@ fn read_all(img: &VmdkImage) -> Vec<u8> {
 }
 
 fn check_sparse_against_qemu(dir: &Path, name: &str, raw: &[u8], extra_opts: &str) {
+    let vmdk = convert_raw(
+        dir,
+        name,
+        raw,
+        &format!("subformat=monolithicSparse{extra_opts}"),
+    );
+    check_vmdk_against_qemu(&vmdk, name, raw, "monolithicSparse");
+}
+
+/// Escribe `raw` y lo convierte con qemu-img a VMDK con las opciones `opts`.
+fn convert_raw(dir: &Path, name: &str, raw: &[u8], opts: &str) -> PathBuf {
     let raw_path = dir.join(format!("{name}.raw"));
     std::fs::write(&raw_path, raw).unwrap();
     let vmdk = dir.join(format!("{name}.vmdk"));
-    let opts = format!("subformat=monolithicSparse{extra_opts}");
     qemu(&[
         "convert",
         "-f",
@@ -142,11 +153,25 @@ fn check_sparse_against_qemu(dir: &Path, name: &str, raw: &[u8], extra_opts: &st
         "-O",
         "vmdk",
         "-o",
-        &opts,
+        opts,
         s(&raw_path),
         s(&vmdk),
     ]);
-    let reference = dir.join(format!("{name}.ref.raw"));
+    vmdk
+}
+
+/// RAW de referencia de un VMDK según qemu-img.
+fn qemu_to_raw(vmdk: &Path) -> Vec<u8> {
+    let reference = vmdk.with_extension("ref.raw");
+    qemu(&["convert", "-f", "vmdk", "-O", "raw", s(vmdk), s(&reference)]);
+    std::fs::read(&reference).unwrap()
+}
+
+/// Lectura completa (SHA-256), rangos aleatorios, `allocation` frente a `qemu-img map` e
+/// inmutabilidad del fichero; `raw` es el contenido original y `kind`, la variante esperada.
+fn check_vmdk_against_qemu(vmdk: &Path, name: &str, raw: &[u8], kind: &str) {
+    let vmdk = vmdk.to_path_buf();
+    let reference = vmdk.with_extension("ref.raw");
     qemu(&[
         "convert",
         "-f",
@@ -162,7 +187,7 @@ fn check_sparse_against_qemu(dir: &Path, name: &str, raw: &[u8], extra_opts: &st
 
     let img = VmdkImage::open(File::open(&vmdk).unwrap()).unwrap();
     eprintln!("{name}: {} ({} bytes)", img.describe(), img.size());
-    assert!(img.describe().contains("monolithicSparse"));
+    assert!(img.describe().contains(kind), "{}", img.describe());
     assert_eq!(img.sector_size(), 512);
     // Tamaño virtual.
     assert_eq!(img.size(), qemu_virtual_size(&vmdk));
@@ -250,33 +275,308 @@ fn monolithic_sparse_matches_qemu() {
     );
 }
 
+/// RAW pseudoaleatorio (incompresible: cada grano comprimido mide más que el grano) salvo un hueco
+/// de 256 KiB a cero a partir de 1 MiB.
+fn random_raw(len: usize, seed: u64) -> Vec<u8> {
+    let mut rng = Rng(seed);
+    let mut v: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
+    v[MIB..MIB + 256 * 1024].fill(0);
+    v
+}
+
+fn convert_stream(dir: &Path, name: &str, raw: &[u8]) -> PathBuf {
+    convert_raw(dir, name, raw, "subformat=streamOptimized")
+}
+
 #[test]
 #[ignore = "requiere qemu-img; lo ejecuta scripts/test.ps1"]
-fn stream_optimized_is_rejected_as_unsupported() {
+fn stream_optimized_matches_qemu() {
     let dir = tempfile::tempdir().unwrap();
-    let raw = dir.path().join("so.raw");
-    std::fs::write(&raw, make_raw(4 * MIB, 5)).unwrap();
-    let vmdk = dir.path().join("so.vmdk");
-    qemu(&[
-        "convert",
-        "-f",
-        "raw",
-        "-O",
-        "vmdk",
-        "-o",
-        "subformat=streamOptimized",
-        s(&raw),
-        s(&vmdk),
-    ]);
-    let before = sha256_file(&vmdk);
-    match VmdkImage::open(File::open(&vmdk).unwrap()) {
-        Err(IoError::UnsupportedFeature { format, detail }) => {
-            assert_eq!(format, "VMDK");
-            assert!(detail.contains("streamOptimized"), "{detail}");
-        }
-        other => panic!("se esperaba UnsupportedFeature: {other:?}"),
+    for (name, raw) in [
+        ("so16", make_raw(16 * MIB, 11)),
+        // Tamaño no múltiplo del grano: el último grano se comprime solo hasta el final del disco.
+        ("so-impar", make_raw(5 * MIB + 37 * 512, 12)),
+        // Ni siquiera múltiplo del sector (qemu-img lo redondea al sector).
+        ("so-suelto", make_raw(3_000_000, 13)),
+        // Incompresible, con un hueco.
+        ("so-azar", random_raw(4 * MIB + 512, 14)),
+    ] {
+        let vmdk = convert_stream(dir.path(), name, &raw);
+        check_vmdk_against_qemu(&vmdk, name, &raw, "streamOptimized");
+        assert!(!VmdkImage::open(File::open(&vmdk).unwrap())
+            .unwrap()
+            .describe()
+            .contains("pie"));
     }
-    assert_eq!(sha256_file(&vmdk), before);
+}
+
+/// Campos de la cabecera (sector 0) de un VMDK.
+fn header_u64(b: &[u8], at: usize) -> u64 {
+    u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
+}
+
+fn le32(b: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
+}
+
+/// Granos de un streamOptimized de qemu: (grano, byte del marcador, bytes comprimidos), en orden
+/// de fichero. qemu-img deja el GD y las GT al principio (`gdOffset` en la cabecera).
+fn stream_grains(b: &[u8]) -> Vec<(u64, usize, usize)> {
+    let capacity = header_u64(b, 12);
+    let grain = header_u64(b, 20);
+    let gd = header_u64(b, 56) as usize * 512;
+    assert_ne!(
+        header_u64(b, 56),
+        u64::MAX,
+        "qemu-img deja el GD en la cabecera"
+    );
+    let grains = capacity.div_ceil(grain);
+    let mut out = Vec::new();
+    for i in 0..grains.div_ceil(512) {
+        let gt = le32(b, gd + 4 * i as usize) as usize * 512;
+        if gt == 0 {
+            continue;
+        }
+        for j in 0..512u64 {
+            let g = i * 512 + j;
+            if g >= grains {
+                break;
+            }
+            let sector = le32(b, gt + 4 * j as usize) as usize;
+            if sector != 0 {
+                let at = sector * 512;
+                assert_eq!(
+                    header_u64(b, at),
+                    g * grain,
+                    "LBA del marcador del grano {g}"
+                );
+                out.push((g, at, le32(b, at + 8) as usize));
+            }
+        }
+    }
+    out.sort_by_key(|x| x.1);
+    out
+}
+
+/// Reescribe un streamOptimized de qemu-img con la disposición de VMware: granos, marcador + GT,
+/// marcador + GD, marcador + pie con el `gdOffset` real, fin de flujo; la cabecera lleva
+/// `gdOffset` = GD_AT_END y sin GD redundante.
+fn restream_vmware_layout(b: &[u8]) -> Vec<u8> {
+    let capacity = header_u64(b, 12);
+    let grain = header_u64(b, 20);
+    let desc_sectors = header_u64(b, 36) as usize;
+    let grains = capacity.div_ceil(grain);
+    let gd_entries = grains.div_ceil(512) as usize;
+    let mut f = b[..(1 + desc_sectors) * 512].to_vec();
+    let mut gt = vec![0u32; gd_entries * 512];
+    for (g, at, size) in stream_grains(b) {
+        gt[g as usize] = (f.len() / 512) as u32;
+        f.extend_from_slice(&b[at..at + 12 + size]);
+        f.resize(f.len().div_ceil(512) * 512, 0);
+    }
+    let marker = |f: &mut Vec<u8>, sectors: u64, kind: u32| {
+        let mut m = [0u8; 512];
+        m[..8].copy_from_slice(&sectors.to_le_bytes());
+        m[12..16].copy_from_slice(&kind.to_le_bytes());
+        f.extend_from_slice(&m);
+    };
+    let mut gd = Vec::new();
+    for i in 0..gd_entries {
+        marker(&mut f, 4, 1);
+        gd.push((f.len() / 512) as u32);
+        for v in &gt[i * 512..(i + 1) * 512] {
+            f.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    marker(&mut f, (gd_entries * 4).div_ceil(512) as u64, 2);
+    let gd_sector = (f.len() / 512) as u64;
+    for v in &gd {
+        f.extend_from_slice(&v.to_le_bytes());
+    }
+    f.resize(f.len().div_ceil(512) * 512, 0);
+    let mut header = b[..512].to_vec();
+    let flags = le32(&header, 8) & !(1 << 1); // sin GD redundante
+    header[8..12].copy_from_slice(&flags.to_le_bytes());
+    header[48..56].copy_from_slice(&0u64.to_le_bytes());
+    header[64..72].copy_from_slice(&(1 + desc_sectors as u64).to_le_bytes());
+    let mut footer = header.clone();
+    header[56..64].copy_from_slice(&u64::MAX.to_le_bytes());
+    footer[56..64].copy_from_slice(&gd_sector.to_le_bytes());
+    f[..512].copy_from_slice(&header);
+    marker(&mut f, 1, 3);
+    f.extend_from_slice(&footer);
+    f.extend_from_slice(&[0u8; 512]);
+    f
+}
+
+#[test]
+#[ignore = "requiere qemu-img; lo ejecuta scripts/test.ps1"]
+fn stream_optimized_with_grain_directory_in_footer_matches_qemu() {
+    let dir = tempfile::tempdir().unwrap();
+    for (name, raw) in [
+        ("pie16", make_raw(16 * MIB, 21)),
+        ("pie-impar", make_raw(5 * MIB + 37 * 512, 22)),
+    ] {
+        let qemu_stream = convert_stream(dir.path(), name, &raw);
+        let bytes = restream_vmware_layout(&std::fs::read(&qemu_stream).unwrap());
+        let vmdk = dir.path().join(format!("{name}-vmware.vmdk"));
+        std::fs::write(&vmdk, &bytes).unwrap();
+        // qemu-img también lee el pie: su conversión a RAW es la referencia y debe ser el original.
+        let reference = qemu_to_raw(&vmdk);
+        assert_eq!(
+            &reference[..raw.len()],
+            &raw[..],
+            "{name}: qemu-img y el original"
+        );
+        check_vmdk_against_qemu(&vmdk, name, &raw, "streamOptimized");
+        let img = VmdkImage::open(File::open(&vmdk).unwrap()).unwrap();
+        assert!(img.describe().contains("directorio de granos en el pie"));
+    }
+}
+
+/// Lectura del grano `g` (o de su parte dentro del disco).
+fn read_grain(img: &VmdkImage, g: u64, grain_bytes: u64) -> mr_io::Result<Vec<u8>> {
+    let start = g * grain_bytes;
+    let mut buf = vec![0u8; grain_bytes.min(img.size() - start) as usize];
+    img.read_at(start, &mut buf).map(|()| buf)
+}
+
+#[test]
+#[ignore = "requiere qemu-img; lo ejecuta scripts/test.ps1"]
+fn stream_optimized_with_damaged_compressed_grains_never_returns_wrong_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let raw = make_raw(8 * MIB, 31);
+    let vmdk = convert_stream(dir.path(), "dañado", &raw);
+    let reference = qemu_to_raw(&vmdk);
+    let original = std::fs::read(&vmdk).unwrap();
+    let grain_bytes = header_u64(&original, 20) * 512;
+    let grains = stream_grains(&original);
+    assert!(grains.len() > 20);
+    let mut rng = Rng(0xDA5A_0001);
+    let (mut failed, mut intact) = (0u32, 0u32);
+    for it in 0..120 {
+        // 1 a 3 bytes alterados dentro de los datos comprimidos de 1 a 3 granos.
+        let mut bytes = original.clone();
+        let mut touched = Vec::new();
+        for _ in 0..1 + rng.below(3) {
+            let (g, at, size) = grains[rng.below(grains.len() as u64) as usize];
+            for _ in 0..1 + rng.below(3) {
+                let p = at + 12 + rng.below(size as u64) as usize;
+                bytes[p] ^= 1 + rng.below(255) as u8;
+            }
+            touched.push(g);
+        }
+        let path = dir.path().join(format!("dañado-{it}.vmdk"));
+        std::fs::write(&path, &bytes).unwrap();
+        let sha = sha256_file(&path);
+        for tolerant in [false, true] {
+            // Los marcadores siguen intactos: se abre en ambos modos sin descartes.
+            let img = VmdkImage::open_with(File::open(&path).unwrap(), tolerant).unwrap();
+            assert_eq!(img.discarded_blocks(), 0);
+            for &(g, _, _) in &grains {
+                let want = &reference[(g * grain_bytes) as usize..];
+                match read_grain(&img, g, grain_bytes) {
+                    Ok(got) => {
+                        assert!(
+                            got[..] == want[..got.len()],
+                            "iteración {it}: el grano {g} se leyó con datos distintos de los originales"
+                        );
+                        if touched.contains(&g) {
+                            intact += 1;
+                        }
+                    }
+                    Err(IoError::Read { .. }) => {
+                        assert!(
+                            touched.contains(&g),
+                            "iteración {it}: grano {g} sano ilegible"
+                        );
+                        failed += 1;
+                    }
+                    Err(e) => panic!("iteración {it}: error inesperado {e:?}"),
+                }
+            }
+        }
+        assert_eq!(sha256_file(&path), sha, "el VMDK se modificó al leerlo");
+        std::fs::remove_file(&path).unwrap();
+    }
+    eprintln!("granos alterados: {failed} ilegibles, {intact} leídos (idénticos al original)");
+    assert!(failed > 0);
+    // Comparación sector a sector con el lector tolerante en un caso concreto: el grano 0 dañado.
+    let mut bytes = original.clone();
+    let (_, at0, size0) = *grains.iter().find(|x| x.0 == 0).unwrap();
+    bytes[at0 + 12 + size0 / 2] ^= 0x40;
+    let path = dir.path().join("dañado-0.vmdk");
+    std::fs::write(&path, &bytes).unwrap();
+    let img = VmdkImage::open_with(File::open(&path).unwrap(), true).unwrap();
+    assert_tolerant_matches(&img, &reference, (0, grain_bytes / 512));
+}
+
+#[test]
+#[ignore = "requiere qemu-img; lo ejecuta scripts/test.ps1"]
+fn stream_optimized_with_bad_marker_or_truncated_in_tolerant_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut raw = make_raw(8 * MIB, 41);
+    // Los tres primeros granos (64 KiB) con datos.
+    for (i, b) in raw[..3 * 64 * 1024].iter_mut().enumerate() {
+        *b = (i % 249) as u8 | 1;
+    }
+    let vmdk = convert_stream(dir.path(), "marcador", &raw);
+    let reference = qemu_to_raw(&vmdk);
+    let original = std::fs::read(&vmdk).unwrap();
+    let grain_sectors = header_u64(&original, 20);
+    let grains = stream_grains(&original);
+
+    // LBA del marcador del grano 1 alterado: estricto rechaza; tolerante descarta solo ese grano.
+    let (_, at1, _) = *grains.iter().find(|x| x.0 == 1).unwrap();
+    let mut bytes = original.clone();
+    bytes[at1..at1 + 8].copy_from_slice(&(5 * grain_sectors).to_le_bytes());
+    let path = dir.path().join("lba.vmdk");
+    std::fs::write(&path, &bytes).unwrap();
+    let sha = sha256_file(&path);
+    assert!(matches!(
+        VmdkImage::open(File::open(&path).unwrap()),
+        Err(IoError::Corrupt { .. })
+    ));
+    let img = VmdkImage::open_with(File::open(&path).unwrap(), true).unwrap();
+    assert_eq!(img.discarded_blocks(), 1);
+    assert!(img
+        .describe()
+        .contains("modo tolerante: 1 grano descartado"));
+    assert_tolerant_matches(&img, &reference, (grain_sectors, grain_sectors));
+    drop(img);
+    assert_eq!(sha256_file(&path), sha);
+
+    // Truncado a mitad del último grano: estricto rechaza; tolerante lee el resto idéntico.
+    let &(g_last, at_last, size_last) = grains.last().unwrap();
+    let cut = at_last + 12 + size_last / 2;
+    let path = dir.path().join("truncado.vmdk");
+    std::fs::write(&path, &original[..cut]).unwrap();
+    let sha = sha256_file(&path);
+    assert!(matches!(
+        VmdkImage::open(File::open(&path).unwrap()),
+        Err(IoError::Corrupt { .. })
+    ));
+    let img = VmdkImage::open_with(File::open(&path).unwrap(), true).unwrap();
+    assert_eq!(img.discarded_blocks(), 1);
+    let span = (
+        g_last * grain_sectors,
+        grain_sectors.min(img.sector_count() - g_last * grain_sectors),
+    );
+    assert_tolerant_matches(&img, &reference, span);
+    drop(img);
+    assert_eq!(sha256_file(&path), sha);
+
+    // Cortado justo tras los datos del último grano (lo que haya detrás no hace falta para leer):
+    // se abre en ambos modos sin descartes y se lee entero.
+    let path = dir.path().join("sin-fin.vmdk");
+    let end = at_last + 12 + size_last;
+    assert!(end <= original.len());
+    std::fs::write(&path, &original[..end]).unwrap();
+    for tolerant in [false, true] {
+        let img = VmdkImage::open_with(File::open(&path).unwrap(), tolerant).unwrap();
+        assert_eq!(img.discarded_blocks(), 0);
+        assert!(read_all(&img) == reference);
+    }
 }
 
 #[test]

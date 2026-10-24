@@ -227,6 +227,31 @@ validan contra el tamaño real del fichero con aritmética comprobada y memoria 
 la estructura incoherente da `Corrupt`, nunca un pánico ni datos inventados. Si se pide un tamaño de sector
 distinto del nativo, se presentan los mismos bytes con otra división (`Reblocked`).
 
+**Addendum (incidencia 9): VMDK streamOptimized y dependencia `miniz_oxide`.** Se declara soportada la
+variante streamOptimized (granos deflate en formato zlib con marcadores; GD en la cabecera, como la escribe
+qemu-img, o en el pie, como la escribe VMware) tras compararla con qemu-img (SHA-256, rangos aleatorios y
+`qemu-img map`, también con el corpus). Decisiones:
+
+- **Validación al abrir sin descomprimir**: se lee el marcador de cada grano (LBA igual a su posición en
+  la GT, tamaño comprimido entre 1 y 2 × grano, dentro del fichero) y su zona (marcador + datos) entra en
+  la detección de solapes de ADR-020; el pie es estructura crítica. Descomprimir todo al abrir exigiría
+  leer el fichero entero, así que la apertura estricta **no** garantiza que todos los granos se
+  descompriman: un grano cuyo flujo zlib no es válido, cuyo Adler-32 no cuadra o que no mide un grano (o
+  la cola del disco) da `IoError::Read` al leerlo, en ambos modos, y el lector tolerante lo marca
+  `Unreadable`. Nunca se entregan datos de un grano que falla. Una alteración que infle al tamaño
+  correcto con el mismo Adler-32 no se puede detectar (VMDK no guarda otra suma).
+- **Memoria**: los tamaños comprimidos se cargan como una tabla más (presupuesto del addendum de
+  ADR-020); por lectura, como mucho 2 × grano + grano; caché LRU de 4 MiB; granos de streamOptimized
+  limitados a 16 MiB (`UnsupportedFeature` si no).
+- **Dependencia**: `miniz_oxide` **=0.8.9** (con `adler2` 2.0.1), fijada en `[workspace.dependencies]`
+  con solo la función `with-alloc`. Motivos: Rust puro con `#![forbid(unsafe_code)]` (la regla de
+  `unsafe` solo en `mr-ffi` se mantiene también en las dependencias de lectura), sin código C ni
+  compilación nativa, comprueba el Adler-32 y permite acotar la salida
+  (`decompress_to_vec_zlib_with_limit`), ampliamente usada (motor por defecto de `flate2`), licencias
+  MIT / Zlib / Apache-2.0 (`adler2`: 0BSD / MIT / Apache-2.0). Alternativas descartadas: `flate2` (capa
+  más sobre el mismo motor), `zlib`/`libz-sys` (C), inflado propio (riesgo sin beneficio). Cambiar de
+  versión exige revisar el diff del crate y repetir las pruebas contra qemu-img.
+
 ---
 
 ## ADR-018 · Referencias externas: nunca se siguen automáticamente (Aceptada, 2026-10-17)

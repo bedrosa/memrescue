@@ -85,7 +85,8 @@ Milestone propio para no retrasar particiones y sistemas de archivos. Exigen abr
 confirmación explícita del usuario o descomprimir; hoy se rechazan con errores tipados
 (`ExternalReference`, `UnsupportedFeature`).
 - VHD/VHDX diferenciales con selección explícita del padre (#8).
-- VMDK streamOptimized (#9).
+- ✔ VMDK streamOptimized (#9): granos comprimidos con marcadores, GD en la cabecera o en el pie,
+  descompresión acotada y granos dañados como ilegibles (`formatos/vmdk.md`, ADR-017, addendum).
 - ✔ Reproducción en memoria del registro pendiente de VHDX (#10): validación de entradas y descriptores,
   secuencia activa, superposición sin escribir el fichero, contrastada con qemu-img (`formatos/vhdx.md`).
 - VMDK multiextensión y flat con confirmación explícita (#11).

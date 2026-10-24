@@ -1,6 +1,7 @@
 //! Extremo a extremo: las imágenes del corpus sintético convertidas por `qemu-img` a VHD, VHDX y
-//! VMDK se abren con la **detección automática** de `mr_api` y deben dar exactamente los mismos
-//! bytes que el RAW original (hash completo, MBR protector y cabeceras GPT en su LBA).
+//! VMDK (monolithicSparse y streamOptimized) se abren con la **detección automática** de `mr_api`
+//! y deben dar exactamente los mismos bytes que el RAW original (hash completo, MBR protector y
+//! cabeceras GPT en su LBA).
 //!
 //! Requiere qemu-img (`MR_QEMU_IMG` o `.tools/qemu/bin/qemu-img.exe`) y el corpus generado en
 //! `tests/corpus/generated` (`MR_CORPUS_DIR` para otra ubicación). Lo ejecuta `scripts/test.ps1`.
@@ -72,7 +73,7 @@ fn file_sha256(p: &Path) -> String {
     sha256_of(src.as_ref())
 }
 
-const VARIANTS: [(&str, &str, &str, ImageFormat); 5] = [
+const VARIANTS: [(&str, &str, &str, ImageFormat); 6] = [
     (
         "vpc",
         "subformat=fixed,force_size=on",
@@ -95,6 +96,12 @@ const VARIANTS: [(&str, &str, &str, ImageFormat); 5] = [
     (
         "vmdk",
         "subformat=monolithicSparse",
+        "vmdk",
+        ImageFormat::Vmdk,
+    ),
+    (
+        "vmdk",
+        "subformat=streamOptimized",
         "vmdk",
         ImageFormat::Vmdk,
     ),

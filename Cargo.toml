@@ -36,6 +36,9 @@ md-5 = "0.10"
 hex = "0.4"
 rusqlite = { version = "0.37", features = ["bundled"] }
 tempfile = "3"
+# Inflado zlib/deflate de los granos de VMDK streamOptimized: Rust puro sin `unsafe`, versión fijada
+# (ADR-017, addendum de la incidencia 9).
+miniz_oxide = { version = "=0.8.9", default-features = false, features = ["with-alloc"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

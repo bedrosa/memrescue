@@ -25,6 +25,7 @@ pub mod vhd;
 pub mod vhdx;
 mod vhdx_log;
 pub mod vmdk;
+mod vmdk_stream;
 
 pub use open::{open_image, open_split, OpenOptions, OpenedImage, Reblocked};
 

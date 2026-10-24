@@ -55,7 +55,7 @@ impl ImageFormat {
     }
 
     /// `true` si MemRescue tiene lector para este formato en la versión actual (la variante concreta
-    /// aún puede rechazarse al abrir: p. ej. VMDK streamOptimized o discos diferenciales).
+    /// aún puede rechazarse al abrir: p. ej. VMDK COWD o discos diferenciales).
     pub fn is_supported(self) -> bool {
         matches!(
             self,

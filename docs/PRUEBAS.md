@@ -266,6 +266,23 @@ SHA-256; `qemu-img info` del original debe negarse a abrirlo por tener un regist
 registros escritos por qemu vueltos a dejar pendientes (también con sus destinos puestos a ceros) y
 registros sintéticos con vuelta al principio y entrada a medias. El original no cambia.
 
+VMDK streamOptimized (issue #9, `formatos/vmdk.md`): 12 pruebas unitarias en
+`core/mr-image/src/vmdk_stream.rs` (marcadores, pie, límites del marcador de grano, descompresión con
+Adler-32 y tamaño exacto, caché LRU acotada, GD en el pie y en la cabecera, variantes no soportadas,
+pie y descriptor críticos, marcadores inválidos en ambos modos, datos comprimidos dañados ilegibles y
+nunca entregados como datos, fichero acortado tras abrir). Contra qemu-img (`vmdk_qemu.rs`, 4 nuevas
+ignoradas por defecto; sustituyen a la de rechazo): 4 imágenes streamOptimized de qemu-img (incluidas
+una no múltiplo del grano, otra no múltiplo del sector y otra incompresible) con SHA-256 completo,
+300 rangos aleatorios y `allocation` = `qemu-img map`; las mismas reescritas con la disposición de
+VMware (GD en el pie), que qemu-img también lee; 120 iteraciones con bytes alterados en los datos
+comprimidos (cada grano legible es idéntico al original); marcador con LBA alterado, truncado a mitad
+del último grano y cortado tras él. El corpus GPT/MBR se convierte además a streamOptimized
+(`containers_qemu.rs`, 6 variantes). En `corruption.rs`, 4 pruebas nuevas sobre una imagen
+streamOptimized sintética: inversión aleatoria en estructuras (400 iteraciones), alteraciones solo en
+los granos comprimidos comparadas con el contenido original (300), truncado en cada frontera hasta el
+último grano y fichero acortado tras abrir. Lo que no se puede detectar (una alteración que siga
+inflando al tamaño correcto con el mismo Adler-32) está documentado en `formatos/vmdk.md`.
+
 Memoria acotada al abrir contenedores (issue #38, addendum de ADR-020): `core/mr-ffi/tests/table_memory.rs`
 (4 pruebas, no ignoradas) genera en un directorio temporal imágenes sintéticas con la tabla al límite de
 `MAX_TABLE_BYTES` y entradas duplicadas (VHD con BAT de 256 MiB y bloques de 512 B; VHDX con BAT de
