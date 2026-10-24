@@ -3,6 +3,7 @@
 //! Todas las operaciones son de solo lectura y solo aceptan ficheros de imagen.
 
 mod ntfs_files;
+mod partition_backup;
 
 use mr_api::mr_fs_ntfs::{
     BackupState, BootSource, NtfsVolume, RecordOutcome, RecordSource, RecordState,
@@ -32,8 +33,10 @@ USO:
   memrescue-cli probe <fichero>
   memrescue-cli image-info <imagen> [ORIGEN] [--json]
   memrescue-cli split-list <imagen.001>
-  memrescue-cli partitions <imagen> [ORIGEN] [--json]
+  memrescue-cli partitions <imagen> [ORIGEN] [--json] [--save-backup F [--overwrite]]
   memrescue-cli find-partitions <imagen> [ORIGEN] [--json] [--max-reads N]
+                                [--save-backup F [--overwrite]]
+  memrescue-cli partition-backup-check <copia> <imagen> [ORIGEN] [--json]
   memrescue-cli ntfs-info <imagen> [ORIGEN] [--json]
   memrescue-cli ntfs-stat <imagen> --record N [ORIGEN] [--json]
   memrescue-cli ntfs-cat <imagen> --record N [--stream NOMBRE] [-o SALIDA [--overwrite]] [ORIGEN]
@@ -92,6 +95,18 @@ BÚSQUEDA DE PARTICIONES PERDIDAS (find-partitions):
   U inicio declarado coherente, A alineación; + sí, x no o dañada, ? no verificable (sector
   ilegible: nunca se interpreta su relleno), o fuera de la imagen, - no aplica.
 
+COPIA DEL PARTICIONADO (--save-backup, partition-backup-check):
+  --save-backup F    guardar en F una copia del particionado en formato propio y versionado
+                     (docs/formatos/copia-particionado.md): tabla interpretada completa y bytes
+                     de los sectores de tabla (LBA 0, EBR, cabeceras y entradas GPT de las dos
+                     copias) con su SHA-256; con find-partitions incluye los volúmenes
+                     encontrados. Misma política de salida que ntfs-cat -o (nunca el origen,
+                     escritura atómica, --overwrite para sustituir F).
+  partition-backup-check valida la copia (versión, campos, límites y sumas SHA-256) y la compara
+                     con la imagen: regiones de tabla cambiadas, particiones y anomalías nuevas o
+                     desaparecidas. Solo lee: restaurar en disco no está disponible (M12).
+                     Código de salida 4 si hay diferencias.
+
 VOLUMEN NTFS (ntfs-info):
   Abre el volumen NTFS que empieza en el origen (imagen sin tabla, --partition N o --found N):
   arranque usado (principal o copia del último sector) y estado de la copia, campos del arranque,
@@ -123,7 +138,8 @@ con #22):
 Formatos: RAW, VHD (fijo/dinámico), VHDX (fijo/dinámico), VMDK monolithicSparse e imágenes
 divididas. Tamaños de sector habituales: 512, 1024, 2048, 4096.
 Códigos de salida: 0 correcto, 1 error de operación, 2 uso incorrecto,
-3 hay sectores no fiables (ilegibles o saltados; su contenido es un patrón de relleno).
+3 hay sectores no fiables (ilegibles o saltados; su contenido es un patrón de relleno),
+4 el origen no coincide con la copia del particionado (partition-backup-check).
 ";
 
 struct Args {
@@ -161,8 +177,10 @@ struct Args {
     stream: Option<String>,
     /// Fichero de salida (`ntfs-cat`).
     output: Option<PathBuf>,
-    /// Sustituir la salida si existe (`ntfs-cat -o`).
+    /// Sustituir la salida si existe (`ntfs-cat -o`, `--save-backup`).
     overwrite: bool,
+    /// Copia del particionado (`partitions`, `find-partitions`).
+    save_backup: Option<PathBuf>,
 }
 
 /// Analiza `--skip-codes`: códigos positivos separados por comas (decimal o `0x…`), sin
@@ -231,6 +249,7 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
         stream: None,
         output: None,
         overwrite: false,
+        save_backup: None,
     };
     while let Some(s) = it.next() {
         match s.as_str() {
@@ -306,6 +325,9 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
                 a.stream = Some(it.next().ok_or("falta el valor de --stream")?);
             }
             "--overwrite" => a.overwrite = true,
+            "--save-backup" => {
+                a.save_backup = Some(it.next().ok_or("falta el valor de --save-backup")?.into());
+            }
             "-o" | "--output" => {
                 a.output = Some(it.next().ok_or("falta el valor de -o")?.into());
             }
@@ -720,8 +742,15 @@ fn run(args: Vec<String>) -> Result<(), (u8, String)> {
     if cmd != "ntfs-cat" && (a.stream.is_some() || a.output.is_some()) {
         return Err(usage("--stream y -o solo se aplican a ntfs-cat"));
     }
-    if a.overwrite && a.output.is_none() {
-        return Err(usage("--overwrite solo se aplica a ntfs-cat con -o"));
+    if a.save_backup.is_some() && cmd != "partitions" && cmd != "find-partitions" {
+        return Err(usage(
+            "--save-backup solo se aplica a partitions y find-partitions",
+        ));
+    }
+    if a.overwrite && a.output.is_none() && a.save_backup.is_none() {
+        return Err(usage(
+            "--overwrite solo se aplica a ntfs-cat con -o y a --save-backup",
+        ));
     }
     if cmd == "ntfs-cat" && a.json {
         return Err(usage(
@@ -930,6 +959,9 @@ fn run(args: Vec<String>) -> Result<(), (u8, String)> {
             let src = open_src(&a, &p).map_err(|e| op(&e))?;
             let t = mr_api::partitions(src.as_ref()).map_err(|e| op(&e))?;
             print_partitions(&t, a.json);
+            if let Some(out) = &a.save_backup {
+                partition_backup::save(&src, None, out, a.overwrite)?;
+            }
             let unreadable = t
                 .all_anomalies()
                 .filter(|x| matches!(x, Anomaly::UnreadableSector { .. }))
@@ -944,8 +976,8 @@ fn run(args: Vec<String>) -> Result<(), (u8, String)> {
         "find-partitions" => {
             let p = one(&a)?;
             let src = open_src(&a, &p).map_err(|e| op(&e))?;
-            let task =
-                mr_api::start_partition_search_task(src, search_options(&a)).map_err(|e| op(&e))?;
+            let task = mr_api::start_partition_search_task(src.clone(), search_options(&a))
+                .map_err(|e| op(&e))?;
             while task.state() == TaskState::Running {
                 let (d, t) = task.progress();
                 if !a.json && t > 0 {
@@ -958,6 +990,9 @@ fn run(args: Vec<String>) -> Result<(), (u8, String)> {
             }
             let found = task.wait().map_err(|e| op(&e))?;
             print_search(&found.result, a.json);
+            if let Some(out) = &a.save_backup {
+                partition_backup::save(&src, Some(&found.result), out, a.overwrite)?;
+            }
             let bad = found.result.stats.unverifiable_sectors;
             if bad > 0 {
                 return Err((
@@ -965,6 +1000,13 @@ fn run(args: Vec<String>) -> Result<(), (u8, String)> {
                     format!("{bad} sectores ilegibles durante la búsqueda: no se interpretaron"),
                 ));
             }
+        }
+        "partition-backup-check" => {
+            let [backup, image] = a.positional.as_slice() else {
+                return Err(usage("partition-backup-check espera la copia y la imagen"));
+            };
+            let src = open_src(&a, image).map_err(|e| op(&e))?;
+            partition_backup::check(std::path::Path::new(backup), &src, a.json)?;
         }
         "ntfs-info" => {
             let p = one(&a)?;

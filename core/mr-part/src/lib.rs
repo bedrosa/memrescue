@@ -226,3 +226,9 @@ impl PartitionTable {
         self.gpt.as_ref().map_or(0, |g| g.shift)
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Añadido en #18: copia del particionado en formato propio (detalle en `backup`).
+// ---------------------------------------------------------------------------------------------
+
+pub mod backup;
