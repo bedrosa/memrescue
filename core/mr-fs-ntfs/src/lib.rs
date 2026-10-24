@@ -20,18 +20,23 @@
 //! - [`mft`]: disposición de la MFT, lectura de registros por número y enumeración.
 //! - [`volume`]: [`NtfsVolume::open`]: arranque principal o copia, `$MFT`, `$MFTMirr`, etiqueta;
 //!   [`NtfsVolume::file`] y [`NtfsVolume::open_stream`].
+//! - [`bitmap`], [`deleted`] y [`recover`] (#23): mapa de asignación de clústeres (`$Bitmap`),
+//!   ficheros borrados de la MFT con su recuperabilidad y recuperación con estado por tramo.
 //!
 //! Contrato común con `mr-part`: toda lectura pasa por `mr_part::sector::read_trusted` (un sector
 //! ilegible nunca se interpreta), aritmética comprobada, límites explícitos, ningún pánico con datos
 //! del origen y confianza (ADR-003, `mr_common::Confidence`) en lugar de aceptar o rechazar.
 
 pub mod attr;
+pub mod bitmap;
 pub mod boot;
+pub mod deleted;
 pub mod file;
 pub mod lznt1;
 pub mod mft;
 mod read;
 pub mod record;
+pub mod recover;
 pub mod runs;
 pub mod stream;
 pub mod values;
@@ -42,12 +47,18 @@ mod stream_tests;
 #[cfg(test)]
 mod testvol;
 
+pub use bitmap::{ClusterAlloc, ClusterBitmap};
 pub use boot::{parse_boot, BootError, BootSector};
+pub use deleted::{
+    scan_deleted, DeletedEntry, DeletedScan, ParentState, Recoverability, ScanObserver,
+    ScanOptions, StreamAssessment,
+};
 pub use file::{FileAnomaly, FileAttribute, NtfsFile, StreamError, StreamIssue, StreamLayout};
 pub use mft::{MftLayout, RecordOutcome, RecordState, Records};
 pub use mr_common::Confidence;
 pub use mr_part::Severity;
 pub use record::{FileRecord, FileReference, RecordDamage, RecordHeader};
+pub use recover::{recover_stream, RecoveryReport, SuspectRange};
 pub use stream::{CopyReport, DataStream, RangeState, StreamChunk, StreamRange};
 pub use volume::{
     BackupBoot, BackupState, BootProbe, BootSource, MirrorCheck, MirrorMismatch, NtfsAnomaly,

@@ -86,6 +86,7 @@ Referencias abreviadas a documentos de investigación: `F1-05` = `investigacion/
 | FS-13 | Btrfs (subvolúmenes) | Lectura | Base | MAN, changelog | M B | `mr-fs-btrfs` | No iniciado | mkfs.btrfs | INV-04 |
 | FS-14 | ISO9660 | Lectura | - | F1-07 (`CD001`) | B | `mr-fs-iso` | No iniciado | Imágenes ISO | No anunciado oficialmente |
 | FS-15 | Nombres nacionales / páginas de código | Transliteración, OEM | Base | MAN, F1-09 | M B | `mr-common` | No iniciado | Nombres no ASCII | - |
+| FS-16 | NTFS: ficheros borrados (MFT e INDX residuales) | Qué datos siguen disponibles y con qué fiabilidad | File panel (borrados) | MAN, F1-05 §5.3 | M | `mr-fs-ntfs::deleted`, `bitmap`, `recover` | **MFT hecho (#23, ADR-027)**: registros base no en uso con `$FILE_NAME` (extensiones por `$ATTRIBUTE_LIST` o por su referencia al base), padre vivo/borrado/huérfano y ruta por la cadena de padres, `$Bitmap` por páginas, índice acotado de dueños vivos, clasificación por clúster (libre, de un vivo, asignado, desconocido, compartido con otro borrado) y recuperabilidad `full`/`partial`/`none` conservadora; recuperación con el tramo `possibly_overwritten`; API `ntfs_deleted` (tarea cancelable), `ntfs_recover_record`/`ntfs_recover_stream`; CLI `ntfs-deleted`, `ntfs-recover` (código 3) | Hecho: los 16 borrados y sobrescritos del corpus (registro, secuencia, nombre, ruta, recuperabilidad, SHA-256 o `recovered_sha256`, clústeres sobrescritos y dueño del `reason`), ningún vivo como borrado, registros dañados nunca recuperados, `$Bitmap` y datos ilegibles con `FaultyDevice`, sintéticos y fuzzing. **Pendiente**: entradas INDX residuales (tras #22); volúmenes de Windows | Diferencia deliberada: un clúster libre reclamado por dos borrados no se da por íntegro en ninguno, y lo que `$Bitmap` no deja leer nunca se supone libre |
 
 ## 5. Escaneo y reconstrucción
 
@@ -123,7 +124,7 @@ Referencias abreviadas a documentos de investigación: `F1-05` = `investigacion/
 | ID | Funcionalidad | Descripción | Ref. DMDE | Evidencias | Verif. | Diseño MemRescue | Estado | Pruebas necesarias | Diferencias pendientes |
 |---|---|---|---|---|---|---|---|---|---|
 | RC-01 | Recuperar ficheros/directorios masivamente | Sin límite de nº | Recover (bulk) | MAN, F1-08, INV-01 | M B | `mr-recover` | No iniciado | Árbol de 100k ficheros | Diseño propio en INV-01 §7 (pendiente de decisiones del propietario, §10) |
-| RC-02 | Categorías (normal/borrado/encontrado/RAW…) | Selección | Recover | MAN, F1-04 | M B | `mr-recover` | No iniciado | Una prueba por categoría | - |
+| RC-02 | Categorías (normal/borrado/encontrado/RAW…) | Selección | Recover | MAN, F1-04 | M B | `mr-recover` | Base de los borrados NTFS hecha (#23, FS-16): lista de borrados de la MFT con recuperabilidad y recuperación de un fichero con estado por tramo; la selección por categoría es de M4 | Una prueba por categoría | - |
 | RC-03 | Filtros (máscaras, exclusión, tamaño, fecha, ID, solo dirs con ficheros) | - | Recover | MAN | M B | `mr-recover` | No iniciado | Tabla de casos | - |
 | RC-04 | Destino en otro disco físico | Protección | Recover | MAN | M B | `mr-recover` | No iniciado | Mismo disco → rechazo | - |
 | RC-05 | Conflictos de nombre (renombrar, auto, omitir, fusionar, umbral) | - | Recover | MAN | M B | `mr-recover` | No iniciado | Casos | - |

@@ -12,11 +12,17 @@
 //! | `unmapped` | sin extensión que lo describa (registro de extensión perdido, runs no válidos) | no: patrón |
 //! | `outside_source` | clústeres más allá del final del origen (volumen truncado) | no: patrón |
 //! | `corrupt` | unidad de compresión que no se puede descomprimir | no: patrón |
+//! | `possibly_overwritten` | leídos del disco, de clústeres que un fichero borrado ya no tiene en exclusiva (#23) | no: bytes tal como están |
 //!
 //! Los tramos no fiables se rellenan con el patrón ([`DEFAULT_FILL`], `BAD!`, alineado al
 //! desplazamiento del flujo) y nunca se presentan como datos. Una unidad de compresión con algún
 //! sector no fiable entre sus clústeres comprimidos se descomprime hasta el primer bloque afectado:
 //! lo anterior es `data` y el resto de la unidad `unreadable`.
+//!
+//! **Clústeres sospechosos** ([`DataStream::with_suspect_clusters`], recuperación de borrados,
+//! #23): los bytes leídos de esos clústeres se devuelven tal como están en el disco, pero con el
+//! estado `possibly_overwritten` en lugar de `data` (pueden ser de otro fichero). Una unidad de
+//! compresión con algún clúster sospechoso es entera `possibly_overwritten`.
 //!
 //! **Memoria acotada**: cada lectura pide como mucho [`MAX_STREAM_READ`] bytes; el disco se lee
 //! por tramos de [`DISK_PIECE`] y una unidad de compresión ocupa como mucho 64 KiB.
@@ -51,10 +57,12 @@ pub enum RangeState {
     Unmapped,
     OutsideSource,
     Corrupt,
+    /// Leído del disco, pero de un clúster que puede pertenecer ya a otro fichero (#23).
+    PossiblyOverwritten,
 }
 
 impl RangeState {
-    pub const ALL: [RangeState; 7] = [
+    pub const ALL: [RangeState; 8] = [
         RangeState::Data,
         RangeState::Sparse,
         RangeState::Uninitialized,
@@ -62,6 +70,7 @@ impl RangeState {
         RangeState::Unmapped,
         RangeState::OutsideSource,
         RangeState::Corrupt,
+        RangeState::PossiblyOverwritten,
     ];
 
     /// `true` si los bytes son contenido del fichero (datos o ceros definidos por el formato).
@@ -70,6 +79,12 @@ impl RangeState {
             self,
             RangeState::Data | RangeState::Sparse | RangeState::Uninitialized
         )
+    }
+
+    /// `true` si los bytes son el patrón de relleno (no se pudo leer nada que interpretar). Un
+    /// tramo `possibly_overwritten` no es fiable pero no lleva patrón: son los bytes del disco.
+    pub fn is_filled(self) -> bool {
+        !self.is_trustworthy() && self != RangeState::PossiblyOverwritten
     }
 
     pub fn code(self) -> &'static str {
@@ -81,6 +96,7 @@ impl RangeState {
             RangeState::Unmapped => "unmapped",
             RangeState::OutsideSource => "outside_source",
             RangeState::Corrupt => "corrupt",
+            RangeState::PossiblyOverwritten => "possibly_overwritten",
         }
     }
 
@@ -93,6 +109,7 @@ impl RangeState {
             RangeState::Unmapped => "SIN MAPA",
             RangeState::OutsideSource => "FUERA DEL ORIGEN",
             RangeState::Corrupt => "COMPRIMIDO DAÑADO",
+            RangeState::PossiblyOverwritten => "POSIBLEMENTE SOBRESCRITO",
         }
     }
 }
@@ -284,6 +301,15 @@ impl CopyReport {
             .map(|s| self.count(*s))
             .sum()
     }
+
+    /// Bytes escritos con el patrón de relleno (no fiables y sin datos del disco).
+    pub fn filled_bytes(&self) -> u64 {
+        RangeState::ALL
+            .iter()
+            .filter(|s| s.is_filled())
+            .map(|s| self.count(*s))
+            .sum()
+    }
 }
 
 /// Error de [`DataStream::copy_to`].
@@ -303,6 +329,8 @@ pub struct DataStream<'v> {
     record: u64,
     record_in_use: bool,
     fill: [u8; 4],
+    /// Tramos de clústeres `(lcn, n)` sospechosos, ordenados y sin solaparse.
+    suspect: Vec<(u64, u64)>,
 }
 
 impl fmt::Debug for DataStream<'_> {
@@ -329,6 +357,62 @@ impl<'v> DataStream<'v> {
             record,
             record_in_use,
             fill: DEFAULT_FILL,
+            suspect: Vec::new(),
+        }
+    }
+
+    /// Marca los clústeres `(lcn, n)` como sospechosos: lo leído de ellos tiene el estado
+    /// [`RangeState::PossiblyOverwritten`] (los bytes no cambian). Se ordenan y se unen.
+    pub fn with_suspect_clusters(mut self, mut ranges: Vec<(u64, u64)>) -> Self {
+        ranges.retain(|r| r.1 > 0);
+        ranges.sort_unstable();
+        let mut out: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+        for (l, n) in ranges {
+            let e = l.saturating_add(n);
+            match out.last_mut() {
+                Some((pl, pn)) if pl.saturating_add(*pn) >= l => *pn = (*pn).max(e - *pl),
+                _ => out.push((l, e - l)),
+            }
+        }
+        self.suspect = out;
+        self
+    }
+
+    /// Clústeres sospechosos (ver [`DataStream::with_suspect_clusters`]).
+    pub fn suspect_clusters(&self) -> &[(u64, u64)] {
+        &self.suspect
+    }
+
+    /// Añade `data` (leído del byte `disk` del volumen) con el estado `data` o, en los clústeres
+    /// sospechosos, `possibly_overwritten`.
+    fn emit_disk(&self, b: &mut Builder, data: &[u8], disk: u64) {
+        if self.suspect.is_empty() || data.is_empty() {
+            b.bytes(data, RangeState::Data);
+            return;
+        }
+        let cluster = u64::from(self.layout.cluster_size).max(1);
+        let end = disk + data.len() as u64;
+        let mut pos = disk;
+        let mut i = self
+            .suspect
+            .partition_point(|&(l, n)| l.saturating_add(n).saturating_mul(cluster) <= pos);
+        while pos < end {
+            let (state, until) = match self.suspect.get(i) {
+                Some(&(l, n)) => {
+                    let a = l.saturating_mul(cluster);
+                    let z = l.saturating_add(n).saturating_mul(cluster);
+                    if pos < a {
+                        (RangeState::Data, a.min(end))
+                    } else {
+                        i += 1;
+                        (RangeState::PossiblyOverwritten, z.min(end))
+                    }
+                }
+                None => (RangeState::Data, end),
+            };
+            let (s, e) = ((pos - disk) as usize, (until - disk) as usize);
+            b.bytes(&data[s..e], state);
+            pos = until;
         }
     }
 
@@ -408,15 +492,16 @@ impl<'v> DataStream<'v> {
             let take = (inside - done).min(DISK_PIECE as u64);
             let s = read_span(self.dev, disk + done, take as usize, self.retries)?;
             let mut at = 0usize;
+            let base = disk + done;
             for &(lba, from, to) in &s.untrusted {
                 if from > at {
-                    b.bytes(&s.data[at..from], RangeState::Data);
+                    self.emit_disk(b, &s.data[at..from], base + at as u64);
                 }
                 b.pattern((to - from) as u64, RangeState::Unreadable, Some((lba, 1)));
                 at = to;
             }
             if at < s.data.len() {
-                b.bytes(&s.data[at..], RangeState::Data);
+                self.emit_disk(b, &s.data[at..], base + at as u64);
             }
             done += take;
         }
@@ -527,22 +612,29 @@ impl<'v> DataStream<'v> {
         for (lcn, len) in disk {
             self.read_disk(lcn * cluster, len * cluster, &mut raw)?;
         }
-        let first_bad = raw
+        let first_bad = raw.ranges.iter().find(|r| r.state.is_filled()).copied();
+        let trusted = first_bad.map_or(raw.data.len(), |r| r.offset as usize);
+        // Un solo clúster sospechoso hace sospechosa toda la unidad descomprimida (no se puede
+        // saber qué bytes de la salida salen de él).
+        let ok = if raw
             .ranges
             .iter()
-            .find(|r| !r.state.is_trustworthy())
-            .copied();
-        let trusted = first_bad.map_or(raw.data.len(), |r| r.offset as usize);
+            .any(|r| r.state == RangeState::PossiblyOverwritten)
+        {
+            RangeState::PossiblyOverwritten
+        } else {
+            RangeState::Data
+        };
         let mut out = Vec::with_capacity(cu_bytes);
         let result = decompress_into(&raw.data[..trusted], &mut out, cu_bytes);
-        u.bytes(&out, RangeState::Data);
+        u.bytes(&out, ok);
         let rest = (cu_bytes - out.len()) as u64;
         match (first_bad, result) {
             // Terminó dentro de la parte fiable: el resto de la unidad son ceros del formato.
-            (None, Ok(_)) => u.zeros(rest, RangeState::Data),
-            (Some(_), Ok(Lznt1End::Terminator(_))) => u.zeros(rest, RangeState::Data),
+            (None, Ok(_)) => u.zeros(rest, ok),
+            (Some(_), Ok(Lznt1End::Terminator(_))) => u.zeros(rest, ok),
             (Some(bad), _) => {
-                let last = raw.ranges.iter().rev().find(|r| !r.state.is_trustworthy());
+                let last = raw.ranges.iter().rev().find(|r| r.state.is_filled());
                 let lbas = match (bad.lbas, last.and_then(|r| r.lbas)) {
                     (Some((a, _)), Some((z, m))) => Some((a, z + m - a)),
                     (x, _) => x,
@@ -555,7 +647,8 @@ impl<'v> DataStream<'v> {
     }
 
     /// Copia el flujo entero a `w` en trozos de [`COPY_CHUNK`] (memoria acotada). Los tramos no
-    /// fiables se escriben con el patrón de relleno y se informan.
+    /// fiables se escriben con el patrón de relleno y se informan; los `possibly_overwritten` se
+    /// escriben tal como están en el disco y también se informan.
     pub fn copy_to(&self, w: &mut dyn std::io::Write) -> Result<CopyReport, CopyError> {
         let mut report = CopyReport {
             counts: RangeState::ALL.iter().map(|&s| (s, 0)).collect(),

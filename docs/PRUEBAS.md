@@ -99,8 +99,10 @@ ubicación de las imágenes). En la CI, el job `ntfs` de `ci.yml` (el único con
 `contents: read`, y `GH_TOKEN` = el token de Actions) descarga el artefacto con
 `tools/fetch_ntfs_corpus.py` (última ejecución con éxito de `main` o, si no hay, de cualquier rama;
 el SHA-256 de cada imagen debe coincidir con su manifiesto versionado) y ejecuta
-`cargo test -p mr-fs-ntfs --test ntfs_corpus -- --ignored` y
-`cargo test -p memrescue-cli --test ntfs_corpus -- --ignored`. En local, `scripts/test.ps1` tiene el
+`cargo test -p mr-fs-ntfs --test ntfs_corpus -- --ignored`,
+`cargo test -p memrescue-cli --test ntfs_corpus -- --ignored` y, para los borrados (#23),
+`cargo test -p mr-fs-ntfs --test ntfs_deleted_corpus -- --ignored` y
+`cargo test -p memrescue-cli --test ntfs_deleted -- --ignored`. En local, `scripts/test.ps1` tiene el
 mismo paso (`-SkipNtfsCorpus` para omitirlo; sin corpus, el paso falla e indica cómo descargarlo).
 
 **Validación independiente.** Tres comprobaciones que no comparten código entre sí:
@@ -538,8 +540,39 @@ Atributos, runs, flujos y LZNT1 (issue #21, ADR-026, `formatos/ntfs.md`):
   tiene su contenido). `hard_link_unsupported_is_recognised_only_for_unsupported_errors` fija qué
   errores del enlace activan la copia. No se prueba en un volumen FAT real (requiere montarlo).
 
-Campos del manifiesto NTFS que no se comparan todavía: `[[files]]` `path` (#22) y `recoverable`
-de los sobrescritos (#23).
+Ficheros borrados (issue #23, ADR-027, `formatos/ntfs.md` «Ficheros borrados»):
+
+- Unitarias (`core/mr-fs-ntfs/src/deleted_tests.rs` y `bitmap.rs`, 13): ver `formatos/ntfs.md`.
+- `core/mr-fs-ntfs/tests/ntfs_deleted_corpus.rs` (2, `--ignored`):
+  `deleted_entries_match_every_manifest` recorre los 10 manifiestos: **cada** entrada `deleted` u
+  `overwritten` (16: 11 de `ntfs_deleted` con un directorio y 5 de `ntfs_overwritten`) aparece con
+  su registro, secuencia, nombre, tipo, `path` completo y padre no huérfano; ningún vivo aparece y no
+  hay borrados que el manifiesto no conozca; `recoverable` igual al manifiesto (12 `full`, 1
+  `partial`, 2 `none`); los `full` se recuperan con el `sha256` del manifiesto y sin ningún tramo no
+  fiable; los `partial`/`none` producen el `recovered_sha256`, con `clusters` y
+  `overwritten_clusters` iguales, todos los sospechosos con dueño vivo, los dueños iguales a los del
+  `reason` (por ruta), los bytes `possibly_overwritten` iguales a los de esos clústeres (recortados
+  al tamaño) y el resumen con los dueños; `$Bitmap` sin problemas en todas las imágenes; en
+  `ntfs_damaged_mft` los 4 registros dañados están en `problems` como dañados, nunca entre los
+  borrados, y recuperarlos da `RecordUnusable` (dañado).
+  `unreadable_bitmap_and_data_sectors_are_never_reported_as_recoverable`: un sector ilegible de
+  `$Bitmap` deja `superviviente_2.bin` en `none` (10 clústeres desconocidos) aunque su contenido
+  siga intacto (se copia tal cual, 40 000 bytes `possibly_overwritten`) y el residente sigue
+  `full`; un sector ilegible en un clúster libre de `objetivo_3.bin` da exactamente un tramo
+  `unreadable` con su LBA y patrón, además de los `possibly_overwritten`.
+- CLI (`cli/tests/ntfs_deleted.rs`): `ntfs_deleted_and_recover_validate_arguments_before_writing`
+  (origen sin NTFS sin crear la salida, 8 errores de uso) y, con `--ignored`,
+  `ntfs_deleted_lists_the_manifest_entries` (`ntfs-deleted --json` de `ntfs_deleted`,
+  `ntfs_overwritten`, `ntfs_damaged_mft` y `ntfs_basic`: registro, secuencia, tipo, ruta,
+  recuperabilidad y dueños de cada entrada, ningún vivo, dañados en `problems`; texto; `ntfs_gpt`
+  con `--partition 1` sin borrados) y `ntfs_recover_matches_the_manifests_and_refuses_unsafe_outputs`
+  (`ntfs-recover` de los 15 ficheros borrados: código 0 y `sha256` los íntegros, código 3,
+  `recovered_sha256`, tramos y dueños en la salida de errores los sobrescritos; salida existente
+  con código 2 y sustituida con `--overwrite`; salida = origen rechazada; registro dañado sin
+  salida; sin temporales).
+
+Campos del manifiesto NTFS que no se comparan todavía: `[[files]]` `path` de los vivos (#22; el de
+los borrados se compara con la ruta por la cadena de padres de la MFT).
 
 ## 7. Registro
 

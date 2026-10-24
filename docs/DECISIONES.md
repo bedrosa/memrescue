@@ -674,3 +674,52 @@ fichero creado por otro proceso entre la comprobación y el renombrado se perdí
 - **Con `overwrite`**, se mantiene `std::fs::rename` (sustitución atómica).
 - El temporal se borra en cualquier error de `commit` y al descartar el `OutputFile`. La CLI
   devuelve el código 2 también cuando el destino aparece durante la escritura.
+
+## ADR-027 · Borrados NTFS: recuperabilidad conservadora por clúster y estado `possibly_overwritten` (Aceptada, 2026-10-24)
+
+**Contexto.** Issue #23 (FS-16): decir, para cada fichero borrado de un volumen NTFS, qué datos
+siguen disponibles y con qué fiabilidad, y recuperarlo diciendo qué bytes pueden no ser los
+originales. Un registro no en uso conserva sus runs, pero sus clústeres pueden haberse reutilizado;
+NTFS no guarda quién los reutilizó. Esta ADR cubre la parte de la MFT; las entradas `INDX`
+residuales llegan tras el árbol de directorios (#22).
+
+**Decisión** (detalle en `formatos/ntfs.md`, «Ficheros borrados»):
+1. **Borrado** = registro **base** no en uso que sigue siendo un registro FILE válido con algún
+   `$FILE_NAME` (los demás no en uso son libres). Las extensiones no son entradas: se unen por la
+   `$ATTRIBUTE_LIST` con las reglas de ADR-026 y, si la lista falta o es ilegible, por su
+   referencia al base (secuencia igual o una más). Dañados, ilegibles y fuera del origen se informan
+   aparte y nunca se recuperan.
+2. **Padre**: vivo (directorio en uso con la misma secuencia), borrado (directorio no en uso con la
+   misma secuencia o una más) o huérfano (fuera de la MFT, inutilizable, reutilizado o no
+   directorio). La ruta sale de la cadena de padres de la MFT solo si llega a la raíz con
+   secuencias coherentes.
+3. **Estado de cada clúster** con contenido (dentro del tamaño inicializado; en comprimidos,
+   unidades enteras), por orden: en los runs de un fichero vivo (`owned`, aunque `$Bitmap` diga
+   libre), asignado en `$Bitmap` sin dueño conocido, asignación desconocida (bit no fiable, mapa
+   corto o `$Bitmap` inutilizable), libre pero reclamado también por otro borrado, libre. Solo lo
+   libre cuenta como original.
+4. **Recuperabilidad**: `full` solo si todos los clústeres con contenido son libres y no hay tramos
+   sin mapa (o residente con el registro válido, o vacío); `none` si no queda ningún clúster libre
+   ni disperso; `partial` en lo demás; disposición inutilizable = `none`.
+5. **Memoria acotada**: dos pasadas por la MFT; los dueños se guardan solo como intersecciones con
+   los clústeres de los borrados (`ClaimIndex`, 4 M intersecciones por defecto; si se llena, se
+   informa y la asignación sigue saliendo de `$Bitmap`); `$Bitmap` por páginas de 64 KiB (64 en
+   memoria); límites de entradas, directorios y problemas listados.
+6. **Recuperación**: nuevo estado de tramo `possibly_overwritten` (no fiable, pero **sin** patrón:
+   son los bytes del disco, que pueden ser de otro fichero), junto a los de ADR-026. Una unidad
+   comprimida con un clúster sospechoso es entera `possibly_overwritten`. La salida usa
+   `create_output`; la CLI termina con código 3 si algún byte no es fiable.
+
+**Alternativas.** Comparar contenido (lo hace el oráculo del corpus, pero en un caso real no hay
+original con el que comparar); fiarse solo de `$Bitmap` (un vivo cuyo bit está a 0 por un mapa
+dañado dejaría pasar clústeres ajenos como originales); cargar todos los runs vivos (memoria
+proporcional al volumen); rellenar con patrón lo posiblemente sobrescrito (se perderían datos que
+pueden ser los originales: escrituras sin asignar o asignaciones sin escribir); decidir cuál de dos
+borrados escribió el último por sus fechas (no son fiables).
+
+**Consecuencias.** Los 16 borrados y sobrescritos del corpus coinciden con el manifiesto
+(recuperabilidad, SHA-256 o `recovered_sha256`, clústeres sobrescritos y dueño del `reason`). Una
+escritura en un clúster libre sin asignarlo no se detecta (el contenido se da por original). La
+evaluación no lee los datos: los sectores ilegibles aparecen al recuperar. Numeración provisional:
+puede cambiar al integrar las ramas paralelas.
+

@@ -24,6 +24,9 @@
 //! - [`partition_backup`], [`save_partition_backup`], [`load_partition_backup`] y
 //!   [`compare_partition_backup`]: copia del particionado en formato propio y comparación con un
 //!   origen, sin escribir nunca en él (#18).
+//! - [`ntfs_deleted`] / [`start_ntfs_deleted_task`]: ficheros borrados de la MFT con su
+//!   recuperabilidad (cancelable, con progreso); [`ntfs_recover_record`] y [`ntfs_recover_stream`]:
+//!   recuperación de un borrado con el estado de cada tramo (#23).
 //! - [`start_hash_task`]: hashes del fichero completo en segundo plano.
 //! - [`start_verify_task`]: lectura completa tolerante a errores con mapa de validez por sector.
 
@@ -358,6 +361,81 @@ pub fn ntfs_copy_stream(
         mr_fs_ntfs::stream::CopyError::Ntfs(n) => ApiError::Ntfs(n),
         mr_fs_ntfs::stream::CopyError::Write(w) => ApiError::Io(mr_io::IoError::Io(w)),
     })
+}
+
+impl mr_fs_ntfs::ScanObserver for TaskContext {
+    fn cancelled(&self) -> bool {
+        self.is_cancelled()
+    }
+    fn progress(&self, done: u64, total: u64) {
+        self.set_total(total);
+        self.set_done(done);
+    }
+}
+
+/// Ficheros y directorios borrados del volumen (registros base no en uso con `$FILE_NAME`) con la
+/// recuperabilidad de cada flujo según `$Bitmap` y los runs de los ficheros vivos (#23). Recorre
+/// la MFT dos veces; progreso en registros leídos y entradas evaluadas. Al cancelar,
+/// [`ApiError::Cancelled`].
+pub fn ntfs_deleted(
+    vol: &mr_fs_ntfs::NtfsVolume,
+    ctx: &TaskContext,
+) -> Result<mr_fs_ntfs::DeletedScan> {
+    mr_fs_ntfs::scan_deleted(vol, &mr_fs_ntfs::ScanOptions::default(), ctx)?
+        .ok_or(ApiError::Cancelled)
+}
+
+/// Lanza [`ntfs_deleted`] en segundo plano.
+pub fn start_ntfs_deleted_task(
+    vol: Arc<mr_fs_ntfs::NtfsVolume>,
+) -> Result<Arc<Task<mr_fs_ntfs::DeletedScan>>> {
+    Task::spawn(move |ctx| ntfs_deleted(&vol, ctx))
+}
+
+/// Recupera el flujo principal del registro `record` en `out` (ver [`ntfs_recover_stream`]).
+pub fn ntfs_recover_record(
+    src: &Source,
+    vol: &mr_fs_ntfs::NtfsVolume,
+    record: u64,
+    out: &Path,
+    overwrite: bool,
+) -> Result<mr_fs_ntfs::RecoveryReport> {
+    ntfs_recover_stream(
+        src,
+        vol,
+        record,
+        "",
+        out,
+        overwrite,
+        &TaskContext::detached(),
+    )
+}
+
+/// Recupera el flujo `stream` del registro `record` (borrado o no) en `out` con la política de
+/// [`create_output`] (nunca el origen, nunca sin `overwrite` sobre un fichero existente,
+/// escritura atómica). El informe dice qué tramos de bytes son datos, cuáles pueden no ser los
+/// originales (`possibly_overwritten`: se escriben tal como están en el disco) y cuáles no se
+/// pudieron leer (patrón de relleno), con el dueño actual de los clústeres. Un registro dañado o
+/// ilegible es un error y no crea la salida.
+pub fn ntfs_recover_stream(
+    src: &Source,
+    vol: &mr_fs_ntfs::NtfsVolume,
+    record: u64,
+    stream: &str,
+    out: &Path,
+    overwrite: bool,
+    ctx: &TaskContext,
+) -> Result<mr_fs_ntfs::RecoveryReport> {
+    // Se evalúa y se abre el flujo antes de crear la salida: un error no deja ficheros.
+    let (s, mut report) = mr_fs_ntfs::recover::recovery_stream(vol, record, stream, ctx)?
+        .ok_or(ApiError::Cancelled)?;
+    let mut w = create_output(src, out, overwrite)?;
+    report.copy = s.copy_to(&mut w).map_err(|e| match e {
+        mr_fs_ntfs::stream::CopyError::Ntfs(n) => ApiError::Ntfs(n),
+        mr_fs_ntfs::stream::CopyError::Write(w) => ApiError::Io(mr_io::IoError::Io(w)),
+    })?;
+    w.commit()?;
+    Ok(report)
 }
 
 /// Comprueba que `out` puede ser el fichero de salida de una extracción del origen `src`: no es
