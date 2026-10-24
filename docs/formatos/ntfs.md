@@ -2,7 +2,8 @@
 
 Crate: `core/mr-fs-ntfs` (`mr_fs_ntfs::NtfsVolume`). Solo lectura. Issues #20 y #21 (M3), paridad
 FS-01, FS-03 y FS-04, ADR-025 y ADR-026. Los índices y el árbol son de #22; los borrados (qué datos
-siguen disponibles y con qué fiabilidad), de #23.
+siguen disponibles y con qué fiabilidad) son de #23 (FS-16, ADR-027): la parte de la MFT está hecha
+y las entradas `INDX` residuales, pendientes.
 
 ## Especificación usada
 
@@ -27,6 +28,10 @@ stream.layout() -> &StreamLayout        // tamaños, compresión, extensiones, r
 stream.read(offset, len) -> Result<StreamChunk, _>         // bytes + estado de cada tramo
 stream.copy_to(&mut impl Write) -> Result<CopyReport, _>   // flujo entero con memoria acotada
 lznt1::decompress(src, límite)          // [MS-XCA] con límites estrictos
+scan_deleted(&volume, &ScanOptions, &observador) -> Result<Option<DeletedScan>, _>  // #23; None = cancelado
+ClusterBitmap::open(&volume).runs(lcn, n)              // asignación libre/asignado/desconocido
+recover_stream(&volume, n, "nombre", &mut w, &observador) -> Result<Option<RecoveryReport>, _>
+stream.with_suspect_clusters(tramos)    // lo leído de esos clústeres: possibly_overwritten
 ```
 
 - `mr_api::ntfs_open(&Source)` abre el volumen de un origen: imagen sin tabla, partición
@@ -61,6 +66,18 @@ lznt1::decompress(src, límite)          // [MS-XCA] con límites estrictos
   fichero); solo se compara la ruta canónica. Los tramos no fiables se escriben con el patrón `BAD!`
   **solo** en esos bytes, se listan en la salida de errores (desplazamiento, longitud, estado y LBA)
   y el código de salida es 3. Un registro no en uso (borrado) se lee igual, con un aviso.
+- #23: `mr_api::ntfs_deleted(volumen, ctx)` y `start_ntfs_deleted_task(Arc<NtfsVolume>)`
+  (cancelable, progreso en registros leídos de las dos pasadas más entradas evaluadas; al cancelar,
+  `ApiError::Cancelled`), `ntfs_recover_record(origen, volumen, registro, salida, sobrescribir)` y
+  `ntfs_recover_stream(..., flujo, ..., ctx)`: evalúan y abren el flujo antes de crear la salida
+  (un error no deja ficheros) y escriben con `create_output`.
+- CLI (#23): `ntfs-deleted <imagen> [ORIGEN] [--json]` (borrados con registro, secuencia, tipo,
+  tamaño, ruta o `<huérfano N>/nombre`, estado del padre, recuperabilidad y resumen de cada flujo
+  no íntegro; registros no interpretables aparte; código 3 si hay registros MFT ilegibles o
+  `$Bitmap` no se puede usar) y `ntfs-recover <imagen> --record N -o SALIDA [--stream NOMBRE]
+  [--overwrite] [ORIGEN]` (política de salida de `ntfs-cat -o`; en la salida de errores, la
+  recuperabilidad, los tramos posiblemente sobrescritos con LCN y dueño y los tramos con patrón;
+  código 3 si algún byte no es fiable).
 - FFI e interfaz: **pendientes** (#22, cuando aparezca el árbol de ficheros). `mr-ffi` solo traduce
   los nuevos errores (`MR_ERR_CORRUPT`, `MR_ERR_OUT_OF_RANGE` o el código de E/S).
 
@@ -73,8 +90,11 @@ Módulos y frontera con los siguientes issues:
 | `attr` | iterador acotado de cabeceras de atributo (residente/no residente, nombre) | - |
 | `values` | `$STANDARD_INFORMATION`, `$FILE_NAME`, `$OBJECT_ID`, `$VOLUME_INFORMATION`, entradas de `$ATTRIBUTE_LIST` | #22 (`$FILE_NAME` de los índices) |
 | `runs` | `decode_runs`, `decode_extent`, `merge_contiguous`, `sparse_ranges` | - |
-| `file` | `NtfsFile` (base + extensiones), `FileAnomaly`, `StreamLayout`, `StreamError`, `StreamIssue` | #23 (fiabilidad de los borrados) |
-| `stream` | `DataStream`: lectura con estado por tramo, compresión, `copy_to` | #22, #23 |
+| `file` | `NtfsFile` (base + extensiones), `FileAnomaly`, `StreamLayout`, `StreamError`, `StreamIssue` | - |
+| `stream` | `DataStream`: lectura con estado por tramo, compresión, `copy_to`, clústeres sospechosos (#23) | #22 |
+| `bitmap` (#23) | `ClusterBitmap`: `$Bitmap` por páginas, `alloc_runs` | - |
+| `deleted` (#23) | `scan_deleted`, `ClaimIndex`, `assess_layout`, `DeletedEntry`, `StreamAssessment`, `ParentState` | INDX residuales (tras #22) |
+| `recover` (#23) | `recovery_stream`, `recover_stream`, `RecoveryReport` | M4 |
 | `lznt1` | descompresor [MS-XCA] | - |
 | `mft` | `MftLayout` (tramos en disco de cada registro), `RecordOutcome`, `Records` | #22, #23 |
 | `volume` | apertura, copia del arranque, `$MFTMirr`, `$Volume`, extensiones de `$MFT`, `file`, `open_stream` | - |
@@ -233,6 +253,7 @@ datos)` con tramos en disco, dispersos o sin mapa.
 | `unmapped` | sin extensión que lo describa | no |
 | `outside_source` | clústeres más allá del final del origen (volumen truncado) | no |
 | `corrupt` | unidad de compresión que no se puede descomprimir | no |
+| `possibly_overwritten` | leído del disco, de un clúster que un borrado ya no tiene en exclusiva (solo al recuperar, #23) | no, pero **sin** patrón: bytes tal como están |
 
 Los tramos no fiables llevan el patrón `BAD!` (configurable con `with_fill`), alineado al
 desplazamiento del flujo, y nunca se presentan como datos. `copy_to` copia el flujo entero en
@@ -271,6 +292,90 @@ datos sin comprimir y comprimidos; 9 vectores más construidos a mano fijan los 
 resultado de `RtlDecompressBuffer` (6 correctos y 3 errores). Los vectores están versionados: la CI
 no necesita Windows.
 
+## Ficheros borrados (#23, ADR-027)
+
+Módulos `deleted` (descubrimiento y clasificación), `bitmap` (`$Bitmap`) y `recover`. Solo la
+parte de la MFT: las entradas `INDX` residuales están **pendientes** (tras #22).
+
+**Descubrimiento** (`scan_deleted(volumen, opciones, observador)`, pasada 1 por la MFT):
+
+| Registro | Resultado |
+|---|---|
+| Base, no en uso, registro FILE válido con algún `$FILE_NAME` (en el propio registro o por su `$ATTRIBUTE_LIST`) | entrada borrada (fichero o directorio) |
+| Base, no en uso, sin `$FILE_NAME` | registro libre (solo se cuenta) |
+| Extensión no en uso | no es una entrada: se une a su base por la lista (holgura de secuencia de ADR-026) o, si la lista del base falta o no se puede leer, por su referencia al base (número y secuencia igual o una más; `backref_extensions`) |
+| Dañado, ilegible o fuera del origen | `problems` (como mucho 10 000; recuentos exactos): nunca es un borrado ni se recupera |
+| En uso | nunca es un borrado |
+
+De cada entrada: registro y secuencia actual, nombre (`$FILE_NAME` que no sea DOS si lo hay) con
+su espacio de nombres y todos los nombres, indicador de directorio, padre (número y secuencia) y su
+estado, ruta, tamaños (del `$DATA` principal o, sin él, del `$FILE_NAME`), fechas
+(`$STANDARD_INFORMATION` o, sin él, del `$FILE_NAME`), extensiones y anomalías.
+
+| Estado del padre | Regla |
+|---|---|
+| `live` | directorio en uso con la misma secuencia |
+| `deleted` | directorio no en uso con la misma secuencia o una más (borrado a la vez o antes) |
+| `orphan_out_of_range`, `orphan_unusable`, `orphan_sequence_mismatch`, `orphan_not_directory` | fuera de la MFT, registro no interpretable, reutilizado (otra secuencia) o no es un directorio |
+
+La ruta se construye por la cadena de padres de la MFT (directorios vivos o borrados con la
+secuencia coherente, como mucho 1024 niveles y 2 millones de directorios recordados) solo si llega
+a la raíz (registro 5); si no, se muestra `<huérfano N>/nombre`. No usa los índices `$I30` (#22).
+
+**Dueños** (pasada 2): con los clústeres de los flujos borrados como consulta, se recorren los
+registros en uso (base y extensiones; los de una extensión cuentan para su base) y se guardan solo
+las intersecciones de los runs de **cualquier** atributo no residente con la consulta
+(`ClaimIndex`, como mucho 4 millones de intersecciones de 24 B; si se llena,
+`claims_truncated` y la asignación sigue saliendo de `$Bitmap`). Igual con los runs de los demás
+borrados. Las dos pasadas son la única lectura de la MFT; la memoria depende de los borrados, no del
+volumen.
+
+**`$Bitmap`** (registro 6, `$DATA` sin nombre, un bit por clúster, el menos significativo
+primero, 1 = asignado) se lee por el mapa de validez en páginas de 64 KiB (64 en memoria). Un byte
+de un tramo no fiable, los clústeres más allá del mapa (`bitmap_short`) y todos si el registro no se
+puede usar (`bitmap_unusable`, `bitmap_not_in_use`) son de asignación **desconocida**: nunca se
+suponen libres.
+
+**Clasificación de cada clúster** con contenido (dentro del tamaño inicializado; en un flujo
+comprimido, unidades de compresión enteras), en este orden:
+
+| Estado | Regla | ¿Original? |
+|---|---|---|
+| `owned` | en los runs de un fichero vivo (aunque `$Bitmap` diga libre); se nombra el dueño | no |
+| `allocated` | asignado en `$Bitmap` sin dueño conocido | no |
+| `unknown` | asignación desconocida | no |
+| `shared_with_deleted` | libre, pero en los runs de otro borrado (no se sabe cuál escribió el último) | no |
+| `free` | libre y sin otro dueño | sí |
+
+**Recuperabilidad** de cada flujo `$DATA` (el principal da la del fichero; un directorio sin `$DATA`
+no tiene):
+
+| Valor | Regla |
+|---|---|
+| `full` | residente con el registro válido, vacío, o todos los clústeres con contenido `free` y ningún tramo sin mapa |
+| `none` | ningún clúster con contenido `free` ni disperso, o disposición inutilizable (cifrado, extensiones incoherentes...) |
+| `partial` | el resto |
+
+Cada flujo lleva los recuentos (`clusters`, `free`, `owned`, `allocated`, `unknown`, `shared`,
+`unmapped`, `sparse`), los tramos de clústeres con su estado (como mucho 4096 por flujo en el
+listado; sin límite al recuperar), los dueños, los motivos tipados y un resumen
+(`N de M clústeres posiblemente sobrescritos, asignados ahora a RUTA`). La evaluación no lee los
+datos: los sectores ilegibles aparecen al recuperar.
+
+**Recuperación** (`recover_stream`, `recovery_stream`): se evalúa el registro (centrado en él: los
+demás borrados se recorren igual) y se abre el flujo con sus clústeres no libres marcados
+(`DataStream::with_suspect_clusters`). Lo leído de ellos tiene el estado de tramo
+`possibly_overwritten` (no fiable, **sin** patrón: son los bytes del disco); una unidad comprimida
+con un clúster sospechoso es entera `possibly_overwritten`. El informe (`RecoveryReport`) tiene el
+recuento por estado, los tramos no fiables, los tramos sospechosos en bytes con su LCN, estado y
+dueño, y el resumen. Un registro en uso se copia tal cual; uno dañado o ilegible es
+`RecordUnusable`; uno libre (sin `$FILE_NAME`) también.
+
+**Pendiente: entradas `INDX` residuales.** Tras #22 serán otra fuente de entradas
+(`EntryOrigin` tendrá su variante): las que coincidan con un registro de la lista añadirán nombres o
+rutas; las que apunten a un registro reutilizado se clasificarán con `assess_layout` si hay runs o
+como `none` si solo queda el `$FILE_NAME` del índice.
+
 ## MFT, estados de registro y límites
 
 - La MFT se localiza con el `$DATA` sin nombre del registro 0 en el LCN del arranque: en uso,
@@ -280,7 +385,7 @@ no necesita Windows.
 - `record_count = data_size / tamaño de registro`, como mucho 2^32 (`MAX_RECORDS`). Avisos:
   `mft_lcn_mismatch`, `mft_size_not_multiple`, `mft_extended` (la MFT se completó con las
   extensiones de `$MFT`) y `mft_incomplete` (ni con ellas se cubre toda la MFT).
-- Estados (`RecordState`): `in_use`, `not_in_use` (borrado o libre: #23 los distinguirá),
+- Estados (`RecordState`): `in_use`, `not_in_use` (borrado o libre: `scan_deleted` los distingue),
   `empty`, `uninitialized` (más allá del tamaño inicializado: no se lee), `unmapped` (sin run o en
   un run disperso), `outside_source` (volumen truncado), `unreadable`, `damaged`.
 - Enumeración por lotes de hasta 64 registros contiguos en disco; un registro que cruza dos runs se
@@ -329,7 +434,19 @@ son el estado de cada registro.
   residente, borrados con secuencias incrementadas, extensiones ajenas, reutilizadas, ilegibles, con
   lista propia, fuera de la MFT, solapadas, repetidas o con hueco, errores de flujo, extensiones de
   `$MFT` y fuzzing de 600 volúmenes con registros mutados.
-- Corpus (`core/mr-fs-ntfs/tests/ntfs_corpus.rs`, 5, `--ignored`): ver `PRUEBAS.md`. 439 flujos
+- #23 (`core/mr-fs-ntfs/src`, 13 unitarias más; `deleted_tests.rs` y `bitmap.rs`): bits de
+  `$Bitmap` y sus límites (bytes no fiables, fuera del mapa, desbordamiento) con fuzzing de 5000
+  consultas contra un modelo; páginas leídas una vez; `$Bitmap` ilegible, corto o no en uso;
+  `ClaimIndex` (solo intersecciones, límite); clasificación de clústeres contra un modelo (500
+  casos); volumen sintético con borrados íntegro, parcial con dueño vivo, asignado sin dueño,
+  residente con ADS, directorio borrado con hijo, huérfanos (padre no directorio y reutilizado),
+  clúster compartido por dos borrados, extensión por la lista y por referencia al base, registro
+  libre y dañado; recuperación con `possibly_overwritten` recortado al tamaño, sector ilegible en un
+  clúster libre, unidad comprimida con un clúster sospechoso; cancelación, progreso, límite de
+  entradas y foco; fuzzing de 300 volúmenes con registros mutados.
+- Corpus (`core/mr-fs-ntfs/tests/ntfs_corpus.rs`, 5, `--ignored`): ver `PRUEBAS.md`.
+- Corpus de borrados (`core/mr-fs-ntfs/tests/ntfs_deleted_corpus.rs`, 2, `--ignored`): ver
+  `PRUEBAS.md`. 439 flujos
   con el SHA-256 del manifiesto (419 vivos, 12 borrados, 3 sobrescritos con `recovered_sha256` y 5
   flujos alternativos), con tamaño, residencia, runs, dispersos y tamaño inicializado.
 - CLI: `cli/tests/cli.rs` (origen sin NTFS, argumentos de `ntfs-cat`/`ntfs-stat`) y
@@ -346,7 +463,13 @@ son el estado de cada registro.
 - Solo se abren flujos `$DATA` (principal y ADS); otros atributos no residentes se leen
   internamente cuando hace falta (`$ATTRIBUTE_LIST`).
 - La lectura de un fichero borrado sigue sus runs tal como están: si los clústeres se han
-  reutilizado, el contenido es el actual del disco (#23 informará la fiabilidad).
+  reutilizado, el contenido es el actual del disco. `ntfs-recover` lo marca como
+  `possibly_overwritten`; `ntfs-cat` no evalúa (solo avisa de que el registro no está en uso).
+- Borrados: una escritura en un clúster libre sin asignarlo no se detecta (el contenido se da por
+  original); de dos borrados que reclaman el mismo clúster libre no se sabe cuál es el original
+  (ninguno es `full`); las rutas salen de la cadena de padres de la MFT, no de los índices; las
+  entradas `INDX` residuales están pendientes (tras #22); el corpus no tiene borrados con
+  `$ATTRIBUTE_LIST`, comprimidos ni huérfanos (solo sintéticos).
 - El corpus de ntfs-3g no tiene ficheros comprimidos ni `$ATTRIBUTE_LIST`: la compresión se
   comprueba con los vectores de Windows y volúmenes sintéticos, y las extensiones con volúmenes
   sintéticos.

@@ -2,6 +2,7 @@
 //!
 //! Todas las operaciones son de solo lectura y solo aceptan ficheros de imagen.
 
+mod ntfs_deleted;
 mod ntfs_files;
 mod partition_backup;
 
@@ -40,6 +41,8 @@ USO:
   memrescue-cli ntfs-info <imagen> [ORIGEN] [--json]
   memrescue-cli ntfs-stat <imagen> --record N [ORIGEN] [--json]
   memrescue-cli ntfs-cat <imagen> --record N [--stream NOMBRE] [-o SALIDA [--overwrite]] [ORIGEN]
+  memrescue-cli ntfs-deleted <imagen> [ORIGEN] [--json]
+  memrescue-cli ntfs-recover <imagen> --record N -o SALIDA [--stream NOMBRE] [--overwrite] [ORIGEN]
   memrescue-cli sectors <imagen> --lba N [--count M] [--retries N] [--jump N] [--read-back]
                         [--bad-fill PATRÓN] [--skip-fill PATRÓN] [ORIGEN]
   memrescue-cli verify <imagen> [--retries N] [--jump N] [--read-back]
@@ -134,6 +137,19 @@ con #22):
   no fiables (sectores ilegibles, sin mapa, fuera del origen, unidad comprimida dañada) se
   escriben con el patrón de relleno BAD! solo en esos bytes, se listan en la salida de errores y
   el código de salida es 3: nunca son datos del origen.
+
+FICHEROS NTFS BORRADOS (ntfs-deleted, ntfs-recover):
+  ntfs-deleted: registros base no en uso que conservan un registro FILE con $FILE_NAME (los
+  dañados o ilegibles se listan aparte y nunca como borrados): registro, secuencia, tipo, tamaño,
+  ruta por la cadena de padres de la MFT (o <huérfano N>/nombre si el padre ya no es ese
+  directorio) y recuperabilidad de cada flujo según $Bitmap y los runs de los ficheros vivos:
+  íntegro (todos sus clústeres libres), PARCIAL o NINGUNO, con el motivo y el fichero vivo que
+  ocupa ahora los clústeres. Código de salida 3 si hay registros MFT ilegibles o $Bitmap no se
+  puede usar (evaluación incompleta). Las entradas INDX residuales están pendientes.
+  ntfs-recover: copia el flujo del registro (borrado o no) en SALIDA con la misma política que
+  ntfs-cat -o. Los bytes de clústeres que ya no son libres se copian tal como están en el disco y
+  se listan como POSIBLEMENTE SOBRESCRITOS con su dueño actual; los ilegibles llevan el patrón
+  BAD!. Código de salida 3 si algún byte no es fiable.
 
 Formatos: RAW, VHD (fijo/dinámico), VHDX (fijo/dinámico), VMDK monolithicSparse e imágenes
 divididas. Tamaños de sector habituales: 512, 1024, 2048, 4096.
@@ -735,12 +751,17 @@ fn run(args: Vec<String>) -> Result<(), (u8, String)> {
     if cmd != "sectors" && (a.bad_fill.is_some() || a.skip_fill.is_some()) {
         return Err(usage("--bad-fill y --skip-fill solo se aplican a sectors"));
     }
-    let ntfs_file_cmd = cmd == "ntfs-cat" || cmd == "ntfs-stat";
+    let ntfs_file_cmd = cmd == "ntfs-cat" || cmd == "ntfs-stat" || cmd == "ntfs-recover";
     if !ntfs_file_cmd && a.record.is_some() {
-        return Err(usage("--record solo se aplica a ntfs-cat y ntfs-stat"));
+        return Err(usage(
+            "--record solo se aplica a ntfs-cat, ntfs-stat y ntfs-recover",
+        ));
     }
-    if cmd != "ntfs-cat" && (a.stream.is_some() || a.output.is_some()) {
-        return Err(usage("--stream y -o solo se aplican a ntfs-cat"));
+    let output_cmd = cmd == "ntfs-cat" || cmd == "ntfs-recover";
+    if !output_cmd && (a.stream.is_some() || a.output.is_some()) {
+        return Err(usage(
+            "--stream y -o solo se aplican a ntfs-cat y ntfs-recover",
+        ));
     }
     if a.save_backup.is_some() && cmd != "partitions" && cmd != "find-partitions" {
         return Err(usage(
@@ -749,8 +770,14 @@ fn run(args: Vec<String>) -> Result<(), (u8, String)> {
     }
     if a.overwrite && a.output.is_none() && a.save_backup.is_none() {
         return Err(usage(
-            "--overwrite solo se aplica a ntfs-cat con -o y a --save-backup",
+            "--overwrite solo se aplica a ntfs-cat o ntfs-recover con -o y a --save-backup",
         ));
+    }
+    if cmd == "ntfs-recover" && a.output.is_none() {
+        return Err(usage("ntfs-recover necesita -o SALIDA"));
+    }
+    if cmd == "ntfs-recover" && a.json {
+        return Err(usage("ntfs-recover no admite --json"));
     }
     if cmd == "ntfs-cat" && a.json {
         return Err(usage(
@@ -1030,6 +1057,21 @@ fn run(args: Vec<String>) -> Result<(), (u8, String)> {
                     ),
                 ));
             }
+        }
+        "ntfs-deleted" => {
+            let p = one(&a)?;
+            let src = open_src(&a, &p).map_err(|e| op(&e))?;
+            let v = mr_api::ntfs_open(&src).map_err(|e| op(&e))?;
+            ntfs_deleted::list(v, a.json)?;
+        }
+        "ntfs-recover" => {
+            let p = one(&a)?;
+            let record = a.record.ok_or_else(|| usage("falta --record N"))?;
+            let out = a.output.clone().ok_or_else(|| usage("falta -o SALIDA"))?;
+            let src = open_src(&a, &p).map_err(|e| op(&e))?;
+            let v = mr_api::ntfs_open(&src).map_err(|e| op(&e))?;
+            let stream = a.stream.clone().unwrap_or_default();
+            ntfs_deleted::recover(&v, &src, record, &stream, &out, a.overwrite)?;
         }
         "ntfs-stat" | "ntfs-cat" => {
             let p = one(&a)?;

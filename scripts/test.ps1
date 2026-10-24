@@ -53,6 +53,10 @@ if (-not $SkipNtfsCorpus) {
         cargo test -p mr-fs-ntfs --test ntfs_corpus -- --ignored
         if ($LASTEXITCODE -ne 0) { return }
         cargo test -p memrescue-cli --test ntfs_corpus -- --ignored
+        if ($LASTEXITCODE -ne 0) { return }
+        cargo test -p mr-fs-ntfs --test ntfs_deleted_corpus -- --ignored
+        if ($LASTEXITCODE -ne 0) { return }
+        cargo test -p memrescue-cli --test ntfs_deleted -- --ignored
     }
 }
 if (-not $SkipQemu) {
