@@ -5,7 +5,8 @@ Uso:
     python -I validate_partition_images.py <dir_imagenes> <dir_manifiestos_de_referencia>
 
 No importa el generador: vuelve a interpretar cada imagen desde los bytes según la especificación
-(MBR/EBR clásico, UEFI para GPT, Microsoft para FAT32 y exFAT, estructura pública del arranque NTFS),
+(MBR/EBR clásico, UEFI para GPT, Apple "Inside Macintosh: Devices" para el Apple Partition Map,
+Microsoft para FAT32 y exFAT, estructura pública del arranque NTFS),
 deduce por su cuenta el esquema, las particiones, las anomalías, el estado de cada copia GPT, el
 desplazamiento de la imagen y los volúmenes con sector de arranque, y lo compara con el manifiesto de
 referencia versionado en git (tests/corpus/manifests). Comprueba también que la generación es
@@ -259,6 +260,54 @@ def parse_gpt_entries(raw: bytes, h: dict) -> list[dict]:
     return found
 
 
+# --------------------------------------------------------------------------- Apple Partition Map
+
+
+def cstr(b: bytes) -> str:
+    return b.split(b"\x00", 1)[0].decode("ascii", "replace")
+
+
+def analyze_apm(d: Disk) -> dict | None:
+    """Driver Descriptor Map ('ER', tamaño de bloque y nº de bloques big-endian) en el byte 0 y una
+    entrada 'PM' de 512 B cada `tamaño de bloque` bytes desde el bloque 1; inicio y tamaño en bloques."""
+    data = d.data
+    if len(data) < 1024 or data[:2] != b"ER":
+        return None
+    bs, blkcount = struct.unpack_from(">HI", data, 2)
+    if bs not in (512, 1024, 2048, 4096) or data[bs : bs + 2] != b"PM":
+        return None
+    blocks = len(data) // bs
+    n = struct.unpack_from(">I", data, bs + 4)[0]
+    an, parts = [], []
+    if blkcount != blocks:
+        an.append({"code": "apm_disk_size_mismatch", "lba": 0, "value": blkcount})
+    if bs != d.ss:
+        an.append({"code": "apm_sector_size_mismatch", "lba": None, "value": bs})
+    for i in range(1, n + 1):
+        e = data[i * bs : i * bs + 512]
+        lba = i * bs // d.ss
+        if len(e) < 512 or e[:2] != b"PM":
+            an.append({"code": "apm_entry_signature", "lba": lba, "value": i})
+            continue
+        count, start, size = struct.unpack_from(">III", e, 4)
+        lg_start, lg_count, status = struct.unpack_from(">III", e, 80)
+        if count != n:
+            an.append({"code": "apm_map_count_mismatch", "lba": lba, "value": count})
+        if start >= blocks:
+            an.append({"code": "apm_entry_outside_disk", "lba": lba, "value": i})
+        elif start + size > blocks:
+            an.append({"code": "apm_entry_partially_outside_disk", "lba": lba, "value": i})
+        if lg_start + lg_count > size:
+            an.append({"code": "apm_entry_data_outside", "lba": lba, "value": i})
+        parts.append({"start_lba": start, "sectors": size, "end_lba": start + size - 1, "apm_index": i,
+                      "apm_type": cstr(e[48:80]), "apm_name": cstr(e[16:48]), "apm_status": status})
+    for i, a in enumerate(parts):
+        for b in parts[i + 1 :]:
+            if a["start_lba"] < b["start_lba"] + b["sectors"] and b["start_lba"] < a["start_lba"] + a["sectors"]:
+                an.append({"code": "apm_entry_overlap", "lba": b["apm_index"] * bs // d.ss, "value": b["apm_index"]})
+    return {"block_size": bs, "disk_blocks": blocks, "map_entries": n, "partitions": parts, "anomalies": an}
+
+
 # ------------------------------------------------------------------------ sectores de arranque FS
 
 
@@ -383,7 +432,8 @@ def scan_volumes(d: Disk, checks: list) -> tuple[list[dict], int | None]:
 
 
 def anomaly_key(a: dict) -> tuple:
-    return (a["code"], a["lba"], a.get("target_lba"), a.get("value"), tuple(a.get("starts", ())))
+    return (a["code"], a["lba"] if a["lba"] is not None else -1, a.get("target_lba"), a.get("value"),
+            tuple(a.get("starts", ())))
 
 
 GPT_KEYS = ("gpt_primary_header", "gpt_primary_header_image_lba", "gpt_primary_entries", "gpt_backup_header",
@@ -397,9 +447,11 @@ def validate(data: bytes, m: dict, r: Report) -> None:
     out = {"anomalies": [], "partitions": [], "checks": []}
     kind = analyze_mbr(d, out)
 
-    g = analyze_gpt(d) if kind != "mbr" else None
+    apm = analyze_apm(d) if kind in ("missing", "empty") else None
+    g = analyze_gpt(d) if kind != "mbr" and apm is None else None
     gpt = g is not None and (kind in ("protective", "hybrid") or g["present"])
-    scheme = "hybrid" if kind == "hybrid" else "gpt" if gpt else "mbr" if kind == "mbr" else "none"
+    scheme = ("apm" if apm else "hybrid" if kind == "hybrid" else "gpt" if gpt else "mbr" if kind == "mbr"
+              else "none")
     r.check(scheme == m["scheme"], f"esquema deducido {scheme} != {m['scheme']}")
 
     vols, delta = scan_volumes(d, out["checks"])
@@ -434,6 +486,12 @@ def validate(data: bytes, m: dict, r: Report) -> None:
     elif gpt:
         compare_partitions(d, m, g["entries"], r,
                            ["start_lba", "sectors", "end_lba", "gpt_type", "unique_guid", "gpt_name"])
+    elif apm:
+        out["anomalies"] += apm["anomalies"]
+        for k in ("block_size", "disk_blocks", "map_entries"):
+            r.check(apm[k] == m.get(f"apm_{k}"), f"apm_{k}: deducido {apm[k]!r} != {m.get(f'apm_{k}')!r}")
+        compare_partitions(d, m, apm["partitions"], r,
+                           ["start_lba", "sectors", "end_lba", "apm_index", "apm_type", "apm_name", "apm_status"])
     else:
         r.check(not m.get("partitions"), "el manifiesto declara particiones en un disco sin tabla")
     if kind == "hybrid":
@@ -533,6 +591,11 @@ def compare_partitions(d: Disk, m: dict, found: list[dict], r: Report, keys: lis
         lba = e.get("marker_lba", e["start_lba"])
         r.check(lba == e["start_lba"] - shift, f"{e['label']}: marker_lba incoherente con el desplazamiento")
         mk = e["marker"].encode()
+        if not mk:
+            # Sin marcador: el mapa APM (su primer bloque es la entrada 1) o una entrada fuera del disco.
+            r.check(e.get("apm_type") == "Apple_partition_map" or lba >= d.n,
+                    f"{e['label']}: marcador vacío sin justificar")
+            continue
         sec = d.sector(lba)
         r.check(sec is not None and sec[: len(mk)] == mk, f"{e['label']}: marcador ausente en LBA {lba}")
 

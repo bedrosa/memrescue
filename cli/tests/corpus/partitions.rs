@@ -9,8 +9,9 @@
 //! `EbrLoop`, `ebr_link_outside_disk` = `LinkOutsideDisk`, `ebr_link_outside_extended` =
 //! `LinkOutsideExtended`, `hybrid_mbr` = `Hybrid`, `protective_mbr_size_mismatch` =
 //! `ProtectiveSizeMismatch`, `superfloppy` = `Superfloppy`. Los códigos `gpt_*` son del lector GPT
-//! (#13) y `image_shifted` / `mbr_displaced`, de la búsqueda de particiones perdidas (#15): aquí se
-//! ignoran (los desplazamientos se comprueban aparte con las coordenadas del manifiesto).
+//! (#13), los `apm_*`, del Apple Partition Map (#17), e `image_shifted` / `mbr_displaced`, de la
+//! búsqueda de particiones perdidas (#15): aquí se ignoran (los desplazamientos se comprueban aparte
+//! con las coordenadas del manifiesto).
 
 use mr_api::mr_part::mbr::{self, MbrAnomaly, NoTableReason};
 use mr_api::mr_part::{Anomaly, Origin, PartitionKind, Scheme};
@@ -204,7 +205,10 @@ const MBR_CODES: &[&str] = &[
 
 /// Códigos que pertenecen a otros analizadores (se ignoran aquí).
 fn foreign_code(code: &str) -> bool {
-    code.starts_with("gpt_") || code == "image_shifted" || code == "mbr_displaced"
+    code.starts_with("gpt_")
+        || code.starts_with("apm_")
+        || code == "image_shifted"
+        || code == "mbr_displaced"
 }
 
 /// Códigos con `value` significativo en el manifiesto.
@@ -220,7 +224,8 @@ fn expected_scheme(m: &Manifest) -> Scheme {
         "hybrid" => Scheme::Hybrid,
         "gpt" if missing => Scheme::None,
         "gpt" => Scheme::Gpt,
-        "none" => Scheme::None,
+        // El bloque 0 de un APM es el Driver Descriptor Map: el MBR no ve ninguna tabla.
+        "none" | "apm" => Scheme::None,
         s => panic!("esquema {s}"),
     }
 }
@@ -441,7 +446,7 @@ fn mbr_view_matches_every_manifest() {
     }
     assert_eq!(
         (checked, anomalies, partitions),
-        (38, 26, 25),
+        (41, 29, 25),
         "manifiestos, anomalías MBR y particiones MBR comprobados"
     );
 }
@@ -519,7 +524,7 @@ fn unreadable_sectors_are_never_interpreted() {
             ebr += 1;
         }
     }
-    assert_eq!((scenario, lba0, ebr), (2, 38, 4));
+    assert_eq!((scenario, lba0, ebr), (2, 41, 4));
 }
 
 #[test]
@@ -746,6 +751,21 @@ fn cli_partitions_json_follows_the_engine() {
                 m.name()
             );
         }
+        for (i, r) in expected_apm_partitions(&m).iter().enumerate() {
+            assert!(
+                json.contains(&format!(
+                    "{{\"number\":{},\"origin\":\"apm\",\"slot\":{},\"ebr_lba\":null,\"start_lba\":{},\"sectors\":{},\"end_lba\":{},\"type\":\"{}\",",
+                    i + 1,
+                    r.2,
+                    r.0,
+                    r.1,
+                    r.0 + r.1 - 1,
+                    r.3
+                )) && json.contains(&format!("\"name\":\"{}\",\"status\":{},", r.4, r.5)),
+                "{}: {json}",
+                m.name()
+            );
+        }
         for (code, lba, _, _) in expected_table_anomalies(&m) {
             let alt = match code.as_str() {
                 "mbr_outside_disk" => "mbr_partially_outside_disk",
@@ -945,6 +965,7 @@ fn table_norm(a: &Anomaly, shift: i64) -> Option<Norm> {
             )
         }
         Anomaly::UnreadableSector { lba } => ("unreadable_sector".into(), *lba as i64, None, None),
+        Anomaly::Apm(_) => (a.code().to_string(), a.lba()? as i64, None, None),
     };
     Some((code, lba, target, value))
 }
@@ -952,7 +973,7 @@ fn table_norm(a: &Anomaly, shift: i64) -> Option<Norm> {
 #[test]
 #[ignore = "requiere el corpus generado; lo ejecuta scripts/test.ps1"]
 fn partition_table_matches_every_manifest() {
-    let (mut checked, mut gpt_parts, mut opened, mut anomalies) = (0, 0, 0, 0);
+    let (mut checked, mut gpt_parts, mut opened, mut anomalies, mut apm_parts) = (0, 0, 0, 0, 0);
     for m in manifests() {
         let name = m.name().to_string();
         let dev = Arc::new(device(&m));
@@ -961,6 +982,7 @@ fn partition_table_matches_every_manifest() {
             "mbr" => Scheme::Mbr,
             "gpt" => Scheme::Gpt,
             "hybrid" => Scheme::Hybrid,
+            "apm" => Scheme::Apm,
             _ => Scheme::None,
         };
         assert_eq!(t.scheme, scheme, "{name}: esquema");
@@ -976,10 +998,11 @@ fn partition_table_matches_every_manifest() {
                     p.active,
                     matches!(p.origin, Origin::Logical { .. }),
                 )),
-                PartitionKind::Gpt(_) => None,
+                PartitionKind::Gpt(_) | PartitionKind::Apm(_) => None,
             })
             .collect();
         assert_eq!(mbr_rows, expected_partitions(&m), "{name}: particiones MBR");
+        apm_parts += check_apm(&m, &t, dev.clone());
         let gpt_rows: Vec<GptRow> = t
             .partitions
             .iter()
@@ -1073,10 +1096,108 @@ fn partition_table_matches_every_manifest() {
         checked += 1;
     }
     assert_eq!(
-        (checked, gpt_parts, opened, anomalies),
-        (38, 21, 21, 41),
-        "manifiestos, particiones GPT, particiones GPT abiertas y anomalías comparadas"
+        (checked, gpt_parts, opened, anomalies, apm_parts),
+        (41, 21, 21, 47, 11),
+        "manifiestos, particiones GPT, particiones GPT abiertas, anomalías comparadas y particiones APM"
     );
+}
+
+/// Partición APM esperada: `(inicio, bloques, entrada, tipo, nombre, estado, marcador)`.
+type ApmRow = (u64, u64, u32, String, String, u32, String);
+
+fn expected_apm_partitions(m: &Manifest) -> Vec<ApmRow> {
+    if m.str("scheme") != "apm" {
+        return Vec::new();
+    }
+    let s = |t: &Table, k: &str| match t.get(k) {
+        Some(Value::Str(v)) => v.clone(),
+        o => panic!("{k}: {o:?}"),
+    };
+    m.table("partitions")
+        .iter()
+        .map(|t| {
+            (
+                int(t, "start_lba").unwrap() as u64,
+                int(t, "sectors").unwrap() as u64,
+                int(t, "apm_index").unwrap() as u32,
+                s(t, "apm_type"),
+                s(t, "apm_name"),
+                int(t, "apm_status").unwrap() as u32,
+                s(t, "marker"),
+            )
+        })
+        .collect()
+}
+
+/// Particiones APM de la tabla frente al manifiesto (entrada, tipo, nombre y estado); las que
+/// empiezan dentro se abren y empiezan por su marcador. Devuelve cuántas se comprobaron.
+fn check_apm(m: &Manifest, t: &mr_api::PartitionTable, dev: Arc<MemDevice>) -> usize {
+    let name = m.name();
+    let want = expected_apm_partitions(m);
+    if want.is_empty() {
+        assert!(t.apm.is_none(), "{name}: APM inesperado");
+        return 0;
+    }
+    let a = t.apm.as_ref().unwrap_or_else(|| panic!("{name}: sin APM"));
+    assert_eq!(
+        (
+            u64::from(a.block_size),
+            a.disk_blocks,
+            u64::from(a.map_entries)
+        ),
+        (
+            m.int("apm_block_size") as u64,
+            m.int("apm_disk_blocks") as u64,
+            m.int("apm_map_entries") as u64
+        ),
+        "{name}: mapa APM"
+    );
+    assert_eq!(
+        t.sector_size, a.block_size,
+        "{name}: LBA en bloques del mapa"
+    );
+    let got: Vec<ApmRow> = t
+        .partitions
+        .iter()
+        .map(|p| {
+            let (Origin::Apm { index }, PartitionKind::Apm(kind)) = (p.origin, p.kind) else {
+                panic!("{name}: partición no APM {p:?}")
+            };
+            (
+                p.start_lba,
+                p.sector_count,
+                index,
+                kind.text(),
+                p.name.clone().unwrap(),
+                t.apm_entry(p).unwrap().status,
+                String::new(),
+            )
+        })
+        .collect();
+    let strip = |v: &[ApmRow]| -> Vec<ApmRow> {
+        v.iter()
+            .map(|r| (r.0, r.1, r.2, r.3.clone(), r.4.clone(), r.5, String::new()))
+            .collect()
+    };
+    assert_eq!(strip(&got), strip(&want), "{name}: particiones APM");
+    let src = mr_api::source_from_device(dev.clone(), "corpus");
+    let total = dev.sector_count();
+    for (i, row) in want.iter().enumerate() {
+        let opened = mr_api::open_partition(&src, t, i, false);
+        if row.0 >= total {
+            assert!(opened.is_err(), "{name}: partición que empieza fuera");
+            continue;
+        }
+        let part = opened.unwrap();
+        assert!(part.info().description.contains("APM "), "{name}");
+        let first = mr_api::read_sectors(part.as_ref(), 0, 1).unwrap();
+        assert_eq!(
+            &first[..row.6.len()],
+            row.6.as_bytes(),
+            "{name}: marcador APM {i}"
+        );
+    }
+    want.len()
 }
 
 /// Tabla construida a partir de un recorrido MBR (para abrir sus particiones en las pruebas).
@@ -1087,5 +1208,6 @@ fn as_table(scan: &mbr::MbrScan, sector_size: u32) -> mr_api::PartitionTable {
         partitions: scan.partitions.clone(),
         anomalies: scan.anomalies.clone(),
         gpt: None,
+        apm: None,
     }
 }

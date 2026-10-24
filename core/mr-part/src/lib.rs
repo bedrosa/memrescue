@@ -8,10 +8,12 @@
 //!   lista de anomalías encontradas, para servir igual en discos sanos y dañados.
 //! - Aritmética comprobada (`checked_*`) en todos los cálculos de LBA, límites explícitos de
 //!   enlaces, entradas y memoria, y ningún pánico con datos del origen.
-//! - Basados en especificaciones públicas (UEFI para GPT, disposición clásica de MBR/EBR) y en
+//! - Basados en especificaciones públicas (UEFI para GPT, disposición clásica de MBR/EBR, Apple
+//!   para APM) y en
 //!   `docs/investigacion/dmde-fase2/INV-05-mbr-y-busqueda-de-particiones.md`; plan en
 //!   `docs/PLAN_M2.md`.
 
+pub mod apm;
 pub mod gpt;
 pub mod mbr;
 pub mod search;
@@ -31,6 +33,8 @@ pub enum Scheme {
     Gpt,
     /// MBR híbrido: GPT más entradas MBR que describen particiones reales.
     Hybrid,
+    /// Apple Partition Map (#17).
+    Apm,
 }
 
 /// De dónde procede una partición.
@@ -42,6 +46,8 @@ pub enum Origin {
     Logical { ebr_lba: u64, slot: u8 },
     /// Entrada `index` de la tabla de entradas GPT.
     Gpt { index: u32 },
+    /// Entrada `index` (desde 1, número de bloque) del Apple Partition Map.
+    Apm { index: u32 },
 }
 
 /// Tipo declarado de la partición.
@@ -51,6 +57,8 @@ pub enum PartitionKind {
     Mbr(u8),
     /// GUID de tipo de una entrada GPT, en el orden de bytes del disco.
     Gpt([u8; 16]),
+    /// Tipo (`pmParType`) de una entrada APM.
+    Apm(apm::ApmType),
 }
 
 /// Anomalía encontrada al leer una tabla. Las específicas de cada formato van en su módulo.
@@ -62,6 +70,7 @@ pub enum Anomaly {
     },
     Mbr(mbr::MbrAnomaly),
     Gpt(gpt::GptAnomaly),
+    Apm(apm::ApmAnomaly),
 }
 
 /// Una partición declarada por una tabla.
@@ -72,7 +81,7 @@ pub struct Partition {
     pub start_lba: u64,
     pub sector_count: u64,
     pub kind: PartitionKind,
-    /// Nombre (GPT); `None` en MBR.
+    /// Nombre (GPT o APM); `None` en MBR.
     pub name: Option<String>,
     /// Indicador de arranque (MBR) o atributo equivalente.
     pub active: bool,
@@ -92,6 +101,9 @@ pub struct PartitionTable {
     /// Lectura GPT completa (copias, copia elegida, desplazamiento, GUID únicos y atributos) cuando
     /// el esquema es GPT o híbrido; `None` en los demás.
     pub gpt: Option<gpt::GptRead>,
+    /// Lectura APM completa (DDM, tamaño de bloque, estado de cada entrada) cuando el esquema es
+    /// `Apm`; `None` en los demás.
+    pub apm: Option<apm::ApmRead>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -122,6 +134,7 @@ impl Anomaly {
             Anomaly::UnreadableSector { lba } => Some(*lba),
             Anomaly::Mbr(m) => Some(m.lba()),
             Anomaly::Gpt(g) => table::gpt_lba(g),
+            Anomaly::Apm(a) => a.lba(),
         }
     }
 
@@ -131,6 +144,7 @@ impl Anomaly {
             Anomaly::UnreadableSector { .. } => "unreadable_sector",
             Anomaly::Mbr(m) => m.code(),
             Anomaly::Gpt(g) => table::gpt_code(g),
+            Anomaly::Apm(a) => a.code(),
         }
     }
 
@@ -139,6 +153,7 @@ impl Anomaly {
             Anomaly::UnreadableSector { .. } => Severity::Suspicious,
             Anomaly::Mbr(m) => m.severity(),
             Anomaly::Gpt(g) => table::gpt_severity(g),
+            Anomaly::Apm(a) => a.severity(),
         }
     }
 
@@ -157,6 +172,7 @@ impl Anomaly {
         match self {
             Anomaly::Mbr(m) => m.value(),
             Anomaly::Gpt(g) => table::gpt_value(g),
+            Anomaly::Apm(a) => a.value(),
             _ => None,
         }
     }
@@ -176,6 +192,7 @@ impl std::fmt::Display for Anomaly {
             ),
             Anomaly::Mbr(m) => m.fmt(f),
             Anomaly::Gpt(g) => g.fmt(f),
+            Anomaly::Apm(a) => a.fmt(f),
         }
     }
 }
@@ -186,6 +203,7 @@ impl PartitionKind {
         match self {
             PartitionKind::Mbr(t) => mbr::type_name(*t),
             PartitionKind::Gpt(g) => gpt_type_name(g),
+            PartitionKind::Apm(t) => apm::type_name(t),
         }
     }
 }
@@ -218,6 +236,18 @@ impl PartitionTable {
             .partitions
             .iter()
             .find(|g| g.partition.origin == Origin::Gpt { index })
+    }
+
+    /// Datos APM propios de una partición (estado y área de datos).
+    pub fn apm_entry(&self, p: &Partition) -> Option<&apm::ApmPartition> {
+        let Origin::Apm { index } = p.origin else {
+            return None;
+        };
+        self.apm
+            .as_ref()?
+            .partitions
+            .iter()
+            .find(|a| a.partition.origin == Origin::Apm { index })
     }
 
     /// Desplazamiento de la imagen detectado por la GPT (`LBA disco = LBA imagen + shift`); 0 si no

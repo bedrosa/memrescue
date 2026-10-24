@@ -31,6 +31,10 @@ def d(v: int) -> bytes:
     return struct.pack("<I", v)
 
 
+def be(v: int) -> bytes:
+    return struct.pack(">I", v)
+
+
 # (imagen, [(desplazamiento en bytes, nuevos bytes)], descripción)
 IMAGE_MUTATIONS = [
     ("gpt_basic", [(S + 16, b"\x00\x00\x00\x00")], "CRC de la cabecera GPT primaria"),
@@ -81,6 +85,17 @@ IMAGE_MUTATIONS = [
     ("superfloppy", [(0x1FE, b"\x00\x00")], "firma del arranque NTFS en LBA 0"),
     ("random_disk", [(0x1BE + 16 * i, b"\x00") for i in range(4)], "datos aleatorios convertidos en tabla"),
     ("fake_mbr_in_data", [(2112 * S + 0x1FE, b"\x00\x00")], "señuelo sin aspecto de tabla"),
+    # Apple Partition Map
+    ("apm_basic", [(0, b"EX")], "firma ER del Driver Descriptor Map"),
+    ("apm_basic", [(2, b"\x08\x00")], "tamaño de bloque del DDM (2048)"),
+    ("apm_basic", [(4, be(4000))], "número de bloques del DDM"),
+    ("apm_basic", [(2 * S + 8, be(65))], "inicio de la entrada APM 2"),
+    ("apm_basic", [(3 * S + 48, b"Apple_HFS\x00")], "tipo de la entrada APM 3"),
+    ("apm_basic", [(4 * S + 88, be(0))], "estado de la entrada APM 4"),
+    ("apm_basic", [(64 * S, b"XXXX")], "marcador de la partición APM H1"),
+    ("apm_entry_damaged", [(3 * S, b"PM")], "firma de la entrada dañada restaurada"),
+    ("apm_entry_outside", [(4 * S + 8, be(3136))], "entrada que empezaba fuera devuelta al disco"),
+    ("apm_entry_outside", [(3 * S + 12, be(1024)), (3 * S + 84, be(1024))], "entrada que terminaba fuera recortada"),
 ]
 
 # (imagen, texto original, texto nuevo, descripción): la verdad esperada del manifiesto es falsa.
@@ -95,6 +110,11 @@ MANIFEST_MUTATIONS = [
     ("hybrid_mbr_gpt", 'gpt_label = "L1"', 'gpt_label = "D1"', "correspondencia del MBR híbrido"),
     ("protective_mbr_only", 'code = "gpt_backup_header_missing"', 'code = "gpt_backup_header_crc"', "anomalía GPT"),
     ("lost_fat32_chs", "suggested_mbr_type = 12", "suggested_mbr_type = 11", "tipo MBR sugerido"),
+    ("apm_basic", 'apm_type = "Apple_Free"', 'apm_type = "Apple_HFS"', "tipo APM"),
+    ("apm_basic", "apm_block_size = 512", "apm_block_size = 2048", "tamaño de bloque APM"),
+    ("apm_entry_damaged", "code = \"apm_entry_signature\"\nlba = 3", "code = \"apm_entry_signature\"\nlba = 2",
+     "entrada APM dañada"),
+    ("apm_entry_outside", 'apm_name = "MR-DATA"', 'apm_name = "MR-DATA2"', "nombre APM"),
 ]
 
 

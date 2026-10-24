@@ -133,9 +133,10 @@ registro que orígenes y tareas). Las estructuras de salida son **versionadas**:
 | Función | Descripción |
 |---|---|
 | `mr_source_partitions(source, out_table)` | Lee el MBR y su cadena de EBR y, con MBR protector o híbrido (o sin MBR utilizable pero con firma GPT), la GPT con su copia de respaldo (ADR-022 y adenda); devuelve el handle de la tabla. Lectura tolerante: un sector de tabla ilegible es la anomalía `MR_ANOMALY_UNREADABLE_SECTOR`, nunca un error ni datos |
-| `mr_partitions_info(table, out)` | `mr_partition_table_info`: `scheme` (`MR_SCHEME_NONE` 0, `MBR` 1, `GPT` 2, `HYBRID` 3), `sector_size` (unidades de las LBA), `confidence` del conjunto (`MR_CONFIDENCE_VALID` 1, `VALID_WITH_FIXES` 2, `SUSPICIOUS` 3, `INVALID` 4), nº de particiones y de anomalías de la tabla; GPT: `gpt_selected` (`MR_GPT_NONE` 0, `PRIMARY` 1, `BACKUP` 2 = copia de respaldo en uso), `gpt_flags` (`MR_GPT_PRESENT`), `shift` (con signo: LBA disco = LBA imagen + shift), `trailing_sectors_missing`, `gpt_sector_size` y `disk_guid` |
-| `mr_partition_get(table, index, out)` | `mr_partition_info`: `origin` (`MR_ORIGIN_PRIMARY` 1, `LOGICAL` 2, `GPT` 3), `slot`, `mbr_type`, `ebr_lba`, `start_lba`, `sector_count`, `active`, `confidence`, nº de anomalías propias `gpt_type`, `unique_guid` (GUID en el orden del disco; ceros en MBR) y `attributes`. Orden: primarias y lógicas en orden de cadena (en un híbrido, las entradas MBR distintas de 0xEE) y después las GPT, que llevan LBA **del disco** |
-| `mr_partition_name(table, index, buf, cap, out_len)` | Nombre GPT (cadena vacía en MBR) |
+| `mr_partitions_info(table, out)` | `mr_partition_table_info`: `scheme` (`MR_SCHEME_NONE` 0, `MBR` 1, `GPT` 2, `HYBRID` 3, `APM` 4), `sector_size` (unidades de las LBA), `confidence` del conjunto (`MR_CONFIDENCE_VALID` 1, `VALID_WITH_FIXES` 2, `SUSPICIOUS` 3, `INVALID` 4), nº de particiones y de anomalías de la tabla; GPT: `gpt_selected` (`MR_GPT_NONE` 0, `PRIMARY` 1, `BACKUP` 2 = copia de respaldo en uso), `gpt_flags` (`MR_GPT_PRESENT`), `shift` (con signo: LBA disco = LBA imagen + shift), `trailing_sectors_missing`, `gpt_sector_size` y `disk_guid` |
+| `mr_partition_get(table, index, out)` | `mr_partition_info`: `origin` (`MR_ORIGIN_PRIMARY` 1, `LOGICAL` 2, `GPT` 3, `APM` 4), `slot` (en APM, número de entrada desde 1), `mbr_type`, `ebr_lba`, `start_lba`, `sector_count`, `active`, `confidence`, nº de anomalías propias `gpt_type`, `unique_guid` (GUID en el orden del disco; ceros en MBR y APM) y `attributes` (en APM, `pmPartStatus`). Orden: primarias y lógicas en orden de cadena (en un híbrido, las entradas MBR distintas de 0xEE) y después las GPT, que llevan LBA **del disco** |
+| `mr_partition_name(table, index, buf, cap, out_len)` | Nombre GPT o APM (cadena vacía en MBR) |
+| `mr_partition_apm_type(table, index, buf, cap, out_len)` | Tipo APM tal como está en el mapa (`pmParType`, p. ej. `Apple_HFS`); cadena vacía si la partición no es APM (#17) |
 | `mr_partition_type_name(table, index, buf, cap, out_len)` | Nombre legible del tipo MBR o del GUID de tipo GPT (lista propia de identificadores públicos; cadena vacía si es desconocido) |
 | `mr_partition_anomaly(table, partition_index, anomaly_index, out)` | `mr_partition_anomaly`: `code` (`MR_ANOMALY_*`, numérico estable), `severity` (`MR_SEVERITY_NOTICE` 1, `SUSPICIOUS` 2, `INVALID` 3, `COMPENSATED` 4 = daño compensado por la otra copia GPT), `lba` (posición en la imagen), `target_lba` y `value` con `flags` que indican si tienen significado (`MR_ANOMALY_VALUE_SIGNED`: `value` es `int64_t`, desplazamiento de `image_shifted`). `partition_index = MR_PARTITION_TABLE` (0xFFFFFFFF) para las anomalías de la tabla |
 | `mr_partition_anomaly_text(table, partition_index, anomaly_index, buf, cap, out_len)` | `"<código estable>\n<descripción en español>"` (p. ej. `ebr_loop`) |
@@ -147,9 +148,9 @@ registro que orígenes y tareas). Las estructuras de salida son **versionadas**:
 (y una tabla no es un origen ni una tarea). Códigos de anomalía: 1 sector ilegible; 100–121 MBR/EBR
 (lista en la cabecera; los códigos textuales coinciden con los del manifiesto del corpus cuando existe
 equivalente; 122 `hybrid_mbr_mismatch`); 201-241 GPT (las de una copia: impar la primaria, par la de respaldo;
-`image_shifted` = 232). En C#: `Source.ReadPartitions()` devuelve
+`image_shifted` = 232); 400-414 Apple Partition Map (#17, `formatos/apm.md`; `lba` = sector del origen del bloque afectado, `value` = número de entrada salvo en 401-407 y 414). Con `MR_SCHEME_APM` las LBA están en bloques del mapa (`sector_size`); si difiere del sector del origen, abrir una partición se rechaza. En C#: `Source.ReadPartitions()` devuelve
 `PartitionTable` (`EngineHandle`: listas materializadas de `PartitionEntry` y `PartitionAnomaly`, `HasGpt`,
-`GptSelected`, `Shift`, `DiskGuid`, `OpenPartition(index, applyShift)`).
+`GptSelected`, `Shift`, `DiskGuid`, `OpenPartition(index, applyShift)`; `PartitionScheme.Apm`, `PartitionOrigin.Apm` y `PartitionEntry.ApmType`).
 
 ## Búsqueda exprés de particiones perdidas (ampliación compatible de la ABI 3, issue #15, ADR-023)
 

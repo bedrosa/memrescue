@@ -40,7 +40,8 @@ public sealed class CorpusTests
 
     /// <summary>
     /// (LBA de la imagen, marcador) de cada <c>[[partitions]]</c>. En una imagen desplazada el marcador
-    /// está en <c>marker_lba</c> (coordenadas de la imagen) en vez de en <c>start_lba</c>.
+    /// está en <c>marker_lba</c> (coordenadas de la imagen) en vez de en <c>start_lba</c>. Un marcador
+    /// vacío (mapa APM o entrada fuera del disco) no se comprueba.
     /// </summary>
     private static List<(ulong Lba, string Marker)> Markers(string manifest)
     {
@@ -68,7 +69,11 @@ public sealed class CorpusTests
             }
             else if (l.StartsWith("marker = ", StringComparison.Ordinal) && lba is { } v)
             {
-                res.Add((v, l["marker = ".Length..].Trim('"')));
+                var text = l["marker = ".Length..].Trim('"');
+                if (text.Length > 0)
+                {
+                    res.Add((v, text));
+                }
                 lba = null;
             }
         }

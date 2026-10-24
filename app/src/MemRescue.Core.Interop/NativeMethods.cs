@@ -129,6 +129,9 @@ internal static partial class NativeMethods
     internal static partial int mr_partition_name(ulong table, uint index, byte[]? buf, nuint cap, out nuint outLen);
 
     [LibraryImport(Dll)]
+    internal static partial int mr_partition_apm_type(ulong table, uint index, byte[]? buf, nuint cap, out nuint outLen);
+
+    [LibraryImport(Dll)]
     internal static partial int mr_partitions_free(ulong table);
 
     [LibraryImport(Dll)]

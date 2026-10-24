@@ -464,6 +464,7 @@ fn origin_text(o: &Origin) -> String {
             )
         }
         Origin::Gpt { index } => format!("la entrada GPT {}", u64::from(index) + 1),
+        Origin::Apm { index } => format!("la entrada APM {index}"),
     }
 }
 
@@ -824,7 +825,7 @@ impl<D: BlockDevice + ?Sized> Walker<'_, D> {
     fn add_entry(&mut self, lba: u64, origin: Origin, e: RawEntry, extended: Option<(u64, u64)>) {
         let slot = match origin {
             Origin::Primary { slot } | Origin::Logical { slot, .. } => slot,
-            Origin::Gpt { .. } => 0,
+            Origin::Gpt { .. } | Origin::Apm { .. } => 0,
         };
         if e.sectors == 0 {
             self.push(MbrAnomaly::ZeroLength {

@@ -223,6 +223,7 @@ public sealed class PartitionTests : IDisposable
             "mbr" => PartitionScheme.Mbr,
             "hybrid" => PartitionScheme.Hybrid,
             "gpt" => PartitionScheme.Gpt,
+            "apm" => PartitionScheme.Apm,
             _ => PartitionScheme.None,
         }, t.Scheme);
 
@@ -234,7 +235,7 @@ public sealed class PartitionTests : IDisposable
             _ => [],
         };
         var gptExpected = scheme is "gpt" or "hybrid" ? Rows("partitions").ToList() : [];
-        var mbrGot = t.Partitions.Where(p => p.Origin != PartitionOrigin.Gpt).ToList();
+        var mbrGot = t.Partitions.Where(p => p.Origin is PartitionOrigin.Primary or PartitionOrigin.Logical).ToList();
         var gptGot = t.Partitions.Where(p => p.Origin == PartitionOrigin.Gpt).ToList();
         Assert.Equal(
             mbrExpected.Select(p => $"{p["start_lba"]}/{p["sectors"]}/{p["mbr_type"]}/{p["active"]}").ToList(),
@@ -243,6 +244,30 @@ public sealed class PartitionTests : IDisposable
             gptExpected.Select(p => $"{p["start_lba"]}/{p["sectors"]}/{p["gpt_type"]}/{p["gpt_name"]}/{p["unique_guid"]}").ToList(),
             gptGot.Select(p => $"{p.StartLba}/{p.SectorCount}/{p.GptType}/{p.Name}/{p.UniqueGuid}").ToList());
         Assert.True(t.Partitions.Take(mbrGot.Count).All(p => p.Origin != PartitionOrigin.Gpt), "las entradas MBR van primero");
+
+        // Apple Partition Map: entrada, tipo, nombre y estado; LBA en bloques del mapa.
+        var apmExpected = scheme == "apm" ? Rows("partitions").ToList() : [];
+        var apmGot = t.Partitions.Where(p => p.Origin == PartitionOrigin.Apm).ToList();
+        Assert.Equal(
+            apmExpected.Select(p => $"{p["start_lba"]}/{p["sectors"]}/{p["apm_index"]}/{p["apm_type"]}/{p["apm_name"]}/{p["apm_status"]}").ToList(),
+            apmGot.Select(p => $"{p.StartLba}/{p.SectorCount}/{p.Slot}/{p.ApmType}/{p.Name}/{p.Attributes}").ToList());
+        if (scheme == "apm")
+        {
+            Assert.Equal(uint.Parse(top["apm_block_size"]), t.SectorSize);
+            Assert.All(apmGot, p => Assert.StartsWith("APM ", p.OriginLabel, StringComparison.Ordinal));
+            Assert.Contains(apmGot, p => p.TypeLabel == "Apple_HFS (HFS / HFS+)");
+            foreach (var (p, row) in apmGot.Zip(apmExpected))
+            {
+                var m = row["marker"];
+                if (p.StartLba >= src.Info.SectorCount)
+                {
+                    Assert.Throws<EngineException>(() => t.OpenPartition(p.Index));
+                    continue;
+                }
+                using var part = t.OpenPartition(p.Index);
+                Assert.Equal(m, Encoding.ASCII.GetString(part.ReadSectors(0, 1), 0, m.Length));
+            }
+        }
 
         if (top.TryGetValue("gpt_selected", out var selected))
         {
@@ -268,7 +293,8 @@ public sealed class PartitionTests : IDisposable
             "gpt_primary_header_missing", "gpt_backup_header_missing", "gpt_primary_header_outside_image",
             "gpt_backup_header_outside_image", "gpt_primary_header_crc", "gpt_backup_header_crc",
             "gpt_primary_entries_crc", "gpt_backup_entries_crc", "gpt_primary_entries_outside_image",
-            "gpt_backup_entries_outside_image",
+            "gpt_backup_entries_outside_image", "apm_entry_signature", "apm_entry_outside_disk",
+            "apm_entry_partially_outside_disk",
         ];
         var want = Rows("anomalies")
             .Where(a => a["code"] != "mbr_displaced" && !(a["code"] == "image_shifted" && scheme == "none"))

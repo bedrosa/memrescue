@@ -65,6 +65,8 @@ pub const MR_SCHEME_NONE: u32 = 0;
 pub const MR_SCHEME_MBR: u32 = 1;
 pub const MR_SCHEME_GPT: u32 = 2;
 pub const MR_SCHEME_HYBRID: u32 = 3;
+/// Apple Partition Map (#17): LBA en bloques del mapa (`sector_size`).
+pub const MR_SCHEME_APM: u32 = 4;
 /// Confianza de tablas y particiones.
 pub const MR_CONFIDENCE_VALID: u32 = 1;
 pub const MR_CONFIDENCE_VALID_WITH_FIXES: u32 = 2;
@@ -88,6 +90,8 @@ pub const MR_PARTITION_OPEN_APPLY_SHIFT: u32 = 1;
 pub const MR_ORIGIN_PRIMARY: u32 = 1;
 pub const MR_ORIGIN_LOGICAL: u32 = 2;
 pub const MR_ORIGIN_GPT: u32 = 3;
+/// Entrada del Apple Partition Map (`slot` = número de entrada desde 1).
+pub const MR_ORIGIN_APM: u32 = 4;
 /// `partition_index` de las anomalías de la tabla (no de una partición).
 pub const MR_PARTITION_TABLE: u32 = u32::MAX;
 /// `mr_partition_anomaly.flags`: `target_lba` / `value` tienen significado.
@@ -132,9 +136,9 @@ pub struct MrPartitionInfo {
     pub struct_size: u32,
     /// `MR_ORIGIN_*`.
     pub origin: u32,
-    /// Entrada en su tabla (0 a 3) o índice GPT.
+    /// Entrada en su tabla (0 a 3), índice GPT o número de entrada APM (desde 1).
     pub slot: u32,
-    /// Tipo MBR (0 en GPT).
+    /// Tipo MBR (0 en GPT y APM).
     pub mbr_type: u32,
     /// EBR de una lógica (0 en las demás).
     pub ebr_lba: u64,
@@ -151,7 +155,7 @@ pub struct MrPartitionInfo {
     pub gpt_type: [u8; 16],
     /// GUID único GPT en el orden del disco (ceros en MBR).
     pub unique_guid: [u8; 16],
-    /// Atributos GPT de 64 bits (0 en MBR).
+    /// Atributos GPT de 64 bits; en APM, `pmPartStatus` (0 en MBR).
     pub attributes: u64,
 }
 
@@ -203,6 +207,29 @@ pub fn anomaly_code(a: &Anomaly) -> u32 {
             M::HybridMismatch { .. } => 122,
         },
         Anomaly::Gpt(g) => gpt_anomaly_code(g),
+        Anomaly::Apm(a) => apm_anomaly_code(a),
+    }
+}
+
+/// Códigos 400 a 414 (bloque reservado a APM, #17).
+fn apm_anomaly_code(a: &mr_part::apm::ApmAnomaly) -> u32 {
+    use mr_part::apm::ApmAnomaly as A;
+    match a {
+        A::DdmMissing => 400,
+        A::BlockSizeInvalid { .. } => 401,
+        A::BlockSizeMismatch { .. } => 402,
+        A::DiskSizeMismatch { .. } => 403,
+        A::MapMissing { .. } => 404,
+        A::MapCountInvalid { .. } => 405,
+        A::MapCountMismatch { .. } => 406,
+        A::MapOutsideImage { .. } => 407,
+        A::EntrySignature { .. } => 408,
+        A::EntryZeroLength { .. } => 409,
+        A::EntryOutsideDisk { .. } => 410,
+        A::EntryPartiallyOutsideDisk { .. } => 411,
+        A::EntryOverlap { .. } => 412,
+        A::EntryDataOutside { .. } => 413,
+        A::SectorSizeMismatch { .. } => 414,
     }
 }
 
@@ -267,6 +294,7 @@ fn scheme_code(s: Scheme) -> u32 {
         Scheme::Mbr => MR_SCHEME_MBR,
         Scheme::Gpt => MR_SCHEME_GPT,
         Scheme::Hybrid => MR_SCHEME_HYBRID,
+        Scheme::Apm => MR_SCHEME_APM,
     }
 }
 
@@ -1635,10 +1663,12 @@ pub unsafe extern "C" fn mr_partition_get(
                 Origin::Primary { slot } => (MR_ORIGIN_PRIMARY, u32::from(slot), 0),
                 Origin::Logical { ebr_lba, slot } => (MR_ORIGIN_LOGICAL, u32::from(slot), ebr_lba),
                 Origin::Gpt { index } => (MR_ORIGIN_GPT, index, 0),
+                Origin::Apm { index } => (MR_ORIGIN_APM, index, 0),
             };
             let (mbr_type, gpt_type) = match p.kind {
                 PartitionKind::Mbr(t) => (u32::from(t), [0u8; 16]),
                 PartitionKind::Gpt(g) => (0, g),
+                PartitionKind::Apm(_) => (0, [0u8; 16]),
             };
             let extra = t.gpt_entry(p);
             Some(MrPartitionInfo {
@@ -1655,7 +1685,11 @@ pub unsafe extern "C" fn mr_partition_get(
                 reserved: 0,
                 gpt_type,
                 unique_guid: extra.map_or([0; 16], |e| e.unique_guid),
-                attributes: extra.map_or(0, |e| e.attributes),
+                // En APM, `pmPartStatus`.
+                attributes: extra.map_or_else(
+                    || t.apm_entry(p).map_or(0, |a| u64::from(a.status)),
+                    |e| e.attributes,
+                ),
             })
         });
         match r {
@@ -1694,7 +1728,7 @@ pub unsafe extern "C" fn mr_partition_type_name(
     })
 }
 
-/// Nombre GPT de la partición (cadena vacía en MBR).
+/// Nombre GPT o APM de la partición (cadena vacía en MBR).
 ///
 /// # Safety
 /// Ver contrato de cadenas de salida.
@@ -1715,6 +1749,35 @@ pub unsafe extern "C" fn mr_partition_name(
         match r {
             // SAFETY: contrato del llamador.
             Ok(Some(name)) => unsafe { write_str(&name, buf, cap, out_len) },
+            Ok(None) => index_error("partición", u64::from(index)),
+            Err(c) => c,
+        }
+    })
+}
+
+/// Tipo APM de la partición tal como está en el mapa (`pmParType`, p. ej. `Apple_HFS`); cadena
+/// vacía si no es una entrada APM (#17).
+///
+/// # Safety
+/// Ver contrato de cadenas de salida.
+#[no_mangle]
+pub unsafe extern "C" fn mr_partition_apm_type(
+    table_h: u64,
+    index: u32,
+    buf: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> i32 {
+    guard(|| {
+        let r = with_partitions(table_h, |_, t| {
+            t.partitions.get(index as usize).map(|p| match p.kind {
+                PartitionKind::Apm(k) => k.text(),
+                _ => String::new(),
+            })
+        });
+        match r {
+            // SAFETY: contrato del llamador.
+            Ok(Some(kind)) => unsafe { write_str(&kind, buf, cap, out_len) },
             Ok(None) => index_error("partición", u64::from(index)),
             Err(c) => c,
         }

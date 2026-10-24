@@ -2,7 +2,7 @@
 # Esquema en docs/PRUEBAS.md (§1.1). Las LBA de [[partitions]], de la GPT y hidden_sectors son las
 # declaradas (disco original); las demás, de la imagen: LBA imagen = LBA disco - leading_sectors_missing.
 schema_version = 2
-generator_version = 2
+generator_version = 3
 name = "mbr_basic"
 file = "mbr_basic.img"
 scenario = "MBR sano: 2 primarias (una activa) y extendida 0x0F con cadena de 2 EBR"
