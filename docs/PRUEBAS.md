@@ -33,9 +33,9 @@ son de la **imagen**: `LBA imagen = LBA disco - leading_sectors_missing`.
 
 | Clave | Significado |
 |---|---|
-| `schema_version`, `generator_version` | Versión del esquema (2) y del generador |
+| `schema_version`, `generator_version` | Versión del esquema (2) y del generador (3 desde #17: añade las imágenes APM sin cambiar ningún byte de las anteriores) |
 | `name`, `file`, `scenario` | Identificador, fichero `.img` y descripción del escenario |
-| `scheme` | Lo que hay en LBA 0 y la GPT: `mbr`, `gpt` (incluye MBR protector), `hybrid` o `none` |
+| `scheme` | Lo que hay en LBA 0 y la GPT: `mbr`, `gpt` (incluye MBR protector), `hybrid`, `apm` (Apple Partition Map) o `none` |
 | `sector_size`, `total_sectors`, `size_bytes`, `sha256` | Geometría de la imagen y huella determinista |
 | `leading_sectors_missing` | Sectores del disco que faltan al inicio (negativo: sectores añadidos) |
 | `trailing_sectors_missing` | Sectores del disco que faltan al final |
@@ -48,13 +48,18 @@ son de la **imagen**: `LBA imagen = LBA disco - leading_sectors_missing`.
 | `gpt_selected` | Copia que debe usarse según UEFI: `primary`, `backup` o `none` |
 | `unreadable_lbas` | Sectores que la prueba debe simular ilegibles (`FaultyDevice`); contienen un relleno que imita una firma |
 | `decoy_lbas` | Sectores con aspecto de tabla dentro de datos, que no deben interpretarse |
+| `apm_block_size`, `apm_disk_blocks`, `apm_map_entries` | APM: tamaño de bloque del mapa (en el que están las LBA de `[[partitions]]`), bloques del disco y `pmMapBlkCnt` |
 
 Tablas:
 
 - `[[partitions]]`: particiones que debe devolver el analizador de la tabla (MBR: primarias y luego
   lógicas en orden de cadena; GPT/híbrido: entradas de la copia elegida). Claves `label`, `start_lba`,
   `sectors`, `end_lba`; MBR: `mbr_type`, `active`, `logical`; GPT: `gpt_type`, `gpt_name`,
-  `unique_guid`; `marker_lba` (si la imagen está desplazada) y `marker` (texto en el primer sector).
+  `unique_guid`; APM (entradas con firma `PM` en orden de mapa, también `Apple_partition_map` y
+  `Apple_Free`): `apm_index` (número de entrada desde 1), `apm_type`, `apm_name`, `apm_status`
+  (`pmPartStatus`); `marker_lba` (si la imagen está desplazada) y `marker` (texto en el primer sector;
+  vacío si no se escribe: la entrada del propio mapa APM, cuyo primer bloque es la entrada 1, y las
+  entradas que empiezan fuera del disco).
 - `[[hybrid_mbr_entries]]`: entradas del MBR híbrido (`index`, `mbr_type`, `active`, `start_lba`,
   `sectors`, `gpt_label` de la partición GPT que reflejan, vacío para 0xEE).
 - `[[anomalies]]`: conjunto **exacto** de anomalías (`code`, `lba`; opcionales `target_lba`, `value`,
@@ -65,7 +70,10 @@ Tablas:
   declarado), `gpt_{primary,backup}_header_{crc,missing,outside_image}`,
   `gpt_{primary,backup}_entries_{crc,outside_image}`, `gpt_usable_range_outside_image` (`lba` =
   cabecera elegida), `image_shifted` (`lba` = posición en la imagen de la LBA 0 del disco, `value` =
-  `leading_sectors_missing`), `mbr_displaced` (MBR encontrado en `lba`) y `superfloppy` (volumen en LBA 0).
+  `leading_sectors_missing`), `mbr_displaced` (MBR encontrado en `lba`), `superfloppy` (volumen en LBA 0)
+  y, en APM (`lba` = sector de la entrada, `value` = número de entrada), `apm_entry_signature` (entrada
+  sin firma `PM`, no se lista), `apm_entry_outside_disk` y `apm_entry_partially_outside_disk`. Una
+  imagen APM lleva también `mbr_missing`: su bloque 0 es el Driver Descriptor Map.
 - `[[found_volumes]]`: volúmenes que debe encontrar la búsqueda de particiones perdidas: `fs` (`ntfs`,
   `fat32`, `exfat`), `start_lba`, `sectors`, `end_lba`, `hidden_sectors` (inicio declarado por el FS),
   `boot_lba`, `backup_boot_lba`, `primary_boot` / `backup_boot` (`valid`, `damaged`, `unreadable`,
@@ -301,10 +309,10 @@ de higiene del repositorio (`tools/check_repo_hygiene.py`: rutas personales, cor
 material excluido, carácter U+2014 y binarios reproducibles), que también es un paso de `test.ps1`. Las
 pruebas de interfaz se lanzan a demanda con el workflow `UI tests`.
 
-Corpus actual (`tests/corpus/manifests`, imágenes en `tests/corpus/generated`, no versionadas; 38
-imágenes, unos 207 MiB, generadas en menos de 1 s). Esquema del manifiesto en §1.1. Todo es sintético y
-se construye solo a partir de especificaciones públicas (UEFI, MBR/EBR clásico, Microsoft FAT32 y exFAT,
-estructura pública del arranque NTFS).
+Corpus actual (`tests/corpus/manifests`, imágenes en `tests/corpus/generated`, no versionadas; 41
+imágenes, unos 213 MiB, generadas en menos de 1 s). Esquema del manifiesto en §1.1. Todo es sintético y
+se construye solo a partir de especificaciones públicas (UEFI, MBR/EBR clásico, Apple «Inside Macintosh:
+Devices» para el Apple Partition Map, Microsoft FAT32 y exFAT, estructura pública del arranque NTFS).
 
 | Imagen | Tamaño | Contenido | Resultado esperado |
 |---|---|---|---|
@@ -346,6 +354,9 @@ estructura pública del arranque NTFS).
 | `image_shifted_neg` | 2 MiB | Faltan 2100 sectores: MBR y arranque NTFS perdidos | NTFS parcial (solo copia) y exFAT, desplazamiento 2100 |
 | `gpt_4kn_lost` | 4 MiB | 4Kn sin GPT ni MBR protector; NTFS y exFAT de 4096 B/sector | 2 volúmenes |
 | `superfloppy` | 1 MiB | NTFS en LBA 0, sin tabla | 1 volumen en LBA 0 (`superfloppy`) |
+| `apm_basic` | 2 MiB | APM sano: DDM de 512 B y mapa de 4 entradas (`Apple_partition_map`, 2 `Apple_HFS`, `Apple_Free`) | 4 particiones APM, solo `mbr_missing` |
+| `apm_entry_damaged` | 2 MiB | Como `apm_basic` con la entrada 3 sin la firma `PM` | 3 particiones, `apm_entry_signature` |
+| `apm_entry_outside` | 2 MiB | Entrada 3 que termina fuera del disco y entrada 4 que empieza fuera | 4 particiones, `apm_entry_partially_outside_disk` y `apm_entry_outside_disk` |
 
 Los nombres de los escenarios de volúmenes perdidos siguen INV-05b §9. Con 512 B/sector, un FAT32 válido
 según la especificación necesita al menos 65 525 clústeres, por eso las tres imágenes con FAT32 ocupan
@@ -356,8 +367,9 @@ las particiones, el conjunto exacto de anomalías, el estado de cada copia GPT y
 desplazamiento de la imagen (por la cabecera GPT de respaldo o por los sectores ocultos de los volúmenes)
 y los volúmenes, recorriendo **todos** los sectores en busca de arranques NTFS, FAT32 y exFAT coherentes
 (campos del BPB, número mínimo de clústeres de FAT32, FSInfo, sectores extendidos y suma de comprobación
-de exFAT) y agrupando cada arranque con su copia. Las pruebas negativas (`test_validator.py`) aplican 44
-corrupciones de imagen y 10 alteraciones de la verdad esperada del manifiesto, **recalculando el SHA-256**
+de exFAT) y agrupando cada arranque con su copia; en APM interpreta por su cuenta el Driver Descriptor
+Map y cada entrada big-endian. Las pruebas negativas (`test_validator.py`) aplican 54
+corrupciones de imagen y 14 alteraciones de la verdad esperada del manifiesto, **recalculando el SHA-256**
 de la copia del manifiesto para que la detección no dependa del hash, más 3 controles sin cambios que
 deben validar.
 
@@ -383,10 +395,10 @@ Tablas MBR/EBR (issue #12, ADR-022):
   la LBA 0 (disco sin particionar) y cabecera GPT en la LBA 0; sectores ilegibles (`FaultyDevice`) en la
   LBA 0 y en un EBR; tabla desplazada (`read_mbr_at`); sector de 4096 B; y un fuzzing acotado con
   semilla fija (3000 discos con tablas aleatorias: sin pánicos, sin bucles, salida acotada, < 60 s).
-- `cli/tests/corpus/partitions.rs` (6 pruebas, `--ignored`, dentro de `cli/tests/corpus.rs`): para los 38
+- `cli/tests/corpus/partitions.rs` (6 pruebas, `--ignored`, dentro de `cli/tests/corpus.rs`): para los 41
   manifiestos, el esquema visto desde el MBR, las particiones (inicio, tamaño, tipo, activa, lógica), la
   extendida, los EBR recorridos, el conjunto **exacto** de anomalías MBR (código, LBA, destino y valor) y
-  las particiones que señala cada una (26 anomalías y 25 particiones); señuelos no interpretados;
+  las particiones que señala cada una (29 anomalías y 25 particiones; en APM el MBR no ve tabla); señuelos no interpretados;
   `unreadable_lbas` con `FaultyDevice` (resultado idéntico), LBA 0 ilegible en todas las imágenes y
   último EBR ilegible; imágenes desplazadas con las coordenadas del manifiesto (cabecera GPT en la LBA 0,
   MBR desplazado leído en `mbr_displaced` con particiones que coinciden con `found_volumes` y empiezan por
@@ -399,10 +411,10 @@ Tablas MBR/EBR (issue #12, ADR-022):
   sintéticos: MBR protector con particiones GPT, híbrido con `hybrid_mbr_mismatch`, MBR clásico que
   ignora una GPT obsoleta, LBA 0 en blanco con GPT, imagen desplazada que solo se abre pidiéndolo y
   partición anterior al inicio de la imagen, nombres de tipo y códigos GPT) y en
-  `cli/tests/corpus/partitions.rs` `partition_table_matches_every_manifest` (los 38 manifiestos por
+  `cli/tests/corpus/partitions.rs` `partition_table_matches_every_manifest` (los 41 manifiestos por
   `read_partition_table`: esquema, particiones MBR y después GPT con tipo, nombre y GUID único, copia en
   uso, desplazamiento y el conjunto **exacto** de anomalías con código en el manifiesto, MBR y GPT
-  unidas, 41 anomalías; las 21 particiones GPT se abren, en las imágenes desplazadas solo con
+  unidas, 47 anomalías con las APM; las 21 particiones GPT se abren, en las imágenes desplazadas solo con
   `apply_shift`, y empiezan por su marcador) y `cli_json_for_gpt_basic_and_damaged_primary`
   (`partitions --json` de `gpt_basic`, `gpt_primary_header_bad` y `gpt_shifted_start`, y `--partition`
   con y sin `--apply-shift`). Códigos sin equivalente en el manifiesto (`gpt_backup_in_use`,
@@ -414,12 +426,35 @@ Tablas MBR/EBR (issue #12, ADR-022):
   (`PartitionUiTests`, 3 pruebas, una con `gpt_basic`). La prueba C# del corpus compara la tabla
   completa (MBR y GPT) y abre cada partición GPT comprobando su marcador.
 
+Apple Partition Map (issue #17, `formatos/apm.md`):
+
+- `core/mr-part/src/apm/tests.rs` (13 pruebas, mapas construidos en memoria): mapa sano con sus 4
+  entradas (origen, tipo, nombre, estado, área de datos), integración en `read_partition_table` y
+  apertura; bloques de 2048 B en sectores de 512 B (LBA en bloques del mapa y apertura rechazada salvo
+  reabriendo con 2048 B) y bloques de 512 B en sectores de 4096 B; entrada sin firma; entradas fuera,
+  parcialmente fuera, de tamaño 0, solapadas y con el área de datos fuera; `pmMapBlkCnt` 0, enorme y
+  mayor que el origen (límite de 512 entradas); DDM ausente, con tamaño no admitido, con tamaño distinto
+  del mapa y con un número de bloques menor o mayor que el origen; DDM sin mapa y «ER» sin APM; MBR que
+  manda; sectores ilegibles (`FaultyDevice`) en el DDM y en las entradas; textos y nombres de tipo; y un
+  fuzzing acotado con semilla fija (3000 mapas mutados con 4 tamaños de sector: sin pánicos, salida
+  acotada, < 60 s).
+- `core/mr-part/tests/apm_corpus.rs` (3 pruebas, `--ignored`): las 3 imágenes APM por
+  `read_partition_table` (mapa, 11 particiones con entrada, tipo, nombre, estado y confianza, conjunto
+  exacto de anomalías), ninguna otra imagen del corpus se toma por APM, cada sector del DDM y del mapa
+  ilegible en `apm_basic` y `apm_basic` leído con sectores de 4096 B.
+- `cli/tests/corpus/partitions.rs` (`partition_table_matches_every_manifest` y
+  `cli_partitions_json_follows_the_engine`: particiones APM, apertura y marcador, `partitions --json`),
+  `mr-ffi` (`apm_partitions_are_enumerated_and_open_as_sources`: `MR_SCHEME_APM`, `MR_ORIGIN_APM`,
+  códigos 100 y 408, `pmPartStatus` en `attributes`, `mr_partition_apm_type`) y C#
+  (`CorpusTableMatchesManifest` con los 3 manifiestos APM: esquema, entradas, tipo, nombre, estado,
+  apertura y marcador).
+
 Búsqueda exprés de particiones perdidas (issue #15, ADR-023, `formatos/busqueda-particiones.md`),
 pruebas por fila del plan de INV-05b §9:
 
 | Fila de INV-05b §9 | Pruebas |
 |---|---|
-| Volúmenes perdidos (`lost_ntfs_mbr_zeroed`, `lost_fat32_chs`, `lost_exfat_1mib`, `lost_chain_three`) | `core/mr-part/tests/search_corpus.rs` (`--ignored`): `found_volumes_match_every_manifest` compara los `[[found_volumes]]` de los **38** manifiestos (18 volúmenes: `fs`, `start_lba`, `sectors`, `end_lba`, `hidden_sectors`, `boot_lba`, `backup_boot_lba`, `primary_boot`, `backup_boot`, `evidence`, `partial`, `serial`, `suggested_mbr_type`, confianza y anomalías `image_shifted`/`mbr_displaced`; nada más) y `scenario_details` el nivel que encuentra cada uno (P2 rejilla, LBA 63 CHS, tercero por encadenamiento P1) e indicadores; la CLI (`cli/tests/corpus/search.rs`, 2) y C# (`PartitionSearchCorpusTests`, 38 casos) repiten la comparación |
+| Volúmenes perdidos (`lost_ntfs_mbr_zeroed`, `lost_fat32_chs`, `lost_exfat_1mib`, `lost_chain_three`) | `core/mr-part/tests/search_corpus.rs` (`--ignored`): `found_volumes_match_every_manifest` compara los `[[found_volumes]]` de los **41** manifiestos (18 volúmenes: `fs`, `start_lba`, `sectors`, `end_lba`, `hidden_sectors`, `boot_lba`, `backup_boot_lba`, `primary_boot`, `backup_boot`, `evidence`, `partial`, `serial`, `suggested_mbr_type`, confianza y anomalías `image_shifted`/`mbr_displaced`; nada más) y `scenario_details` el nivel que encuentra cada uno (P2 rejilla, LBA 63 CHS, tercero por encadenamiento P1) e indicadores; la CLI (`cli/tests/corpus/search.rs`, 2) y C# (`PartitionSearchCorpusTests`, 41 casos) repiten la comparación |
 | Principal dañada (`ntfs_`, `fat32_`, `exfat_primary_damaged`) | `scenario_details`: sospechosos con `found_primary_damaged`; el NTFS se encuentra por su copia al final (P4) |
 | `primary_unreadable`, `backup_unreadable` (`unreadable_lbas`) | Con `FaultyDevice`: «?» y `found_*_unreadable`, nunca el relleno; `unreadable_boot_structures_never_yield_volumes` hace ilegibles **todas** las estructuras de arranque de cada volumen del corpus (ninguno aparece); unitaria `unreadable_fill_that_mimics_a_boot_sector_is_never_evidence` (relleno que es un arranque NTFS perfecto) |
 | Imágenes desplazadas (`image_shifted_pos`/`_neg`) | Corpus (desplazamiento ±, tabla en la LBA 8, NTFS parcial); unitaria `shift_needs_two_independent_pieces_of_evidence`; apertura solo con `apply_shift` en mr-api, FFI (`shifted_search_reports_the_shift_and_opens_only_on_request`), CLI (`--found 2` con y sin `--apply-shift`, parcial rechazado) y C# |
@@ -433,7 +468,7 @@ pruebas por fila del plan de INV-05b §9:
 | Reconocedores y fuzzing | 3 unitarias de reconocedores (cada campo fuera de rango, suma exFAT, coherencia), `recognizers_never_panic_on_mutations` (6000 sectores) y `search_fuzz_is_bounded` (150 discos mutados) |
 
 Total: 16 unitarias y 7 de corpus en mr-part, 3 en mr-api, 5 en mr-ffi, 2 de CLI más 2 de corpus,
-5 + 38 casos en C# y 1 de UI Automation. Las pruebas de corpus de Rust se ejecutan en los pasos ya
+5 + 41 casos en C# y 1 de UI Automation. Las pruebas de corpus de Rust se ejecutan en los pasos ya
 existentes (`cargo test -p mr-part -- --ignored` y `cargo test -p memrescue-cli --test corpus --
 --ignored`), sin pasos nuevos.
 
@@ -441,8 +476,8 @@ Copia del particionado (issue #18, PT-10, `formatos/copia-particionado.md`):
 
 | Qué | Pruebas |
 |---|---|
-| Ida y vuelta con todo el corpus | `core/mr-part/tests/backup_corpus.rs` (`--ignored`): `round_trip_over_the_whole_partition_corpus` toma la copia de los **38** manifiestos (con sus `unreadable_lbas` simulados con `FaultyDevice` y la búsqueda exprés incluida), la escribe, la lee y exige igualdad exacta (`==`), mismo texto al reescribirla y comparación sin diferencias con la misma imagen |
-| Ida y vuelta sintética | Unitarias en `core/mr-part/src/backup/tests.rs`: MBR con cadena de EBR, GPT con las dos copias y búsqueda, GPT vista con otro tamaño de sector, sectores de tabla ilegibles (región sin contenido), disco en blanco y de un sector, y `every_variant_round_trips` con **todas** las variantes de anomalía MBR, GPT, de volumen y de búsqueda, todas las confianzas, estados y comprobaciones |
+| Ida y vuelta con todo el corpus | `core/mr-part/tests/backup_corpus.rs` (`--ignored`): `round_trip_over_the_whole_partition_corpus` toma la copia de los **41** manifiestos (en los 3 APM, lectura APM y región `apm_map` exactas) (con sus `unreadable_lbas` simulados con `FaultyDevice` y la búsqueda exprés incluida), la escribe, la lee y exige igualdad exacta (`==`), mismo texto al reescribirla y comparación sin diferencias con la misma imagen |
+| Ida y vuelta sintética | Unitarias en `core/mr-part/src/backup/tests.rs`: MBR con cadena de EBR, GPT con las dos copias y búsqueda, GPT vista con otro tamaño de sector, sectores de tabla ilegibles (región sin contenido), disco en blanco y de un sector, y `every_variant_round_trips` con **todas** las variantes de anomalía MBR, GPT, de volumen y de búsqueda, todas las confianzas, estados y comprobaciones; APM (#17): `apm_round_trips_with_its_map`, `every_apm_variant_round_trips` (las 15 anomalías APM y un tipo con bytes tras el NUL), `apm_field_must_match_the_scheme` (campo `apm` solo con esquema `apm`; `null` explícito aceptado) y `comparison_reports_changed_apm_entry_and_map`; `comparison_reports_differences_on_modified_copies` cubre además `apm_basic` con una entrada movida |
 | Manipulaciones | Bytes de una región editados (los detecta `body_sha256` y, si también se recalcula, la suma de la región), sumas editadas, valor del particionado editado, versión 0, 2 y `"1"`, otro `format`, fichero truncado en cada posición de los primeros 2000 bytes y cada 97 después, no UTF-8, mayor de 32 MiB, campos desconocidos, ausentes, de otro tipo o fuera de rango, variante desconocida, región fuera del origen, identidad incoherente y código de anomalía cambiado; los cambios de espacios o CRLF siguen siendo válidos |
 | Comparación | Unitarias (entrada MBR movida y EBR borrado, entradas GPT primarias dañadas, origen recortado, otro esquema, sectores antes ilegibles) y de corpus (`comparison_reports_differences_on_modified_copies`: copias modificadas de `mbr_basic` y `gpt_basic` en un directorio temporal; el original queda intacto y sigue coincidiendo) |
 | Lector JSON y fuzzing | 4 unitarias del subconjunto JSON (rechazos, anidamiento de 100 000 niveles, línea y columna) y `seeded_fuzz_never_panics` (1500 documentos mutados y 500 aleatorios: sin pánicos; solo pasan mutaciones sin efecto) |

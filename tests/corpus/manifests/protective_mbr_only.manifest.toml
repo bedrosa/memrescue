@@ -2,7 +2,7 @@
 # Esquema en docs/PRUEBAS.md (§1.1). Las LBA de [[partitions]], de la GPT y hidden_sectors son las
 # declaradas (disco original); las demás, de la imagen: LBA imagen = LBA disco - leading_sectors_missing.
 schema_version = 2
-generator_version = 2
+generator_version = 3
 name = "protective_mbr_only"
 file = "protective_mbr_only.img"
 scenario = "MBR protector (0xEE) sin cabeceras GPT en LBA 1 ni en el último sector"

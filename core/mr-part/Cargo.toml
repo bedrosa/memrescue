@@ -1,6 +1,6 @@
 [package]
 name = "mr-part"
-description = "Tablas de particiones de MemRescue (MBR/EBR, GPT), solo lectura y tolerantes a daños"
+description = "Tablas de particiones de MemRescue (MBR/EBR, GPT, APM), solo lectura y tolerantes a daños"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

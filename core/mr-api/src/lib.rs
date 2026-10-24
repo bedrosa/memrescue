@@ -283,6 +283,7 @@ pub fn open_partition(
     let kind = match &p.kind {
         mr_part::PartitionKind::Mbr(t) => format!("tipo 0x{t:02X}"),
         mr_part::PartitionKind::Gpt(g) => format!("GPT {}", mr_part::gpt::format_guid(g)),
+        mr_part::PartitionKind::Apm(t) => format!("APM {}", t.text()),
     };
     open_view(parent, c.image_start, c.count, |end| {
         let mut d = if c.shift_applied != 0 {

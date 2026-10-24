@@ -36,6 +36,8 @@
  * índice: mr_partition_search_result, mr_found_volume_get, mr_found_volume_origin,
  * mr_found_volume_anomaly, mr_found_volume_anomaly_text, mr_found_table_get; apertura con
  * mr_found_volume_open). mr_task_status_get, mr_task_cancel y mr_task_free admiten la tarea.
+ * Añadido sin cambiar la ABI 3 (M2.5, issue #17): Apple Partition Map (MR_SCHEME_APM,
+ * MR_ORIGIN_APM, códigos 400-414 y mr_partition_apm_type).
  */
 #ifndef MEMRESCUE_CORE_H
 #define MEMRESCUE_CORE_H
@@ -251,6 +253,7 @@ mr_status mr_verify_untrusted_range(uint64_t task, uint64_t index, uint64_t *out
 #define MR_SCHEME_MBR     1u
 #define MR_SCHEME_GPT     2u   /* GPT (MBR protector, o firma GPT sin MBR utilizable) */
 #define MR_SCHEME_HYBRID  3u   /* MBR híbrido: entradas MBR distintas de 0xEE y después las GPT */
+#define MR_SCHEME_APM     4u   /* Apple Partition Map: LBA en bloques del mapa (sector_size) */
 
 #define MR_CONFIDENCE_VALID             1u
 #define MR_CONFIDENCE_VALID_WITH_FIXES  2u
@@ -274,6 +277,7 @@ mr_status mr_verify_untrusted_range(uint64_t task, uint64_t index, uint64_t *out
 #define MR_ORIGIN_PRIMARY  1u
 #define MR_ORIGIN_LOGICAL  2u
 #define MR_ORIGIN_GPT      3u
+#define MR_ORIGIN_APM      4u   /* slot = número de entrada del mapa (desde 1) */
 
 #define MR_PARTITION_TABLE     0xFFFFFFFFu  /* partition_index de las anomalías de la tabla */
 #define MR_ANOMALY_HAS_TARGET  1u           /* mr_partition_anomaly.flags: target_lba válido */
@@ -333,6 +337,24 @@ mr_status mr_verify_untrusted_range(uint64_t task, uint64_t index, uint64_t *out
 #define MR_ANOMALY_GPT_DUPLICATE_UNIQUE_GUID 240u    /* value = índice de entrada */
 #define MR_ANOMALY_GPT_NAME_INVALID          241u    /* value = índice de entrada */
 
+/* Apple Partition Map (#17): lba = sector del origen del bloque afectado; value = nº de entrada
+ * salvo donde se indica. */
+#define MR_ANOMALY_APM_DDM_MISSING           400u    /* bloque 0 sin firma ER */
+#define MR_ANOMALY_APM_BLOCK_SIZE_INVALID    401u    /* value = sbBlkSize declarado */
+#define MR_ANOMALY_APM_BLOCK_SIZE_MISMATCH   402u    /* value = sbBlkSize declarado */
+#define MR_ANOMALY_APM_DISK_SIZE_MISMATCH    403u    /* value = sbBlkCount declarado */
+#define MR_ANOMALY_APM_MAP_MISSING           404u    /* DDM sin entrada PM en el bloque 1 */
+#define MR_ANOMALY_APM_MAP_COUNT_INVALID     405u    /* value = pmMapBlkCnt (0 o > 512) */
+#define MR_ANOMALY_APM_MAP_COUNT_MISMATCH    406u    /* value = pmMapBlkCnt de la entrada */
+#define MR_ANOMALY_APM_MAP_OUTSIDE_IMAGE     407u    /* sin lba; value = primera entrada que falta */
+#define MR_ANOMALY_APM_ENTRY_SIGNATURE       408u    /* entrada sin firma PM (no se lista) */
+#define MR_ANOMALY_APM_ENTRY_ZERO_LENGTH     409u
+#define MR_ANOMALY_APM_ENTRY_OUTSIDE_DISK    410u
+#define MR_ANOMALY_APM_ENTRY_PARTIALLY_OUTSIDE 411u
+#define MR_ANOMALY_APM_ENTRY_OVERLAP         412u
+#define MR_ANOMALY_APM_ENTRY_DATA_OUTSIDE    413u
+#define MR_ANOMALY_APM_SECTOR_SIZE_MISMATCH  414u    /* sin lba; value = tamaño de bloque del mapa */
+
 typedef struct mr_partition_table_info {  /* 80 bytes */
     uint32_t struct_size;        /* = sizeof(mr_partition_table_info), lo escribe el llamador */
     uint32_t scheme;             /* MR_SCHEME_* */
@@ -352,8 +374,8 @@ typedef struct mr_partition_table_info {  /* 80 bytes */
 typedef struct mr_partition_info {  /* 96 bytes */
     uint32_t struct_size;        /* = sizeof(mr_partition_info), lo escribe el llamador */
     uint32_t origin;             /* MR_ORIGIN_* */
-    uint32_t slot;               /* entrada de su tabla (0-3) o índice GPT */
-    uint32_t mbr_type;           /* 0 en GPT */
+    uint32_t slot;               /* entrada de su tabla (0-3), índice GPT o entrada APM (desde 1) */
+    uint32_t mbr_type;           /* 0 en GPT y APM */
     uint64_t ebr_lba;            /* EBR de una lógica; 0 en las demás */
     uint64_t start_lba;
     uint64_t sector_count;
@@ -363,7 +385,7 @@ typedef struct mr_partition_info {  /* 96 bytes */
     uint32_t reserved;
     uint8_t  gpt_type[16];       /* GUID de tipo en el orden del disco; ceros en MBR */
     uint8_t  unique_guid[16];    /* GUID único GPT en el orden del disco; ceros en MBR */
-    uint64_t attributes;         /* atributos GPT; 0 en MBR */
+    uint64_t attributes;         /* atributos GPT; pmPartStatus en APM; 0 en MBR */
 } mr_partition_info;
 
 typedef struct mr_partition_anomaly {  /* 40 bytes */
@@ -382,9 +404,12 @@ mr_status mr_partition_get(uint64_t table, uint32_t index, mr_partition_info *ou
 /* Nombre legible del tipo (cadena vacía si es desconocido). */
 mr_status mr_partition_type_name(uint64_t table, uint32_t index,
                                  uint8_t *buf, size_t cap, size_t *out_len);
-/* Nombre GPT de la partición (cadena vacía en MBR). */
+/* Nombre GPT o APM de la partición (cadena vacía en MBR). */
 mr_status mr_partition_name(uint64_t table, uint32_t index,
                             uint8_t *buf, size_t cap, size_t *out_len);
+/* Tipo APM tal como está en el mapa (p. ej. "Apple_HFS"); cadena vacía si no es APM. */
+mr_status mr_partition_apm_type(uint64_t table, uint32_t index,
+                                uint8_t *buf, size_t cap, size_t *out_len);
 /* partition_index = MR_PARTITION_TABLE para las anomalías de la tabla. */
 mr_status mr_partition_anomaly(uint64_t table, uint32_t partition_index, uint32_t anomaly_index,
                                mr_partition_anomaly *out);

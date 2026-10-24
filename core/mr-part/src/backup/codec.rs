@@ -9,6 +9,7 @@
 
 use super::json::Json;
 use super::BackupError;
+use crate::apm::{ApmAnomaly, ApmPartition, ApmRead, ApmType};
 use crate::gpt::{
     format_guid, CopyReport, EntriesState, GptAnomaly, GptCopy, GptField, GptHeader, GptPartition,
     GptRead, HeaderState,
@@ -77,6 +78,11 @@ impl<'a> Obj<'a> {
             )),
             None => Ok(()),
         }
+    }
+
+    /// `true` si el objeto tiene el campo `key` (campos opcionales añadidos a la versión 1).
+    pub(crate) fn has(&self, key: &str) -> bool {
+        self.members.iter().any(|(k, _)| k == key)
     }
 
     pub(crate) fn path(&self) -> &str {
@@ -334,6 +340,7 @@ names!(Scheme {
     Mbr = "mbr",
     Gpt = "gpt",
     Hybrid = "hybrid",
+    Apm = "apm",
 });
 
 names!(NoTableReason {
@@ -380,6 +387,7 @@ tagged!(Origin {
     Primary { slot },
     Logical { ebr_lba, slot },
     Gpt { index },
+    Apm { index },
 });
 
 tagged!(MbrAnomaly {
@@ -436,7 +444,39 @@ tagged!(GptAnomaly {
     NameInvalid { index },
 });
 
-/// `{"family": "device" | "mbr" | "gpt", "code": <código estable>, "type": <variante>, ...}`.
+tagged!(ApmAnomaly {
+    DdmMissing {},
+    BlockSizeInvalid { declared },
+    BlockSizeMismatch { declared, used },
+    DiskSizeMismatch { declared, available },
+    MapMissing { lba },
+    MapCountInvalid { lba, count },
+    MapCountMismatch { lba, index, count },
+    MapOutsideImage { index },
+    EntrySignature { lba, index },
+    EntryZeroLength { lba, index },
+    EntryOutsideDisk { lba, index, start },
+    EntryPartiallyOutsideDisk { lba, index, end },
+    EntryOverlap { lba, index, other },
+    EntryDataOutside { lba, index },
+    SectorSizeMismatch { block_size, device },
+});
+
+/// Tipo APM: los 32 bytes de `pmParType` en hexadecimal (sin pérdidas, también tras el NUL).
+impl Codec for ApmType {
+    fn enc(&self) -> Json {
+        Json::Str(hex_encode(&self.0))
+    }
+    fn dec(v: &Json, at: &str) -> Res<Self> {
+        let s = str_of(v, at)?;
+        hex_decode(s)
+            .and_then(|b| <[u8; 32]>::try_from(b).ok())
+            .map(ApmType)
+            .ok_or_else(|| invalid(at, "se esperaban 32 bytes en hexadecimal"))
+    }
+}
+
+/// `{"family": "device" | "mbr" | "gpt" | "apm", "code": <código estable>, "type": <variante>, ...}`.
 /// El código es informativo y se comprueba al leer.
 impl Codec for Anomaly {
     fn enc(&self) -> Json {
@@ -444,6 +484,7 @@ impl Codec for Anomaly {
             Anomaly::UnreadableSector { .. } => "device",
             Anomaly::Mbr(_) => "mbr",
             Anomaly::Gpt(_) => "gpt",
+            Anomaly::Apm(_) => "apm",
         };
         let mut out = vec![
             ("family".to_string(), Json::Str(family.to_string())),
@@ -459,6 +500,7 @@ impl Codec for Anomaly {
             }
             Anomaly::Mbr(m) => m.enc_fields(&mut out),
             Anomaly::Gpt(g) => g.enc_fields(&mut out),
+            Anomaly::Apm(a) => a.enc_fields(&mut out),
         }
         Json::Obj(out)
     }
@@ -479,6 +521,7 @@ impl Codec for Anomaly {
             }
             "mbr" => Anomaly::Mbr(MbrAnomaly::dec_fields(&mut o)?),
             "gpt" => Anomaly::Gpt(GptAnomaly::dec_fields(&mut o)?),
+            "apm" => Anomaly::Apm(ApmAnomaly::dec_fields(&mut o)?),
             other => return Err(invalid(at, format!("familia desconocida: {other}"))),
         };
         o.finish()?;
@@ -495,12 +538,14 @@ impl Codec for Anomaly {
     }
 }
 
-/// `{"table": "mbr", "type": 7}` o `{"table": "gpt", "type": "<GUID>"}`.
+/// `{"table": "mbr", "type": 7}`, `{"table": "gpt", "type": "<GUID>"}` o
+/// `{"table": "apm", "type": "<32 bytes en hexadecimal>"}`.
 impl Codec for PartitionKind {
     fn enc(&self) -> Json {
         let (table, t) = match self {
             PartitionKind::Mbr(t) => ("mbr", t.enc()),
             PartitionKind::Gpt(g) => ("gpt", g.enc()),
+            PartitionKind::Apm(t) => ("apm", t.enc()),
         };
         Json::Obj(vec![
             ("table".to_string(), Json::Str(table.to_string())),
@@ -514,6 +559,7 @@ impl Codec for PartitionKind {
         let k = match table.as_str() {
             "mbr" => PartitionKind::Mbr(o.take("type")?),
             "gpt" => PartitionKind::Gpt(o.take("type")?),
+            "apm" => PartitionKind::Apm(o.take("type")?),
             other => return Err(invalid(at, format!("tabla desconocida: {other}"))),
         };
         o.finish()?;
@@ -606,13 +652,67 @@ record!(GptRead {
     confidence,
 });
 
-record!(PartitionTable {
-    scheme,
-    sector_size,
+record!(ApmPartition {
+    partition,
+    status,
+    data_start,
+    data_count,
+});
+
+record!(ApmRead {
+    ddm,
+    ddm_block_size,
+    ddm_block_count,
+    block_size,
+    disk_blocks,
+    map_entries,
+    map_found,
     partitions,
     anomalies,
-    gpt,
+    confidence,
 });
+
+/// Todos los campos y, solo si hay lectura APM, `apm` (#17). Sin APM el objeto es el mismo que
+/// antes de #17, así que la versión 1 del formato no cambia: las copias anteriores se leen igual y
+/// una copia sin APM la lee también un programa anterior. `apm` ausente o `null` es `None`; debe
+/// estar presente si y solo si el esquema es `apm`.
+impl Codec for PartitionTable {
+    fn enc(&self) -> Json {
+        let mut out = vec![
+            ("scheme".to_string(), self.scheme.enc()),
+            ("sector_size".to_string(), self.sector_size.enc()),
+            ("partitions".to_string(), self.partitions.enc()),
+            ("anomalies".to_string(), self.anomalies.enc()),
+            ("gpt".to_string(), self.gpt.enc()),
+        ];
+        if let Some(a) = &self.apm {
+            out.push(("apm".to_string(), a.enc()));
+        }
+        Json::Obj(out)
+    }
+    fn dec(v: &Json, at: &str) -> Res<Self> {
+        let mut o = Obj::new(v, at)?;
+        let mut r = Self {
+            scheme: o.take("scheme")?,
+            sector_size: o.take("sector_size")?,
+            partitions: o.take("partitions")?,
+            anomalies: o.take("anomalies")?,
+            gpt: o.take("gpt")?,
+            apm: None,
+        };
+        if o.has("apm") {
+            r.apm = o.take("apm")?;
+        }
+        o.finish()?;
+        if (r.scheme == Scheme::Apm) != r.apm.is_some() {
+            return Err(invalid(
+                at,
+                "la lectura APM debe estar presente si y solo si el esquema es apm",
+            ));
+        }
+        Ok(r)
+    }
+}
 
 // ---------------------------------------------------------------------------------------------
 // Búsqueda exprés

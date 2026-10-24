@@ -12,8 +12,8 @@ use mr_part::backup::{
     capture, compare, Difference, LayoutBackup, RegionContent, RegionKind, RegionStatus,
 };
 use mr_part::gpt::GptCopy;
-use mr_part::read_partition_table;
 use mr_part::search::{search, NoObserver, SearchOptions};
+use mr_part::{read_partition_table, Scheme};
 
 fn repo() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -87,8 +87,8 @@ fn full_backup(dev: &dyn BlockDevice, name: &str) -> LayoutBackup {
 #[ignore = "requiere el corpus generado"]
 fn round_trip_over_the_whole_partition_corpus() {
     let all = manifests();
-    assert_eq!(all.len(), 38, "número de escenarios del corpus");
-    let mut regions = 0;
+    assert_eq!(all.len(), 41, "número de escenarios del corpus");
+    let (mut regions, mut apm) = (0, 0);
     for m in &all {
         let name = &m["name"];
         let dev = source(&image_path(m), m);
@@ -104,6 +104,22 @@ fn round_trip_over_the_whole_partition_corpus() {
                 );
             }
         }
+        // APM (#17): lectura completa en la copia y región del mapa con sus entradas.
+        if m["scheme"] == "apm" {
+            assert_eq!(b.layout.scheme, Scheme::Apm, "{name}");
+            let a = b.layout.apm.as_ref().unwrap();
+            let entries: u64 = m["apm_map_entries"].parse().unwrap();
+            let block = u64::from(a.block_size);
+            assert_eq!(
+                region(&b, RegionKind::ApmMap),
+                (block, (entries - 1) * block + 512),
+                "{name}"
+            );
+            apm += 1;
+        } else {
+            assert!(b.layout.apm.is_none(), "{name}");
+            assert!(b.regions.iter().all(|r| r.kind != RegionKind::ApmMap));
+        }
         regions += b.regions.len();
         let text = b.to_text();
         let back = LayoutBackup::from_text(&text).unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -113,6 +129,7 @@ fn round_trip_over_the_whole_partition_corpus() {
         assert!(c.identical(), "{name}: {:#?}", c.differences);
     }
     assert!(regions > all.len());
+    assert_eq!(apm, 3, "escenarios APM");
 }
 
 /// Copia la imagen a un directorio temporal y aplica `edit` a sus bytes (el original no se toca).
@@ -191,7 +208,28 @@ fn comparison_reports_differences_on_modified_copies() {
         }
     )));
 
+    // APM: entrada 2 movida (cambia la partición y la región del mapa).
+    let m = manifest("apm_basic");
+    let original = image_path(&m);
+    let b = full_backup(&source(&original, &m), "apm_basic");
+    let copy = modified_copy(&original, tmp.path(), |d| d[2 * 512 + 11] ^= 0x01);
+    let c = compare(&b, &source(&copy, &m)).unwrap();
+    assert!(c.differences.iter().any(|x| matches!(
+        x,
+        Difference::Region {
+            kind: RegionKind::ApmMap,
+            ..
+        }
+    )));
+    assert!(c.differences.iter().any(
+        |x| matches!(x, Difference::PartitionChanged { fields, .. } if fields.contains(&"inicio"))
+    ));
+    assert!(compare(&b, &source(&original, &m)).unwrap().identical());
+
     // GPT recortada: la copia de respaldo ya no existe en el origen.
+    let m = manifest("gpt_basic");
+    let original = image_path(&m);
+    let b = full_backup(&source(&original, &m), "gpt_basic");
     let copy = modified_copy(&original, tmp.path(), |d| d.truncate(d.len() / 2));
     let c = compare(&b, &source(&copy, &m)).unwrap();
     assert!(c

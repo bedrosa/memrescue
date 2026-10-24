@@ -1568,6 +1568,132 @@ fn shifted_gpt_partitions_open_only_when_the_shift_is_requested() {
     assert_eq!(mr_source_close(src), MR_OK);
 }
 
+// ---------- Apple Partition Map (#17) ----------
+
+/// Disco APM de 64 bloques de 512 B: DDM, mapa de 3 entradas (el propio mapa, `Apple_HFS` en
+/// [16, 32) con estado de arranque y otra entrada sin firma). Cada bloque de datos vale su número.
+fn apm_disk() -> Vec<u8> {
+    let mut d: Vec<u8> = (0..64 * 512).map(|i| (i / 512) as u8).collect();
+    d[..512].fill(0);
+    d[..2].copy_from_slice(b"ER");
+    d[2..4].copy_from_slice(&512u16.to_be_bytes());
+    d[4..8].copy_from_slice(&64u32.to_be_bytes());
+    let entries: [(u32, u32, &str, &str, u32); 2] = [
+        (1, 3, "Apple_partition_map", "Apple", 0x37),
+        (16, 16, "Apple_HFS", "MR-HFS", 0x8000_0033),
+    ];
+    for (i, (start, size, kind, name, status)) in entries.iter().enumerate() {
+        let e = &mut d[(i + 1) * 512..(i + 2) * 512];
+        e.fill(0);
+        e[..2].copy_from_slice(b"PM");
+        e[4..8].copy_from_slice(&3u32.to_be_bytes());
+        e[8..12].copy_from_slice(&start.to_be_bytes());
+        e[12..16].copy_from_slice(&size.to_be_bytes());
+        e[16..16 + name.len()].copy_from_slice(name.as_bytes());
+        e[48..48 + kind.len()].copy_from_slice(kind.as_bytes());
+        e[88..92].copy_from_slice(&status.to_be_bytes());
+    }
+    d
+}
+
+fn partition_string(
+    t: u64,
+    index: u32,
+    f: unsafe extern "C" fn(u64, u32, *mut u8, usize, *mut usize) -> i32,
+) -> String {
+    let mut buf = vec![0u8; 256];
+    let mut n = 0usize;
+    assert_eq!(
+        unsafe { f(t, index, buf.as_mut_ptr(), buf.len(), &mut n) },
+        MR_OK
+    );
+    String::from_utf8(buf[..n].to_vec()).unwrap()
+}
+
+#[test]
+fn apm_partitions_are_enumerated_and_open_as_sources() {
+    let src = insert(Entry::Source(mr_api::source_from_device(
+        Arc::new(mr_io::MemDevice::new(apm_disk(), 512).unwrap()),
+        "apm",
+    )));
+    let mut t = 0u64;
+    assert_eq!(unsafe { mr_source_partitions(src, &mut t) }, MR_OK);
+    let info = table_info(t).unwrap();
+    assert_eq!(
+        (
+            info.scheme,
+            info.sector_size,
+            info.partition_count,
+            info.confidence,
+            info.gpt_flags
+        ),
+        (MR_SCHEME_APM, 512, 2, MR_CONFIDENCE_SUSPICIOUS, 0)
+    );
+    let table: Vec<(u32, u32, u64, u64)> = (0..info.anomaly_count as u32)
+        .map(|i| {
+            let (a, _) = anomaly(t, MR_PARTITION_TABLE, i).unwrap();
+            (a.code, a.severity, a.lba, a.value)
+        })
+        .collect();
+    assert_eq!(
+        table,
+        vec![
+            (100, MR_SEVERITY_NOTICE, 0, 0),
+            (408, MR_SEVERITY_SUSPICIOUS, 3, 3)
+        ]
+    );
+    let (_, text) = anomaly(t, MR_PARTITION_TABLE, 1).unwrap();
+    assert!(text.starts_with("apm_entry_signature\n"), "{text}");
+    let p = partition(t, 1).unwrap();
+    assert_eq!(
+        (
+            p.origin,
+            p.slot,
+            p.start_lba,
+            p.sector_count,
+            p.mbr_type,
+            p.active,
+            p.attributes
+        ),
+        (MR_ORIGIN_APM, 2, 16, 16, 0, 1, 0x8000_0033)
+    );
+    assert_eq!((p.gpt_type, p.unique_guid), ([0; 16], [0; 16]));
+    assert_eq!(partition_string(t, 1, mr_partition_name), "MR-HFS");
+    assert_eq!(partition_string(t, 1, mr_partition_apm_type), "Apple_HFS");
+    assert_eq!(partition_string(t, 1, mr_partition_type_name), "HFS / HFS+");
+    assert_eq!(
+        partition_string(t, 0, mr_partition_type_name),
+        "Mapa de particiones de Apple"
+    );
+    let mut ps = 0u64;
+    assert_eq!(unsafe { mr_partition_open(t, 1, &mut ps) }, MR_OK);
+    let mut sector = vec![0u8; 512];
+    let mut n = 0usize;
+    assert_eq!(
+        unsafe { mr_source_read(ps, 0, 1, sector.as_mut_ptr(), 512, &mut n) },
+        MR_OK
+    );
+    assert!(sector.iter().all(|&b| b == 16));
+    assert!(describe(ps).contains("APM Apple_HFS"), "{}", describe(ps));
+    assert_eq!(mr_source_close(ps), MR_OK);
+    assert_eq!(mr_partitions_free(t), MR_OK);
+    assert_eq!(mr_source_close(src), MR_OK);
+    // En un MBR la función de tipo APM devuelve una cadena vacía.
+    let src = insert(Entry::Source(mr_api::source_from_device(
+        Arc::new(mr_io::MemDevice::new(partitioned_disk(), 512).unwrap()),
+        "mbr",
+    )));
+    assert_eq!(unsafe { mr_source_partitions(src, &mut t) }, MR_OK);
+    assert_eq!(partition_string(t, 0, mr_partition_apm_type), "");
+    let mut buf = [0u8; 8];
+    assert_eq!(
+        unsafe { mr_partition_apm_type(t, 99, buf.as_mut_ptr(), buf.len(), &mut n) },
+        MR_ERR_OUT_OF_RANGE
+    );
+    assert_eq!(mr_partitions_free(t), MR_OK);
+    assert_eq!(mr_source_close(src), MR_OK);
+}
+
 // ---------- Búsqueda exprés de particiones perdidas (#15) ----------
 
 #[test]

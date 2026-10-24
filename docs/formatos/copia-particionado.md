@@ -76,7 +76,7 @@ no tienen significado.
 
 | Campo | Significado |
 |---|---|
-| `kind` | `mbr` (sector de la LBA 0), `ebr`, `gpt_primary_header`, `gpt_primary_entries`, `gpt_backup_header`, `gpt_backup_entries` |
+| `kind` | `mbr` (sector de la LBA 0), `ebr`, `gpt_primary_header`, `gpt_primary_entries`, `gpt_backup_header`, `gpt_backup_entries`, `apm_map` (#17) |
 | `offset`, `length` | Posición y longitud **en bytes** del origen (`1 ≤ length ≤ 4 MiB + 64 KiB`; la región cabe en `size_bytes`) |
 | `state` | `data`: todos los sectores eran fiables; `unreadable`: alguno no lo era |
 | `sha256` | (`data`) SHA-256 de los bytes |
@@ -90,6 +90,10 @@ Qué regiones se guardan, en este orden y sin repetir `(kind, offset, length)`:
   sector de la GPT, que puede ser de otro tamaño que el del dispositivo) y, si tiene campos legibles y
   su tabla ocupa entre 1 byte y 4 MiB, la tabla de entradas redondeada a sectores de la GPT, situada con
   el desplazamiento de su propia cabecera (`MyLBA` frente a la posición leída).
+- `apm_map` (esquema `apm` con mapa encontrado, #17): las entradas del Apple Partition Map que recorre
+  el lector, desde el byte `B` (bloque 1) hasta el final de los 512 bytes de la entrada `n`, donde `B`
+  es el tamaño de bloque del mapa y `n` el número de entradas declarado, acotado a 1-512 y a lo que cabe
+  en el origen. El Driver Descriptor Map (bloque 0) ya está en la región `mbr`.
 - Las posiciones que quedan fuera del origen (imagen recortada o desplazada) no se guardan.
 
 ### `layout` y tipos comunes
@@ -100,21 +104,23 @@ nombres que en `mr-part`. Al leer se exigen exactamente esos campos. Los enteros
 
 | Objeto | Campos |
 |---|---|
-| `PartitionTable` | `scheme` (`none`, `mbr`, `gpt`, `hybrid`), `sector_size`, `partitions` (lista de `Partition`), `anomalies` (lista de `Anomaly`), `gpt` (`GptRead` o `null`) |
+| `PartitionTable` | `scheme` (`none`, `mbr`, `gpt`, `hybrid`, `apm`), `sector_size`, `partitions` (lista de `Partition`), `anomalies` (lista de `Anomaly`), `gpt` (`GptRead` o `null`) y, **solo con esquema `apm`**, `apm` (`ApmRead`). Es el único campo opcional del formato: ausente (o `null`) equivale a sin APM, y debe estar presente si y solo si `scheme` es `apm` |
 | `Partition` | `origin` (`Origin`), `start_lba`, `sector_count`, `kind` (`PartitionKind`), `name` (cadena o `null`), `active`, `confidence` (`Confidence`), `anomalies` |
-| `Origin` | `{"type": "Primary", "slot"}`, `{"type": "Logical", "ebr_lba", "slot"}` o `{"type": "Gpt", "index"}` |
-| `PartitionKind` | `{"table": "mbr", "type": <byte>}` o `{"table": "gpt", "type": <GUID>}` |
+| `Origin` | `{"type": "Primary", "slot"}`, `{"type": "Logical", "ebr_lba", "slot"}`, `{"type": "Gpt", "index"}` o `{"type": "Apm", "index"}` (entrada del mapa desde 1) |
+| `PartitionKind` | `{"table": "mbr", "type": <byte>}`, `{"table": "gpt", "type": <GUID>}` o `{"table": "apm", "type": <64 dígitos hex>}` (los 32 bytes de `pmParType` tal cual, también los que siguen al NUL) |
 | `Confidence` | `{"level": "valid"}`, `{"level": "valid_with_fixes" \| "suspicious", "reasons": [cadenas]}` o `{"level": "invalid", "reason": cadena}` |
 | `GptRead` | `sector_size`, `device_sector_size`, `primary` y `backup` (`CopyReport`), `selected` (`primary`, `backup` o `null`), `shift` (con signo: LBA disco = LBA imagen + `shift`), `trailing_sectors_missing`, `partitions` (lista de `GptPartition`), `anomalies`, `confidence` |
 | `CopyReport` | `header` (`valid`, `crc`, `invalid`, `missing`, `outside_image`, `unreadable`), `entries` (`valid`, `crc`, `outside_image`, `unreadable`, `unchecked`), `disk_lba`, `image_lba` (o `null`), `fields` (`GptHeader` o `null`) |
 | `GptHeader` | `revision`, `header_size`, `header_crc32`, `my_lba`, `alternate_lba`, `first_usable_lba`, `last_usable_lba`, `disk_guid`, `entries_lba`, `entry_count`, `entry_size`, `entries_crc32` |
 | `GptPartition` | `partition` (`Partition`), `unique_guid`, `attributes` (64 bits sin signo) |
+| `ApmRead` | `ddm`, `ddm_block_size`, `ddm_block_count`, `block_size`, `disk_blocks`, `map_entries`, `map_found`, `partitions` (lista de `ApmPartition`), `anomalies`, `confidence` (`formatos/apm.md`) |
+| `ApmPartition` | `partition` (`Partition`), `status` (`pmPartStatus`), `data_start`, `data_count` |
 
 **GUID**: forma textual habitual `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` en minúsculas; los tres primeros
 grupos son los bytes 0-3, 4-5 y 6-7 del disco en little endian y los dos últimos, los bytes 8-15 en
 orden. Es biyectiva con los 16 bytes del disco.
 
-**Anomalías** (`Anomaly`): objeto con `family` (`device`, `mbr` o `gpt`), `code` (el código estable de
+**Anomalías** (`Anomaly`): objeto con `family` (`device`, `mbr`, `gpt` o `apm`), `code` (el código estable de
 la CLI y de los manifiestos, comprobado al leer), `type` (la variante) y los campos de la variante:
 
 | Familia | `type` y campos |
@@ -122,6 +128,7 @@ la CLI y de los manifiestos, comprobado al leer), `type` (la variante) y los cam
 | `device` | `UnreadableSector {lba}` |
 | `mbr` | `NoTable {lba, reason}`, `EbrInvalid {lba, reason}`, `Empty {lba}`, `SignatureMissing {lba}`, `Superfloppy {lba, fs}`, `InvalidBootIndicator {lba, slot, value, used}`, `MultipleActive {lba, slots}`, `MultipleExtended {lba, slots}`, `ZeroLength {lba, slot, kind}`, `OutsideDisk {lba, origin, start}`, `PartiallyOutsideDisk {lba, origin, end, disk_sectors}`, `Overlap {lba, first, second}`, `UnknownType {lba, origin, kind}`, `LogicalOutsideExtended {lba, origin}`, `ExtraDataEntries {lba, count}`, `EbrLoop {lba, target}`, `LinkOutsideDisk {lba, target}`, `LinkOutsideExtended {lba, target}`, `ChainLimit {lba, limit}`, `ProtectiveStart {lba, start}`, `ProtectiveSizeMismatch {lba, declared, expected}`, `Hybrid {lba}`, `HybridMismatch {lba, slot}` |
 | `gpt` | `HeaderMissing {copy, lba}`, `HeaderOutsideImage {copy, disk_lba}`, `HeaderCrc {copy, lba, stored, computed}`, `HeaderSize {copy, lba, size}`, `RevisionUnsupported {copy, lba, revision}`, `RevisionMinor {copy, lba, revision}`, `MyLbaMismatch {copy, lba, my_lba, expected}`, `AlternateLbaMismatch {copy, lba, alternate_lba}`, `UsableRangeInvalid {copy, lba, first, last}`, `EntriesLocationInvalid {copy, lba, entries_lba}`, `EntryArrayLimits {copy, lba, entry_count, entry_size}`, `EntriesCrc {copy, lba, stored, computed}`, `EntriesOutsideImage {copy, disk_lba}`, `BackupInUse {primary_header, primary_entries}`, `CopiesDisagree {field}`, `ImageShifted {offset}`, `ImageTruncated {missing}`, `UsableRangeOutsideImage {lba, first, last}`, `SectorSizeMismatch {device, used}`, `EntryInverted {index, first, last}`, `EntryOutsideUsable {index}`, `EntryOutsideImage {index}`, `EntryOverlap {index, other}`, `DuplicateUniqueGuid {index, other}`, `NameInvalid {index}` |
+| `apm` | `DdmMissing {}`, `BlockSizeInvalid {declared}`, `BlockSizeMismatch {declared, used}`, `DiskSizeMismatch {declared, available}`, `MapMissing {lba}`, `MapCountInvalid {lba, count}`, `MapCountMismatch {lba, index, count}`, `MapOutsideImage {index}`, `EntrySignature {lba, index}`, `EntryZeroLength {lba, index}`, `EntryOutsideDisk {lba, index, start}`, `EntryPartiallyOutsideDisk {lba, index, end}`, `EntryOverlap {lba, index, other}`, `EntryDataOutside {lba, index}`, `SectorSizeMismatch {block_size, device}` |
 
 Valores enumerados: `reason` = `blank`, `no_entry_inside_disk`, `invalid_boot_indicator`,
 `multiple_extended`, `gpt_header`, `outside_device`; `fs` = `NTFS`, `exFAT`, `FAT32`, `FAT`; `copy` =
@@ -191,7 +198,7 @@ reglas y, sin escribir nada, informa de:
 | `region_changed` | Los bytes de una región de la copia, releídos en la misma posición, ya no coinciden (o ahora son ilegibles, o la posición queda fuera del origen), o el origen tiene una región de tabla que la copia no tenía |
 | `scheme_changed`, `table_sector_size` | Esquema o tamaño de sector de la tabla distintos |
 | `gpt_selected_copy`, `image_shift` | Copia GPT en uso o desplazamiento distintos |
-| `partition_removed`, `partition_added`, `partition_changed` | Particiones emparejadas por su entrada de tabla (`origin`); en las cambiadas, los campos que difieren (inicio, tamaño, tipo, nombre, activa, confianza, anomalías, GUID único, atributos) |
+| `partition_removed`, `partition_added`, `partition_changed` | Particiones emparejadas por su entrada de tabla (`origin`); en las cambiadas, los campos que difieren (inicio, tamaño, tipo, nombre, activa, confianza, anomalías, GUID único, atributos, estado APM) |
 | `anomaly_removed`, `anomaly_added` | Anomalías de la tabla que desaparecen o aparecen |
 
 La búsqueda exprés guardada no se repite al comparar (se conserva como información). La CLI termina con
@@ -203,6 +210,8 @@ código 4 si hay diferencias.
   ADR-006, PT-07 y PT-09).
 - Las regiones con algún sector ilegible no guardan ningún byte (tampoco los de sus sectores sanos).
 - Con un MBR clásico la GPT no se lee (el MBR manda, ADR-022) y por tanto no se guarda.
-- APM (#17) no está incluido: se añadirá como variantes nuevas (cambio de versión si altera el
-  significado de lo existente).
+- APM (#17) se añadió **sin cambiar la versión 1**: solo son variantes, valores y una región nuevos y
+  el campo `layout.apm`, que se escribe únicamente con esquema `apm`. Una copia sin APM es byte a byte
+  la misma que antes, las copias anteriores se leen igual y un programa anterior rechaza (por valor o
+  campo desconocido) una copia con APM en lugar de malinterpretarla.
 - FFI e interfaz gráfica pendientes: por ahora, API de Rust y CLI.

@@ -24,6 +24,7 @@ use std::fmt;
 use mr_common::{HashAlgorithm, MultiHasher};
 use mr_io::BlockDevice;
 
+use crate::apm::{self, ApmRead};
 use crate::gpt::{self, GptCopy, GptRead, MAX_ENTRY_ARRAY_BYTES};
 use crate::mbr::{self, MAX_EBR_CHAIN};
 use crate::search::SearchResult;
@@ -130,16 +131,19 @@ pub enum RegionKind {
     GptPrimaryEntries,
     GptBackupHeader,
     GptBackupEntries,
+    /// Entradas del Apple Partition Map (desde el bloque 1; el bloque 0 es la región `mbr`).
+    ApmMap,
 }
 
 impl RegionKind {
-    pub const ALL: [RegionKind; 6] = [
+    pub const ALL: [RegionKind; 7] = [
         RegionKind::Mbr,
         RegionKind::Ebr,
         RegionKind::GptPrimaryHeader,
         RegionKind::GptPrimaryEntries,
         RegionKind::GptBackupHeader,
         RegionKind::GptBackupEntries,
+        RegionKind::ApmMap,
     ];
 
     /// Código estable del formato.
@@ -151,6 +155,7 @@ impl RegionKind {
             RegionKind::GptPrimaryEntries => "gpt_primary_entries",
             RegionKind::GptBackupHeader => "gpt_backup_header",
             RegionKind::GptBackupEntries => "gpt_backup_entries",
+            RegionKind::ApmMap => "apm_map",
         }
     }
 
@@ -162,6 +167,7 @@ impl RegionKind {
             RegionKind::GptPrimaryEntries => "entradas GPT primarias",
             RegionKind::GptBackupHeader => "cabecera GPT de respaldo",
             RegionKind::GptBackupEntries => "entradas GPT de respaldo",
+            RegionKind::ApmMap => "mapa de particiones APM",
         }
     }
 }
@@ -228,6 +234,7 @@ fn region_positions(
     dev_size: u64,
     ebr_lbas: &[u64],
     gpt: Option<&GptRead>,
+    apm: Option<&ApmRead>,
 ) -> Vec<(RegionKind, u64, u64)> {
     let mut out = vec![(RegionKind::Mbr, 0, dev_sector)];
     for &lba in ebr_lbas {
@@ -264,6 +271,19 @@ fn region_positions(
             if let Some(off) = entries_image.checked_mul(ss) {
                 out.push((ek, off, len));
             }
+        }
+    }
+    // APM: las entradas que recorre el lector (bloques 1 a n; de la última, sus 512 B).
+    if let Some(a) = apm.filter(|a| a.map_found) {
+        let block = u64::from(a.block_size);
+        let declared = u64::from(a.map_entries.clamp(1, apm::MAX_MAP_ENTRIES));
+        let n = declared.min(dev_size.saturating_sub(apm::ENTRY_BYTES) / block);
+        if n > 0 {
+            out.push((
+                RegionKind::ApmMap,
+                block,
+                (n - 1) * block + apm::ENTRY_BYTES,
+            ));
         }
     }
     out.retain(|&(_, off, len)| off.checked_add(len).is_some_and(|end| end <= dev_size));
@@ -332,6 +352,7 @@ fn positions_of(
         dev.sector_count() * u64::from(dev.sector_size()),
         &ebr_lbas,
         layout.gpt.as_ref(),
+        layout.apm.as_ref(),
     ))
 }
 
@@ -775,6 +796,7 @@ fn origin_text(o: &Origin) -> String {
         Origin::Primary { slot } => format!("entrada primaria {slot}"),
         Origin::Logical { ebr_lba, slot } => format!("entrada {slot} del EBR de la LBA {ebr_lba}"),
         Origin::Gpt { index } => format!("entrada GPT {index}"),
+        Origin::Apm { index } => format!("entrada APM {index}"),
     }
 }
 
@@ -784,6 +806,7 @@ fn scheme_text(s: Scheme) -> &'static str {
         Scheme::Mbr => "MBR",
         Scheme::Gpt => "GPT",
         Scheme::Hybrid => "MBR híbrido con GPT",
+        Scheme::Apm => "Apple Partition Map",
     }
 }
 
@@ -895,6 +918,8 @@ fn changed_fields(
     b: &Partition,
     ga: Option<&gpt::GptPartition>,
     gb: Option<&gpt::GptPartition>,
+    aa: Option<&apm::ApmPartition>,
+    ab: Option<&apm::ApmPartition>,
 ) -> Vec<&'static str> {
     let mut v = Vec::new();
     let mut check = |differs: bool, name| {
@@ -916,6 +941,11 @@ fn changed_fields(
     check(
         ga.map(|g| g.attributes) != gb.map(|g| g.attributes),
         "atributos",
+    );
+    check(
+        aa.map(|a| (a.status, a.data_start, a.data_count))
+            != ab.map(|a| (a.status, a.data_start, a.data_count)),
+        "estado APM",
     );
     v
 }
@@ -1010,7 +1040,14 @@ pub fn compare(
         match found {
             Some((i, q)) => {
                 matched[i] = true;
-                let fields = changed_fields(p, q, bl.gpt_entry(p), cl.gpt_entry(q));
+                let fields = changed_fields(
+                    p,
+                    q,
+                    bl.gpt_entry(p),
+                    cl.gpt_entry(q),
+                    bl.apm_entry(p),
+                    cl.apm_entry(q),
+                );
                 if !fields.is_empty() {
                     d.push(Difference::PartitionChanged {
                         backup: Box::new(p.clone()),

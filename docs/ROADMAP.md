@@ -99,7 +99,7 @@ Cerrado por el propietario (`PROGRESO.md`, etapa 8). APM y la copia del particio
     `partitions` / `--partition N` y pestaña «Particiones» en la interfaz (ADR-022).
   - **GPT con copia y tolerancias: hecho (#13)** e **integrado (#12)**: particiones GPT, copia de respaldo
     en uso y desplazamiento en API, ABI, CLI (`--apply-shift`) e interfaz (ADR-022, adenda).
-  - APM: #17, en M2.5.
+  - APM: #17, hecho en M2.5.
 - **Búsqueda exprés de particiones perdidas: hecha (#15)**: candidatos por niveles con presupuesto
   acotado, NTFS/FAT/exFAT con sus copias, tablas encontradas, hipótesis de desplazamiento, API, ABI 3
   ampliada, CLI `find-partitions` / `--found N` y acción en la pestaña «Particiones» (ADR-023).
@@ -110,7 +110,9 @@ Cerrado por el propietario (`PROGRESO.md`, etapa 8). APM y la copia del particio
 ## M2.5 · Funciones adicionales de particiones
 
 Milestone propio para no retrasar NTFS y la recuperación.
-- Apple Partition Map (#17, PT-04).
+- **Apple Partition Map: hecho (#17, PT-04)**: lector `mr-part::apm` con DDM, entradas, límites y anomalías
+  tipadas, esquema `Apm` en API, ABI 3 ampliada (`MR_SCHEME_APM`, `MR_ORIGIN_APM`, códigos 400-414), CLI e
+  interfaz; corpus con 3 imágenes APM (`formatos/apm.md`).
 - **Guardar y cargar una copia del particionado en formato propio: hecho (#18, PT-10)**: formato
   versionado `memrescue-partition-backup` (`formatos/copia-particionado.md`) con el particionado
   interpretado y los bytes de los sectores de tabla, ida y vuelta sin pérdidas con todo el corpus,

@@ -1,7 +1,8 @@
-//! Integración de los lectores MBR/EBR (#12) y GPT (#13): esquema del origen, unión de particiones y
+//! Integración de los lectores MBR/EBR (#12), GPT (#13) y APM (#17): esquema del origen, unión de particiones y
 //! anomalías, códigos estables de las anomalías GPT, nombres de tipo GPT y coordenadas para abrir una
 //! partición sin aplicar nunca en silencio el desplazamiento de una imagen (ADR-022).
 
+use crate::apm;
 use crate::gpt::{self, GptAnomaly, GptCopy};
 use crate::mbr::{self, MbrAnomaly};
 use crate::{Anomaly, Origin, Partition, PartitionTable, Scheme, Severity};
@@ -15,7 +16,11 @@ use mr_io::BlockDevice;
 ///    cabecera GPT) pero aparece alguna firma `EFI PART` en las posiciones de la GPT; en este último
 ///    caso el esquema pasa a `Gpt` (imágenes desplazadas o sin MBR protector). Con un MBR clásico
 ///    (`Mbr`) o un disco sin particionar (`Superfloppy`) la GPT no se mira: el MBR manda.
-/// 3. En un híbrido se listan las entradas MBR (distintas de 0xEE) y después las GPT, y cada entrada
+/// 3. Si la LBA 0 no tiene una tabla MBR utilizable, antes que la GPT se busca un Apple Partition
+///    Map ([`apm::read_apm`]): con una entrada `PM` en el bloque 1 el esquema es `Apm` (la GPT no se
+///    mira); un Driver Descriptor Map sin mapa solo da `Apm` (con `apm_map_missing`) si tampoco hay
+///    GPT. Las particiones APM están en bloques del mapa y `sector_size` es ese tamaño de bloque.
+/// 4. En un híbrido se listan las entradas MBR (distintas de 0xEE) y después las GPT, y cada entrada
 ///    MBR que no coincide con ninguna GPT recibe [`MbrAnomaly::HybridMismatch`].
 ///
 /// Las particiones GPT conservan las LBA **del disco** declaradas por la GPT; si la imagen está
@@ -30,6 +35,7 @@ pub fn read_partition_table(dev: &(impl BlockDevice + ?Sized)) -> mr_io::Result<
         partitions: scan.partitions,
         anomalies: scan.anomalies,
         gpt: None,
+        apm: None,
     };
     let superfloppy = table
         .anomalies
@@ -38,10 +44,19 @@ pub fn read_partition_table(dev: &(impl BlockDevice + ?Sized)) -> mr_io::Result<
     if table.scheme == Scheme::Mbr || superfloppy {
         return Ok(table);
     }
+    let apm = if table.scheme == Scheme::None {
+        apm::read_apm(dev)?
+    } else {
+        None
+    };
+    if apm.as_ref().is_some_and(|a| a.map_found) {
+        return Ok(with_apm(table, apm));
+    }
     let g = gpt::read_gpt(dev)?;
     match table.scheme {
         Scheme::Gpt | Scheme::Hybrid => {}
         _ if g.signature_found() || g.selected.is_some() => table.scheme = Scheme::Gpt,
+        _ if apm.is_some() => return Ok(with_apm(table, apm)),
         _ => return Ok(table),
     }
     let mbr_partitions = !table.partitions.is_empty();
@@ -62,6 +77,21 @@ pub fn read_partition_table(dev: &(impl BlockDevice + ?Sized)) -> mr_io::Result<
     }
     table.gpt = Some(g);
     Ok(table)
+}
+
+/// Incorpora la lectura APM: esquema `Apm`, LBA en bloques del mapa, particiones y anomalías.
+fn with_apm(mut table: PartitionTable, apm: Option<apm::ApmRead>) -> PartitionTable {
+    let Some(a) = apm else {
+        return table;
+    };
+    table.scheme = Scheme::Apm;
+    table.sector_size = a.block_size;
+    table
+        .partitions
+        .extend(a.partitions.iter().map(|p| p.partition.clone()));
+    table.anomalies.extend(a.anomalies.iter().cloned());
+    table.apm = Some(a);
+    table
 }
 
 /// Marca las entradas MBR de un híbrido que no describen exactamente una partición GPT.

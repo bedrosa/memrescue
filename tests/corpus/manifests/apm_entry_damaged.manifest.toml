@@ -1,0 +1,60 @@
+# Generado por tests/generators/gen_partition_images.py: no editar a mano.
+# Esquema en docs/PRUEBAS.md (§1.1). Las LBA de [[partitions]], de la GPT y hidden_sectors son las
+# declaradas (disco original); las demás, de la imagen: LBA imagen = LBA disco - leading_sectors_missing.
+schema_version = 2
+generator_version = 3
+name = "apm_entry_damaged"
+file = "apm_entry_damaged.img"
+scenario = "Apple Partition Map con la entrada 3 sin la firma PM (no se lista)"
+scheme = "apm"
+sector_size = 512
+total_sectors = 4096
+size_bytes = 2097152
+sha256 = "3009ba1fae3b9dfff7a7d1b9da8c83c8fa88b017db0d540322ea6aae43919df4"
+leading_sectors_missing = 0
+trailing_sectors_missing = 0
+apm_block_size = 512
+apm_disk_blocks = 4096
+apm_map_entries = 4
+
+[[partitions]]
+label = "MAP"
+start_lba = 1
+sectors = 63
+end_lba = 63
+apm_index = 1
+apm_type = "Apple_partition_map"
+apm_name = "Apple"
+apm_status = 55
+marker = ""
+
+[[partitions]]
+label = "H1"
+start_lba = 64
+sectors = 2048
+end_lba = 2111
+apm_index = 2
+apm_type = "Apple_HFS"
+apm_name = "MR-HFS"
+apm_status = 1073741875
+marker = "MEMRESCUE-TEST|apm_entry_damaged|H1|LBA=64|"
+
+[[partitions]]
+label = "H2"
+start_lba = 3136
+sectors = 960
+end_lba = 4095
+apm_index = 4
+apm_type = "Apple_HFS"
+apm_name = "MR-DATA"
+apm_status = 1073741875
+marker = "MEMRESCUE-TEST|apm_entry_damaged|H2|LBA=3136|"
+
+[[anomalies]]
+code = "mbr_missing"
+lba = 0
+
+[[anomalies]]
+code = "apm_entry_signature"
+lba = 3
+value = 3

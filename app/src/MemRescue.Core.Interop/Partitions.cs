@@ -13,6 +13,8 @@ public enum PartitionScheme : uint
     Gpt = 2,
     /// <summary>MBR híbrido (GPT y entradas MBR que describen particiones).</summary>
     Hybrid = 3,
+    /// <summary>Apple Partition Map (LBA en bloques del mapa).</summary>
+    Apm = 4,
 }
 
 /// <summary>Confianza de una tabla o partición (<c>MR_CONFIDENCE_*</c>).</summary>
@@ -53,6 +55,8 @@ public enum PartitionOrigin : uint
     Primary = 1,
     Logical = 2,
     Gpt = 3,
+    /// <summary>Entrada del Apple Partition Map (<c>Slot</c> = número de entrada desde 1).</summary>
+    Apm = 4,
 }
 
 public static class PartitionLabels
@@ -81,6 +85,7 @@ public static class PartitionLabels
         PartitionScheme.Mbr => "MBR",
         PartitionScheme.Gpt => "GPT",
         PartitionScheme.Hybrid => "híbrido MBR + GPT",
+        PartitionScheme.Apm => "Apple Partition Map (APM)",
         _ => "desconocido",
     };
 }
@@ -115,8 +120,11 @@ public sealed record PartitionEntry(
     byte MbrType, Guid GptType, bool Active, ConfidenceLevel Confidence, string TypeName,
     IReadOnlyList<PartitionAnomaly> Anomalies)
 {
-    /// <summary>Nombre GPT (vacío en MBR).</summary>
+    /// <summary>Nombre GPT o APM (vacío en MBR).</summary>
     public string Name { get; init; } = "";
+
+    /// <summary>Tipo APM tal como está en el mapa (p. ej. <c>Apple_HFS</c>); vacío en MBR y GPT.</summary>
+    public string ApmType { get; init; } = "";
 
     /// <summary>GUID único GPT (vacío en MBR).</summary>
     public Guid UniqueGuid { get; init; }
@@ -134,12 +142,16 @@ public sealed record PartitionEntry(
         PartitionOrigin.Primary => $"primaria {Slot + 1}",
         PartitionOrigin.Logical => $"lógica (EBR {EbrLba})",
         PartitionOrigin.Gpt => $"GPT {Slot + 1}",
+        PartitionOrigin.Apm => $"APM {Slot}",
         _ => "?",
     };
 
-    public string TypeLabel => Origin == PartitionOrigin.Gpt
-        ? (TypeName.Length > 0 ? TypeName : $"desconocido ({GptType})")
-        : $"0x{MbrType:X2} {(TypeName.Length > 0 ? TypeName : "desconocido")}";
+    public string TypeLabel => Origin switch
+    {
+        PartitionOrigin.Gpt => TypeName.Length > 0 ? TypeName : $"desconocido ({GptType})",
+        PartitionOrigin.Apm => TypeName.Length > 0 ? $"{ApmType} ({TypeName})" : ApmType,
+        _ => $"0x{MbrType:X2} {(TypeName.Length > 0 ? TypeName : "desconocido")}",
+    };
 }
 
 /// <summary>
@@ -171,11 +183,13 @@ public sealed class PartitionTable : EngineHandle
             var index = i;
             var name = Engine.ReadString((b, c) => (NativeMethods.mr_partition_type_name(Handle, index, b, c, out var n), n));
             var gptName = Engine.ReadString((b, c) => (NativeMethods.mr_partition_name(Handle, index, b, c, out var n), n));
+            var apmType = Engine.ReadString((b, c) => (NativeMethods.mr_partition_apm_type(Handle, index, b, c, out var n), n));
             parts.Add(new PartitionEntry((int)i, (PartitionOrigin)p.Origin, p.Slot, p.EbrLba, p.StartLba, p.SectorCount,
                 (byte)p.MbrType, p.GptType, p.Active != 0, (ConfidenceLevel)p.Confidence, name,
                 ReadAnomalies(i, p.AnomalyCount))
             {
                 Name = gptName,
+                ApmType = apmType,
                 UniqueGuid = p.UniqueGuid,
                 Attributes = p.Attributes,
             });

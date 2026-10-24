@@ -427,6 +427,7 @@ fn scheme_name(s: Scheme) -> &'static str {
         Scheme::Mbr => "mbr",
         Scheme::Gpt => "gpt",
         Scheme::Hybrid => "hybrid",
+        Scheme::Apm => "apm",
     }
 }
 
@@ -493,6 +494,7 @@ fn origin_parts(o: &Origin) -> (&'static str, u64, Option<u64>) {
         Origin::Primary { slot } => ("primary", u64::from(slot), None),
         Origin::Logical { ebr_lba, slot } => ("logical", u64::from(slot), Some(ebr_lba)),
         Origin::Gpt { index } => ("gpt", u64::from(index), None),
+        Origin::Apm { index } => ("apm", u64::from(index), None),
     }
 }
 
@@ -501,6 +503,7 @@ fn kind_text(k: &PartitionKind) -> (String, &'static str) {
     match k {
         PartitionKind::Mbr(t) => (format!("0x{t:02X}"), name),
         PartitionKind::Gpt(g) => (mr_api::mr_part::gpt::format_guid(g), name),
+        PartitionKind::Apm(t) => (t.text(), name),
     }
 }
 
@@ -516,7 +519,9 @@ fn print_partitions(t: &PartitionTable, json: bool) {
                 let (origin, slot, ebr) = origin_parts(&p.origin);
                 let kind = match p.kind {
                     PartitionKind::Mbr(k) => k.to_string(),
-                    PartitionKind::Gpt(_) => json_str(&kind_text(&p.kind).0),
+                    PartitionKind::Gpt(_) | PartitionKind::Apm(_) => {
+                        json_str(&kind_text(&p.kind).0)
+                    }
                 };
                 let anomalies: Vec<String> = p.anomalies.iter().map(anomaly_json).collect();
                 let gpt = match t.gpt_entry(p) {
@@ -526,7 +531,14 @@ fn print_partitions(t: &PartitionTable, json: bool) {
                         mr_api::mr_part::gpt::format_guid(&e.unique_guid),
                         e.attributes
                     ),
-                    None => String::new(),
+                    None => match t.apm_entry(p) {
+                        Some(e) => format!(
+                            ",\"name\":{},\"status\":{}",
+                            json_str(p.name.as_deref().unwrap_or("")),
+                            e.status
+                        ),
+                        None => String::new(),
+                    },
                 };
                 format!(
                     "{{\"number\":{},\"origin\":\"{origin}\",\"slot\":{slot},\"ebr_lba\":{},\"start_lba\":{},\"sectors\":{},\"end_lba\":{},\"type\":{kind},\"type_name\":{},\"active\":{},\"confidence\":\"{}\"{gpt},\"anomalies\":[{}]}}",
@@ -561,8 +573,17 @@ fn print_partitions(t: &PartitionTable, json: bool) {
             ),
             None => "null".into(),
         };
+        let apm = t.apm.as_ref().map_or_else(
+            || "null".into(),
+            |a| {
+                format!(
+                    "{{\"block_size\":{},\"disk_blocks\":{},\"map_entries\":{},\"ddm\":{},\"ddm_block_size\":{},\"ddm_block_count\":{}}}",
+                    a.block_size, a.disk_blocks, a.map_entries, a.ddm, a.ddm_block_size, a.ddm_block_count
+                )
+            },
+        );
         println!(
-            "{{\"scheme\":\"{}\",\"sector_size\":{},\"confidence\":\"{}\",\"gpt\":{gpt},\"partitions\":[{}],\"anomalies\":[{}]}}",
+            "{{\"scheme\":\"{}\",\"sector_size\":{},\"confidence\":\"{}\",\"gpt\":{gpt},\"apm\":{apm},\"partitions\":[{}],\"anomalies\":[{}]}}",
             scheme_name(t.scheme),
             t.sector_size,
             confidence_name(&t.confidence()),
@@ -576,6 +597,7 @@ fn print_partitions(t: &PartitionTable, json: bool) {
         Scheme::Mbr => "MBR",
         Scheme::Gpt => "GPT",
         Scheme::Hybrid => "híbrido MBR + GPT (entradas del MBR y después las de la GPT)",
+        Scheme::Apm => "Apple Partition Map (APM)",
     };
     println!("Esquema:         {scheme}");
     println!("Tamaño sector:   {} bytes", t.sector_size);
@@ -607,6 +629,18 @@ fn print_partitions(t: &PartitionTable, json: bool) {
             );
         }
     }
+    if let Some(a) = &t.apm {
+        println!(
+            "Mapa APM:        bloques de {} B, {} entradas declaradas, {}",
+            a.block_size,
+            a.map_entries,
+            if a.ddm {
+                "con Driver Descriptor Map"
+            } else {
+                "SIN Driver Descriptor Map"
+            }
+        );
+    }
     if t.partitions.is_empty() {
         println!("(sin particiones)");
     } else {
@@ -619,11 +653,13 @@ fn print_partitions(t: &PartitionTable, json: bool) {
                 Origin::Primary { slot } => format!("primaria {}", u32::from(slot) + 1),
                 Origin::Logical { ebr_lba, .. } => format!("lógica (EBR {ebr_lba})"),
                 Origin::Gpt { index } => format!("GPT {}", u64::from(index) + 1),
+                Origin::Apm { index } => format!("APM {index}"),
             };
             let (code, name) = kind_text(&p.kind);
             let kind = match p.kind {
                 PartitionKind::Mbr(_) => format!("{code} {name}"),
                 PartitionKind::Gpt(_) => name.to_string(),
+                PartitionKind::Apm(_) => format!("{code} ({name})"),
             };
             println!(
                 "{:>3}  {:<22} {:>3}  {:>12}  {:>12}  {:>12}  {:<34} {:<20} {}",

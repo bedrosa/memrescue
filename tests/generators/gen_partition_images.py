@@ -18,6 +18,8 @@ Referencias de formato (solo especificaciones públicas):
 - Microsoft "exFAT file system specification" (región de arranque de 12 sectores, copia en el 12,
   suma de comprobación del sector 11).
 - Estructura pública del sector de arranque NTFS (BPB, copia en el último sector del volumen).
+- Apple, "Inside Macintosh: Devices" (Driver Descriptor Map con firma ER en el bloque 0 y entradas
+  del Apple Partition Map con firma PM en los bloques 1 a N, enteros big-endian).
 """
 from __future__ import annotations
 
@@ -30,7 +32,7 @@ import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-GENERATOR_VERSION = 2
+GENERATOR_VERSION = 3
 SCHEMA_VERSION = 2
 NS = uuid.UUID("6d656d72-6573-6375-6500-000000000001")  # espacio de nombres fijo de MemRescue
 
@@ -55,6 +57,11 @@ class Partition:
     gpt_name: str = ""
     active: bool = False
     logical: bool = False
+    apm_index: int = 0
+    apm_type: str = ""
+    apm_name: str = ""
+    apm_status: int = 0
+    mark: bool = True  # False: el primer sector no lleva marcador (mapa APM, entrada fuera del disco)
 
     @property
     def end_lba(self) -> int:
@@ -111,7 +118,8 @@ class Image:
 
     def mark_partitions(self) -> None:
         for p in self.partitions:
-            self.put(p.start_lba, marker(self.name, p.label, p.start_lba))
+            if p.mark:
+                self.put(p.start_lba, marker(self.name, p.label, p.start_lba))
 
 
 def new_image(name: str, ss: int, total: int, scheme: str, scenario: str, **kw) -> Image:
@@ -690,6 +698,69 @@ def build_lost_volumes() -> list[Image]:
     return out
 
 
+# --------------------------------------------------------------------------------------------- APM
+
+
+APM_MAP = ("MAP", 1, 63, "Apple_partition_map", "Apple", 0x37)
+APM_ENTRIES = [
+    APM_MAP,
+    ("H1", 64, 2048, "Apple_HFS", "MR-HFS", 0x40000033),
+    ("F1", 2112, 1024, "Apple_Free", "Extra", 0),
+    ("H2", 3136, 960, "Apple_HFS", "MR-DATA", 0x40000033),
+]
+
+
+def apm_entry(count: int, start: int, size: int, ptype: str, name: str, status: int) -> bytes:
+    """Entrada del mapa (512 B, big-endian): firma PM, nº de entradas, inicio, tamaño, nombre, tipo,
+    área de datos lógica (toda la partición) y estado."""
+    e = bytearray(512)
+    struct.pack_into(">2sHIII32s32sIII", e, 0, b"PM", 0, count, start, size,
+                     name.encode("ascii"), ptype.encode("ascii"), 0, size, status)
+    return bytes(e)
+
+
+def build_apm(name: str, scenario: str, entries: list[tuple], damaged: tuple[int, ...] = ()) -> Image:
+    """Disco APM de 4096 bloques de 512 B: DDM (ER, tamaño de bloque y nº de bloques) en el bloque 0 y
+    una entrada por bloque desde el 1. Las entradas de `damaged` (desde 1) pierden la firma PM."""
+    ss, total = 512, 4096
+    img = new_image(name, ss, total, "apm", scenario)
+    ddm = bytearray(ss)
+    struct.pack_into(">2sHI", ddm, 0, b"ER", ss, total)
+    img.put(0, bytes(ddm))
+    img.anomalies = [Anomaly("mbr_missing", 0)]
+    for i, (label, start, size, ptype, pname, status) in enumerate(entries, start=1):
+        e = bytearray(apm_entry(len(entries), start, size, ptype, pname, status))
+        if i in damaged:
+            e[0:2] = b"\x00\x00"
+            img.anomalies.append(Anomaly("apm_entry_signature", i, value=i))
+            img.put(i, bytes(e))
+            continue
+        img.put(i, bytes(e))
+        inside = start < total
+        if not inside:
+            img.anomalies.append(Anomaly("apm_entry_outside_disk", i, value=i))
+        elif start + size > total:
+            img.anomalies.append(Anomaly("apm_entry_partially_outside_disk", i, value=i))
+        img.partitions.append(Partition(label, start, size, apm_index=i, apm_type=ptype, apm_name=pname,
+                                        apm_status=status, mark=inside and ptype != "Apple_partition_map"))
+    img.extra = {"apm_block_size": ss, "apm_disk_blocks": total, "apm_map_entries": len(entries)}
+    img.mark_partitions()
+    return img
+
+
+def build_apm_all() -> list[Image]:
+    outside = [APM_ENTRIES[0], APM_ENTRIES[1], ("F1", 2112, 2000, "Apple_Free", "Extra", 0),
+               ("H2", 5000, 960, "Apple_HFS", "MR-DATA", 0x40000033)]
+    return [
+        build_apm("apm_basic", "Apple Partition Map sano: DDM de 512 B, mapa de 4 entradas (mapa, 2 Apple_HFS y Apple_Free)",
+                  APM_ENTRIES),
+        build_apm("apm_entry_damaged", "Apple Partition Map con la entrada 3 sin la firma PM (no se lista)",
+                  APM_ENTRIES, damaged=(3,)),
+        build_apm("apm_entry_outside", "Apple Partition Map con una entrada que termina fuera del disco y otra que empieza fuera",
+                  outside),
+    ]
+
+
 # ------------------------------------------------------------------------------------- catálogo
 
 
@@ -741,6 +812,8 @@ def build_all() -> list[Image]:
                       leading=1),
         build_gpt_cut("gpt_truncated_end", "Imagen GPT recortada al final: faltan 200 sectores y el respaldo",
                       trailing=200),
+        # Apple Partition Map (#17)
+        *build_apm_all(),
         # Volúmenes perdidos (tabla borrada) y casos negativos de la búsqueda (INV-05b §9)
         *build_lost_volumes(),
     ]
@@ -786,7 +859,10 @@ def manifest(img: Image, sha256: str) -> str:
     for p in img.partitions:
         lines += ["", "[[partitions]]", f'label = "{p.label}"', f"start_lba = {p.start_lba}",
                   f"sectors = {p.sectors}", f"end_lba = {p.end_lba}"]
-        if not gpt_keys:
+        if img.scheme == "apm":
+            lines += [f"apm_index = {p.apm_index}", f"apm_type = {toml_value(p.apm_type)}",
+                      f"apm_name = {toml_value(p.apm_name)}", f"apm_status = {p.apm_status}"]
+        elif not gpt_keys:
             lines += [f"mbr_type = {p.mbr_type}", f"active = {toml_value(p.active)}",
                       f"logical = {toml_value(p.logical)}"]
         else:
@@ -794,7 +870,8 @@ def manifest(img: Image, sha256: str) -> str:
                       f'unique_guid = "{det_guid(f"{img.name}/{p.label}")}"']
         if img.leading_missing:
             lines.append(f"marker_lba = {p.start_lba - img.leading_missing}")
-        lines.append(f'marker = "{marker(img.name, p.label, p.start_lba).decode()}"')
+        text = marker(img.name, p.label, p.start_lba).decode() if p.mark else ""
+        lines.append(f'marker = "{text}"')
     for h in img.hybrid_entries:
         lines += ["", "[[hybrid_mbr_entries]]"] + [f"{k} = {toml_value(v)}" for k, v in h.items()]
     for a in img.anomalies:

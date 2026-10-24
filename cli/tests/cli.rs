@@ -408,7 +408,7 @@ fn partitions_lists_table_confidence_and_anomalies() {
     let json = String::from_utf8_lossy(&o.stdout);
     assert!(
         json.contains(
-            "\"scheme\":\"none\",\"sector_size\":512,\"confidence\":\"valid\",\"gpt\":null,\"partitions\":[]"
+            "\"scheme\":\"none\",\"sector_size\":512,\"confidence\":\"valid\",\"gpt\":null,\"apm\":null,\"partitions\":[]"
         ),
         "{json}"
     );

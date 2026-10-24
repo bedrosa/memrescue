@@ -113,7 +113,11 @@ fn partition_markers(manifest: &Path) -> Vec<(u64, String)> {
             lba = Some(v.parse().unwrap());
         }
         if let Some(v) = l.strip_prefix("marker = ") {
-            out.push((lba.take().unwrap(), v.trim_matches('"').to_string()));
+            let (lba, v) = (lba.take().unwrap(), v.trim_matches('"'));
+            // Sin marcador: el mapa APM (su primer bloque es la entrada 1) o una entrada fuera.
+            if !v.is_empty() {
+                out.push((lba, v.to_string()));
+            }
         }
     }
     out
@@ -172,7 +176,7 @@ fn sector_reads_land_on_the_exact_lba_for_every_sector_size() {
         );
     }
     assert_eq!(
-        checked, 44,
+        checked, 51,
         "marcadores de las particiones declaradas en los manifiestos"
     );
 }

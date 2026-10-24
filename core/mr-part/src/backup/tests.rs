@@ -2,6 +2,7 @@
 //! variantes, manipulaciones, comparación y fuzzing del lector.
 
 use super::*;
+use crate::apm::ApmAnomaly;
 use crate::gpt::{GptAnomaly, GptField, HeaderState};
 use crate::mbr::{MbrAnomaly, NoTableReason};
 use crate::search::{
@@ -906,5 +907,196 @@ fn seeded_fuzz_never_panics() {
         let len = rng.below(512);
         let d: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
         let _ = LayoutBackup::from_bytes(&d);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Apple Partition Map (#17)
+// ---------------------------------------------------------------------------------------------
+
+/// Disco APM de 256 bloques de 512 B: DDM y mapa de 3 entradas (mapa, `Apple_HFS` en [64, 128) y
+/// `Apple_Free` en [128, 256)).
+fn apm_disk() -> Vec<u8> {
+    let mut d = vec![0u8; 256 * SS];
+    d[..2].copy_from_slice(b"ER");
+    d[2..4].copy_from_slice(&512u16.to_be_bytes());
+    d[4..8].copy_from_slice(&256u32.to_be_bytes());
+    let entries: [(u32, u32, &str, &str, u32); 3] = [
+        (1, 63, "Apple_partition_map", "Apple", 0x37),
+        (64, 64, "Apple_HFS", "MR-HFS", 0x4000_0033),
+        (128, 128, "Apple_Free", "Extra", 0),
+    ];
+    for (i, (start, size, kind, name, status)) in entries.iter().enumerate() {
+        let e = &mut d[(i + 1) * SS..(i + 2) * SS];
+        e[..2].copy_from_slice(b"PM");
+        e[4..8].copy_from_slice(&3u32.to_be_bytes());
+        e[8..12].copy_from_slice(&start.to_be_bytes());
+        e[12..16].copy_from_slice(&size.to_be_bytes());
+        e[16..16 + name.len()].copy_from_slice(name.as_bytes());
+        e[48..48 + kind.len()].copy_from_slice(kind.as_bytes());
+        e[84..88].copy_from_slice(&size.to_be_bytes());
+        e[88..92].copy_from_slice(&status.to_be_bytes());
+    }
+    d
+}
+
+#[test]
+fn apm_round_trips_with_its_map() {
+    let d = dev(apm_disk());
+    let b = capture(&d, "disco APM sintético", None).unwrap();
+    assert_eq!(b.layout.scheme, Scheme::Apm);
+    assert_eq!(b.layout.partitions.len(), 3);
+    assert!(b.layout.apm.is_some());
+    assert_eq!(
+        kinds(&b),
+        vec![
+            (RegionKind::Mbr, 0, 512),
+            (RegionKind::ApmMap, 512, 3 * 512)
+        ]
+    );
+    round_trip(&b);
+    let text = b.to_text();
+    assert!(text.contains("\"scheme\": \"apm\""), "{text}");
+    assert!(text.contains("\"kind\": \"apm_map\""));
+    assert!(compare(&b, &d).unwrap().identical());
+    // Una copia sin APM no lleva el campo `apm` (mismo documento que antes de #17).
+    assert!(!mbr_text().contains("\"apm\""));
+}
+
+#[test]
+fn every_apm_variant_round_trips() {
+    let mut b = capture(&dev(apm_disk()), "", None).unwrap();
+    let all = vec![
+        ApmAnomaly::DdmMissing,
+        ApmAnomaly::BlockSizeInvalid { declared: 1000 },
+        ApmAnomaly::BlockSizeMismatch {
+            declared: 2048,
+            used: 512,
+        },
+        ApmAnomaly::DiskSizeMismatch {
+            declared: u64::MAX,
+            available: 1,
+        },
+        ApmAnomaly::MapMissing { lba: 1 },
+        ApmAnomaly::MapCountInvalid {
+            lba: 1,
+            count: u32::MAX,
+        },
+        ApmAnomaly::MapCountMismatch {
+            lba: 2,
+            index: 2,
+            count: 0,
+        },
+        ApmAnomaly::MapOutsideImage { index: 9 },
+        ApmAnomaly::EntrySignature { lba: 3, index: 3 },
+        ApmAnomaly::EntryZeroLength { lba: 4, index: 4 },
+        ApmAnomaly::EntryOutsideDisk {
+            lba: 5,
+            index: 5,
+            start: u64::MAX,
+        },
+        ApmAnomaly::EntryPartiallyOutsideDisk {
+            lba: 6,
+            index: 6,
+            end: 7,
+        },
+        ApmAnomaly::EntryOverlap {
+            lba: 7,
+            index: 7,
+            other: 2,
+        },
+        ApmAnomaly::EntryDataOutside { lba: 8, index: 8 },
+        ApmAnomaly::SectorSizeMismatch {
+            block_size: 2048,
+            device: 512,
+        },
+    ];
+    let all: Vec<Anomaly> = all.into_iter().map(Anomaly::Apm).collect();
+    b.layout.anomalies = all.clone();
+    b.layout.partitions[1].anomalies = all.clone();
+    // Tipo con bytes tras el NUL: se conserva sin pérdidas.
+    let mut raw = [0xFFu8; 32];
+    raw[..4].copy_from_slice(b"X\0Y\x01");
+    b.layout.partitions[1].kind = PartitionKind::Apm(crate::apm::ApmType(raw));
+    let a = b.layout.apm.as_mut().unwrap();
+    a.anomalies = all;
+    a.partitions[0].status = u32::MAX;
+    round_trip(&b);
+}
+
+#[test]
+fn apm_field_must_match_the_scheme() {
+    let b = capture(&dev(apm_disk()), "", None).unwrap();
+    let text = b.to_text();
+    // Esquema apm sin lectura APM.
+    let mut no_apm = b.clone();
+    no_apm.layout.apm = None;
+    let edited = refresh_body_sum(&no_apm.to_text());
+    match LayoutBackup::from_text(&edited) {
+        Err(BackupError::Invalid { path, .. }) => assert!(path.ends_with("layout"), "{path}"),
+        other => panic!("{other:?}"),
+    }
+    // Lectura APM con otro esquema.
+    let edited = refresh_body_sum(&text.replacen("\"scheme\": \"apm\"", "\"scheme\": \"none\"", 1));
+    assert!(matches!(
+        LayoutBackup::from_text(&edited),
+        Err(BackupError::Invalid { .. })
+    ));
+    // `apm: null` explícito en una copia sin APM se acepta (equivale a ausente).
+    let mbr = mbr_text();
+    let edited =
+        refresh_body_sum(&mbr.replacen("\"gpt\": null", "\"gpt\": null,\n    \"apm\": null", 1));
+    assert_ne!(edited, mbr);
+    assert_eq!(
+        LayoutBackup::from_text(&edited).unwrap(),
+        LayoutBackup::from_text(&mbr).unwrap()
+    );
+}
+
+#[test]
+fn comparison_reports_changed_apm_entry_and_map() {
+    let b = capture(&dev(apm_disk()), "", None).unwrap();
+    let mut d = apm_disk();
+    // Entrada 2: inicio movido y estado cambiado.
+    d[2 * SS + 8..2 * SS + 12].copy_from_slice(&65u32.to_be_bytes());
+    d[2 * SS + 88..2 * SS + 92].copy_from_slice(&0u32.to_be_bytes());
+    let c = compare(&b, &dev(d)).unwrap();
+    assert!(c.differences.iter().any(|x| matches!(
+        x,
+        Difference::Region {
+            kind: RegionKind::ApmMap,
+            offset: 512,
+            ..
+        }
+    )));
+    assert!(c.differences.iter().any(|x| matches!(
+        x,
+        Difference::PartitionChanged { fields, .. }
+            if fields.contains(&"inicio") && fields.contains(&"estado APM")
+    )));
+    // Mapa borrado (queda el DDM): las particiones desaparecen y aparece `apm_map_missing`.
+    let mut d = apm_disk();
+    d[SS..4 * SS].fill(0);
+    let c = compare(&b, &dev(d)).unwrap();
+    let removed = c
+        .differences
+        .iter()
+        .filter(|x| matches!(x, Difference::PartitionRemoved { .. }))
+        .count();
+    assert_eq!(removed, 3);
+    assert!(c
+        .differences
+        .iter()
+        .any(|x| matches!(x, Difference::AnomalyAdded(a) if a.code() == "apm_map_missing")));
+    // Sin DDM ni mapa ya no hay APM: cambia el esquema.
+    let mut d = apm_disk();
+    d[..4 * SS].fill(0);
+    let c = compare(&b, &dev(d)).unwrap();
+    assert!(c
+        .differences
+        .iter()
+        .any(|x| matches!(x, Difference::Scheme { .. })));
+    for x in &c.differences {
+        assert!(!x.to_string().is_empty() && !x.code().is_empty());
     }
 }
