@@ -38,6 +38,10 @@
  * mr_found_volume_open). mr_task_status_get, mr_task_cancel y mr_task_free admiten la tarea.
  * Añadido sin cambiar la ABI 3 (M2.5, issue #17): Apple Partition Map (MR_SCHEME_APM,
  * MR_ORIGIN_APM, códigos 400-414 y mr_partition_apm_type).
+ * Añadido sin cambiar la ABI 3 (M3, issue #22): sistema de archivos NTFS (mr_ntfs_*): volumen,
+ * listado de directorios por índice, rutas, árbol como tarea, un fichero como origen y copia de
+ * un fichero como tarea; códigos 15 (MR_ERR_NOT_FOUND) y 16 (MR_ERR_ALREADY_EXISTS), que solo
+ * devuelven estas funciones.
  */
 #ifndef MEMRESCUE_CORE_H
 #define MEMRESCUE_CORE_H
@@ -69,6 +73,8 @@ typedef int32_t mr_status;
 #define MR_ERR_CORRUPT            12   /* estructura del contenedor dañada o incoherente */
 #define MR_ERR_EXTERNAL_REFERENCE 13   /* necesita otro fichero (padre, extensión) que no se abre */
 #define MR_ERR_UNSUPPORTED_FEATURE 14  /* variante del formato aún no soportada */
+#define MR_ERR_NOT_FOUND          15   /* ruta NTFS que no existe (#22) */
+#define MR_ERR_ALREADY_EXISTS     16   /* la salida ya existe y no se pidió sustituirla (#22) */
 #define MR_ERR_PANIC              99
 
 /* Algoritmos de hash (máscara de bits para *_hash_start, valor único para mr_hash_result). */
@@ -574,6 +580,182 @@ mr_status mr_found_table_get(uint64_t task, uint32_t index, mr_found_table *out)
  * MR_FOUND_REQUIRES_SHIFT solo con MR_PARTITION_OPEN_APPLY_SHIFT. Se cierra con mr_source_close. */
 mr_status mr_found_volume_open(uint64_t task, uint32_t index, uint32_t flags,
                                uint64_t *out_source);
+
+/*
+ * Sistema de archivos NTFS (M3, issue #22). Solo lectura. Handles del mismo registro que
+ * orígenes y tareas; estructuras de salida versionadas por struct_size; consultas por índice.
+ * Un volumen sobrevive al cierre de su origen; los listados y tareas, a la liberación del volumen.
+ * Cada entrada de directorio está contrastada con la MFT: solo MR_NTFS_ENTRY_LIVE es un fichero
+ * vivo; las demás son entradas del índice cuyo registro está libre, reutilizado, ilegible o
+ * dañado (16-31 reservados para borrados y residuales, #23).
+ */
+#define MR_NTFS_BOOT_FROM_BACKUP    1u
+#define MR_NTFS_VERSION_KNOWN       2u
+#define MR_NTFS_UPCASE_FROM_VOLUME  4u   /* si no, plegado simple de mayúsculas */
+
+typedef struct mr_ntfs_volume_info {  /* 72 bytes */
+    uint32_t struct_size;        /* = sizeof(mr_ntfs_volume_info) */
+    uint32_t confidence;         /* MR_CONFIDENCE_* */
+    uint64_t serial;
+    uint64_t record_count;       /* registros de la MFT */
+    uint64_t total_clusters;
+    uint32_t cluster_size;
+    uint32_t record_size;
+    uint32_t index_record_size;
+    uint32_t bytes_per_sector;
+    uint32_t version_major;      /* con MR_NTFS_VERSION_KNOWN */
+    uint32_t version_minor;
+    uint32_t flags;              /* MR_NTFS_BOOT_FROM_BACKUP | VERSION_KNOWN | UPCASE_FROM_VOLUME */
+    uint32_t anomaly_count;      /* mr_ntfs_volume_anomaly_text */
+    uint64_t mft_lcn;
+} mr_ntfs_volume_info;
+
+#define MR_NTFS_ENTRY_LIVE              1u
+#define MR_NTFS_ENTRY_STALE_NOT_IN_USE  2u   /* registro libre: entrada residual */
+#define MR_NTFS_ENTRY_STALE_REUSED      3u   /* registro reutilizado (otra secuencia) */
+#define MR_NTFS_ENTRY_RECORD_UNUSABLE   4u   /* registro dañado, ilegible...: record_state */
+#define MR_NTFS_ENTRY_INVALID_REFERENCE 5u   /* fuera de la MFT o registro de extensión */
+#define MR_NTFS_ENTRY_DIRECTORY         1u   /* mr_ntfs_entry.flags */
+#define MR_NTFS_ENTRY_SYSTEM            2u   /* registros 0-15 y contenido de $Extend */
+#define MR_NTFS_ENTRY_NAME_LOSSY        4u   /* unidades UTF-16 sueltas sustituidas por U+FFFD */
+#define MR_NTFS_ENTRY_HAS_DOS_NAME      8u
+#define MR_NTFS_ENTRY_TIMES_FROM_INDEX 16u   /* fechas de la clave del índice, no del registro */
+
+typedef struct mr_ntfs_entry {  /* 104 bytes */
+    uint32_t struct_size;        /* = sizeof(mr_ntfs_entry) */
+    uint32_t state;              /* MR_NTFS_ENTRY_LIVE ... */
+    uint64_t record;
+    uint64_t parent_record;
+    uint32_t sequence;           /* de la referencia del índice */
+    uint32_t parent_sequence;
+    uint64_t size;               /* $DATA principal; 0 en directorios */
+    uint64_t allocated_size;
+    uint64_t created;            /* FILETIME UTC */
+    uint64_t modified;
+    uint64_t mft_modified;
+    uint64_t accessed;
+    uint32_t file_attributes;    /* atributos DOS */
+    uint32_t flags;              /* MR_NTFS_ENTRY_DIRECTORY ... */
+    uint32_t name_space;         /* 0 POSIX, 1 Win32, 2 DOS, 3 Win32 y DOS */
+    uint32_t link_count;
+    uint32_t record_state;       /* RECORD_UNUSABLE: 1 en uso, 2 no en uso, 3 vacío, 4 sin
+                                    inicializar, 5 sin mapa, 6 fuera del origen, 7 ilegible,
+                                    8 dañado */
+    uint32_t found_sequence;     /* secuencia actual del registro (0 si no se leyó) */
+} mr_ntfs_entry;
+
+typedef struct mr_ntfs_listing_info {  /* 32 bytes */
+    uint32_t struct_size;
+    uint32_t entry_count;
+    uint64_t directory_record;
+    uint32_t directory_sequence;
+    uint32_t anomaly_count;      /* mr_ntfs_listing_anomaly_text */
+    uint32_t live_count;
+    uint32_t unreadable;         /* 1 si algún nodo o registro tenía sectores no fiables */
+} mr_ntfs_listing_info;
+
+#define MR_NTFS_TREE_NO_ORPHANS   1u   /* mr_ntfs_tree_start: sin búsqueda de huérfanos */
+#define MR_NTFS_TREE_COMPLETE     1u
+#define MR_NTFS_TREE_LIMIT        2u
+#define MR_NTFS_TREE_CANCELLED    3u
+#define MR_NTFS_ROOT_PARENT       UINT64_MAX
+
+typedef struct mr_ntfs_tree_info {  /* 40 bytes */
+    uint32_t struct_size;
+    uint32_t status;             /* MR_NTFS_TREE_COMPLETE / _LIMIT / _CANCELLED */
+    uint64_t node_count;         /* el nodo 0 es la raíz */
+    uint64_t orphan_count;
+    uint32_t anomaly_count;
+    uint32_t reserved;
+    uint64_t directories;
+} mr_ntfs_tree_info;
+
+/* Motivo de un huérfano (registro en uso no alcanzado desde la raíz). */
+#define MR_NTFS_ORPHAN_NO_NAME              1u
+#define MR_NTFS_ORPHAN_PARENT_OUT_OF_RANGE  2u
+#define MR_NTFS_ORPHAN_PARENT_UNUSABLE      3u
+#define MR_NTFS_ORPHAN_PARENT_NOT_IN_USE    4u
+#define MR_NTFS_ORPHAN_PARENT_REUSED        5u
+#define MR_NTFS_ORPHAN_PARENT_NOT_DIRECTORY 6u
+#define MR_NTFS_ORPHAN_NOT_INDEXED          7u
+#define MR_NTFS_ORPHAN_PARENT_ORPHAN        8u
+#define MR_NTFS_ORPHAN_LOOP                 9u
+#define MR_NTFS_ORPHAN_TOO_DEEP            10u
+
+typedef struct mr_ntfs_orphan {  /* 40 bytes */
+    uint32_t struct_size;
+    uint32_t reason;             /* MR_NTFS_ORPHAN_* */
+    uint64_t record;
+    uint64_t parent_record;
+    uint32_t sequence;
+    uint32_t parent_sequence;
+    uint32_t flags;              /* MR_NTFS_ENTRY_DIRECTORY */
+    uint32_t reserved;
+} mr_ntfs_orphan;
+
+#define MR_NTFS_COPY_OVERWRITE          1u   /* mr_ntfs_copy_start: sustituir la salida */
+#define MR_NTFS_COPY_RANGES_TRUNCATED   1u   /* mr_ntfs_copy_report.flags */
+#define MR_NTFS_COPY_RECORD_NOT_IN_USE  2u
+
+typedef struct mr_ntfs_copy_report {  /* 56 bytes */
+    uint32_t struct_size;
+    uint32_t untrusted_range_count;
+    uint64_t bytes;
+    uint64_t untrusted_bytes;    /* no fiables: patrón de relleno BAD! o posiblemente sobrescritos */
+    uint64_t sparse_bytes;
+    uint64_t uninitialized_bytes;
+    uint64_t possibly_overwritten_bytes; /* parte de untrusted_bytes: clústeres quizá reutilizados */
+    uint32_t flags;
+    uint32_t reserved;
+} mr_ntfs_copy_report;
+
+mr_status mr_ntfs_open(uint64_t source, uint64_t *out_volume);
+mr_status mr_ntfs_volume_info(uint64_t volume, mr_ntfs_volume_info *out);
+mr_status mr_ntfs_volume_label(uint64_t volume, uint8_t *buf, size_t cap, size_t *out_len);
+/* "<código>\n<descripción>" */
+mr_status mr_ntfs_volume_anomaly_text(uint64_t volume, uint32_t index,
+                                      uint8_t *buf, size_t cap, size_t *out_len);
+mr_status mr_ntfs_volume_free(uint64_t volume);
+/* record 5 = raíz. Registro que no es un directorio: MR_ERR_INVALID_ARGUMENT. */
+mr_status mr_ntfs_list_dir(uint64_t volume, uint64_t record, uint64_t *out_listing);
+mr_status mr_ntfs_listing_info(uint64_t listing, mr_ntfs_listing_info *out);
+mr_status mr_ntfs_listing_entry(uint64_t listing, uint32_t index, mr_ntfs_entry *out);
+mr_status mr_ntfs_listing_entry_name(uint64_t listing, uint32_t index,
+                                     uint8_t *buf, size_t cap, size_t *out_len);
+mr_status mr_ntfs_listing_anomaly_text(uint64_t listing, uint32_t index,
+                                       uint8_t *buf, size_t cap, size_t *out_len);
+mr_status mr_ntfs_listing_free(uint64_t listing);
+/* Ruta absoluta sin distinguir mayúsculas; no existe: MR_ERR_NOT_FOUND. */
+mr_status mr_ntfs_resolve(uint64_t volume, const uint8_t *path, size_t path_len,
+                          mr_ntfs_entry *out);
+/* Huérfano: MR_ERR_CORRUPT con el motivo en mr_last_error. */
+mr_status mr_ntfs_path_of(uint64_t volume, uint64_t record,
+                          uint8_t *buf, size_t cap, size_t *out_len);
+/* Tarea: progreso = entradas listadas + registros revisados; cancelada con árbol parcial. */
+mr_status mr_ntfs_tree_start(uint64_t volume, uint32_t flags, uint64_t *out_task);
+mr_status mr_ntfs_tree_result(uint64_t task, mr_ntfs_tree_info *out);
+mr_status mr_ntfs_tree_node(uint64_t task, uint64_t index, uint64_t *out_parent,
+                            uint32_t *out_depth, mr_ntfs_entry *out_entry);
+mr_status mr_ntfs_tree_node_path(uint64_t task, uint64_t index,
+                                 uint8_t *buf, size_t cap, size_t *out_len);
+/* "<código>\n<ruta del directorio>\n<descripción>" */
+mr_status mr_ntfs_tree_anomaly_text(uint64_t task, uint32_t index,
+                                    uint8_t *buf, size_t cap, size_t *out_len);
+mr_status mr_ntfs_tree_orphan(uint64_t task, uint32_t index, mr_ntfs_orphan *out);
+/* "<código>\n<nombre>\n<descripción>" */
+mr_status mr_ntfs_tree_orphan_text(uint64_t task, uint32_t index,
+                                   uint8_t *buf, size_t cap, size_t *out_len);
+/* Flujo $DATA (stream vacío = principal) como origen de sectores de 512 B; se cierra con
+ * mr_source_close. Los tramos no fiables se leen como sectores ilegibles. */
+mr_status mr_ntfs_open_stream(uint64_t volume, uint64_t record,
+                              const uint8_t *stream, size_t stream_len, uint64_t *out_source);
+/* Copia como tarea (progreso en bytes). Nunca el origen ni un dispositivo ni un directorio;
+ * salida existente: MR_ERR_ALREADY_EXISTS salvo MR_NTFS_COPY_OVERWRITE; escritura atómica. */
+mr_status mr_ntfs_copy_start(uint64_t volume, uint64_t record,
+                             const uint8_t *stream, size_t stream_len,
+                             const uint8_t *out_path, size_t out_path_len,
+                             uint32_t flags, uint64_t *out_task);
+mr_status mr_ntfs_copy_result(uint64_t task, mr_ntfs_copy_report *out);
 
 mr_status mr_task_status_get(uint64_t task, mr_task_status *out);
 mr_status mr_task_cancel(uint64_t task);

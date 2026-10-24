@@ -628,9 +628,20 @@ fn ntfs_cat_and_stat_validate_arguments_before_writing() {
         vec!["ntfs-info", f, "--record", "5"],
         vec!["ntfs-cat", f, "--record", "5", "--stream"],
         vec!["ntfs-cat", f, "--record", "5", "--overwrite"],
+        vec!["ntfs-cat", f, "--record", "5", "/a.txt"],
+        vec!["ntfs-cat", f, "/a.txt", "/b.txt"],
+        vec!["ntfs-cat", f, "/a.txt", "-r"],
+        vec!["ntfs-ls", f, "/", "/x"],
+        vec!["ntfs-ls", f, "--record", "5"],
+        vec!["ntfs-ls", f, "-o", o_s],
+        vec!["ntfs-ls"],
+        vec!["ntfs-info", f, "-r"],
     ] {
         let o = cli().args(&args).output().unwrap();
         assert_eq!(o.status.code(), Some(2), "{args:?}");
     }
     assert!(!out.exists());
+    // ntfs-ls sobre un origen sin NTFS: error de operación.
+    let o = cli().args(["ntfs-ls", f, "/", "-r"]).output().unwrap();
+    assert_eq!(o.status.code(), Some(1));
 }

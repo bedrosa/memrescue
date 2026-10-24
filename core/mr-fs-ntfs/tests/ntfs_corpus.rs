@@ -1,4 +1,4 @@
-//! Lector NTFS (#20, #21) contra el corpus NTFS (ADR-024, esquema del manifiesto en `docs/PRUEBAS.md`
+//! Lector NTFS (#20, #21, #22) contra el corpus NTFS (ADR-024, esquema del manifiesto en `docs/PRUEBAS.md`
 //! §1.2). La verdad de los manifiestos la obtuvo The Sleuth Kit, no MemRescue.
 //!
 //! Requieren las imágenes descargadas (`python -I -X utf8 tools/fetch_ntfs_corpus.py`, en
@@ -10,10 +10,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use mr_common::{HashAlgorithm, MultiHasher};
+use mr_fs_ntfs::dir::NoTreeObserver;
 use mr_fs_ntfs::runs::{merge_contiguous, sparse_ranges, Run};
+use mr_fs_ntfs::upcase::UpcaseSource;
 use mr_fs_ntfs::{
-    BackupState, BootSource, Confidence, DataStream, NtfsError, NtfsVolume, RangeState,
-    RecordOutcome, RecordSource, RecordState,
+    BackupState, BootSource, Confidence, DataStream, EntryState, NodeId, NtfsError, NtfsVolume,
+    OrphanReason, RangeState, RecordOutcome, RecordSource, RecordState, TreeOptions, TreeStatus,
 };
 use mr_io::{BlockDevice, FaultyDevice, ImageFile, RangeView};
 use mr_part::{open_coordinates, read_partition_table, Scheme};
@@ -665,4 +667,220 @@ fn unreadable_clusters_inside_a_file_are_reported_per_range() {
             assert_eq!(g, w, "byte {i}");
         }
     }
+}
+
+/// Árbol (#22) de un volumen con las opciones por defecto (con búsqueda de huérfanos).
+fn full_tree(v: &NtfsVolume) -> mr_fs_ntfs::Tree {
+    v.tree(&TreeOptions::default(), &NoTreeObserver).unwrap()
+}
+
+fn is_damaged(f: &HashMap<String, String>) -> bool {
+    f.get("mft_damaged").map(String::as_str) == Some("true")
+}
+
+#[test]
+#[ignore = "requiere el corpus NTFS (tools/fetch_ntfs_corpus.py)"]
+fn tree_matches_the_live_paths_of_every_manifest() {
+    let mut total = 0;
+    let mut accented = 0;
+    let mut deepest = 0;
+    for m in manifests() {
+        let name = m.name().to_string();
+        let v = open(&m);
+        assert_eq!(v.upcase().source(), &UpcaseSource::Volume, "{name}");
+        let t = full_tree(&v);
+        assert_eq!(t.status, TreeStatus::Complete, "{name}");
+        assert!(t.anomalies.is_empty(), "{name}: {:?}", t.anomalies);
+        assert!(t.orphans.is_empty(), "{name}: {:?}", t.orphans);
+        assert_eq!(t.nodes[0].path, "/");
+        let got: BTreeSet<(String, &str, u64)> = t
+            .nodes
+            .iter()
+            .skip(1)
+            .filter(|n| n.entry.state.is_live() && !n.entry.system)
+            .map(|n| {
+                let ty = if n.entry.is_directory { "dir" } else { "file" };
+                (n.path.clone(), ty, n.entry.record())
+            })
+            .collect();
+        let want: BTreeSet<(String, &str, u64)> = m
+            .files
+            .iter()
+            .filter(|f| f["state"] == "live" && !is_damaged(f))
+            .map(|f| {
+                (
+                    f["path"].clone(),
+                    f["type"].as_str(),
+                    f["mft_record"].parse().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(got, want, "{name}");
+        // Entradas que apuntan a registros dañados: listadas con su estado, nunca vivas.
+        let damaged: BTreeSet<String> = t
+            .nodes
+            .iter()
+            .filter(|n| {
+                matches!(
+                    n.entry.state,
+                    EntryState::RecordUnusable {
+                        state: RecordState::Damaged,
+                        ..
+                    }
+                )
+            })
+            .map(|n| n.path.clone())
+            .collect();
+        let want_damaged: BTreeSet<String> = m
+            .files
+            .iter()
+            .filter(|f| is_damaged(f))
+            .map(|f| f["path"].clone())
+            .collect();
+        assert_eq!(damaged, want_damaged, "{name}");
+        // Nada fuera de lo vivo y lo dañado del manifiesto (los borrados no se listan como vivos).
+        assert!(
+            t.nodes
+                .iter()
+                .all(|n| n.entry.state.is_live() || damaged.contains(&n.path)),
+            "{name}"
+        );
+        // Tamaños de los ficheros vivos.
+        for f in m
+            .files
+            .iter()
+            .filter(|f| f["state"] == "live" && f["type"] == "file")
+        {
+            if is_damaged(f) {
+                continue;
+            }
+            let n = t.nodes.iter().find(|n| n.path == f["path"]).unwrap();
+            assert_eq!(n.entry.size.to_string(), f["size"], "{name} {}", f["path"]);
+        }
+        total += want.len();
+        accented += want.iter().filter(|(p, _, _)| !p.is_ascii()).count();
+        deepest = deepest.max(
+            want.iter()
+                .map(|(p, _, _)| p.matches('/').count())
+                .max()
+                .unwrap_or(0),
+        );
+    }
+    println!("rutas vivas comparadas: {total} (con caracteres no ASCII: {accented}; profundidad máxima {deepest})");
+    assert!(accented >= 50 && deepest >= 4, "{accented} {deepest}");
+}
+
+#[test]
+#[ignore = "requiere el corpus NTFS (tools/fetch_ntfs_corpus.py)"]
+fn every_live_path_resolves_to_its_record_and_content() {
+    let mut files = 0;
+    let mut dirs = 0;
+    for m in manifests() {
+        let name = m.name().to_string();
+        let v = open(&m);
+        assert_eq!(v.resolve_path("/").unwrap().record(), 5);
+        for f in &m.files {
+            let what = format!("{name} {}", f["path"]);
+            let record: u64 = f["mft_record"].parse().unwrap();
+            if is_damaged(f) {
+                // El índice la lista, pero su registro está dañado: no se resuelve como viva.
+                assert!(
+                    matches!(v.resolve_path(&f["path"]), Err(NtfsError::NotFound { .. })),
+                    "{what}"
+                );
+                continue;
+            }
+            if f["state"] != "live" {
+                assert!(v.resolve_path(&f["path"]).is_err(), "{what}");
+                continue;
+            }
+            let e = v
+                .resolve_path(&f["path"])
+                .unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert_eq!(e.record(), record, "{what}");
+            assert!(e.state.is_live(), "{what}");
+            // Sin distinguir mayúsculas ($UpCase del volumen) y con separador de Windows.
+            let upper = f["path"].to_uppercase().replace('/', "\\");
+            assert_eq!(v.resolve_path(&upper).unwrap().record(), record, "{what}");
+            assert_eq!(v.path_of(record).unwrap(), f["path"], "{what}");
+            if f["type"] == "file" {
+                let s = v.open_stream(e.record(), "").unwrap();
+                let (sha, r) = stream_sha(&s);
+                assert_eq!(r.untrusted_bytes(), 0, "{what}");
+                assert_eq!(sha, f["sha256"], "{what}");
+                files += 1;
+            } else {
+                assert!(e.is_directory, "{what}");
+                dirs += 1;
+            }
+        }
+        assert!(matches!(
+            v.resolve_path("/no/existe.txt"),
+            Err(NtfsError::NotFound { .. })
+        ));
+    }
+    println!("rutas resueltas: {files} ficheros (SHA-256) y {dirs} directorios");
+    assert!(files > 400 && dirs > 80, "{files} {dirs}");
+}
+
+/// Un nodo INDX ilegible (sector no fiable en el nodo de la raíz) no bloquea el resto: se informa,
+/// los demás directorios se listan y lo que colgaba de él aparece como huérfano con su ruta.
+#[test]
+#[ignore = "requiere el corpus NTFS (tools/fetch_ntfs_corpus.py)"]
+fn unreadable_index_node_does_not_block_the_rest() {
+    let m = manifests()
+        .into_iter()
+        .find(|m| m.name() == "ntfs_basic")
+        .unwrap();
+    let healthy = open(&m);
+    let root = healthy.file(5).unwrap();
+    let alloc = root
+        .stream_layout(0xA0, "$I30", healthy.geometry())
+        .unwrap();
+    let lcn = alloc.runs[0].lcn.unwrap();
+    let cluster = m.vol_num("cluster_size");
+    let bad = lcn * cluster / 512 + 3;
+    let dev = FaultyDevice::new(ImageFile::open(generated().join(&m.top["file"]), 512).unwrap())
+        .with_bad([bad]);
+    let v = NtfsVolume::open(Arc::new(dev)).unwrap();
+    let listing = v.list_dir(5).unwrap();
+    assert!(listing.has_unreadable());
+    assert!(listing
+        .anomalies
+        .iter()
+        .any(|a| a.issue.code() == "index_block_unreadable" && a.node == NodeId::Vcn(0)));
+    let t = full_tree(&v);
+    assert_eq!(t.status, TreeStatus::Complete);
+    assert!(t
+        .anomalies
+        .iter()
+        .any(|a| a.path == "/" && a.issue.code() == "index_block_unreadable"));
+    // Lo alcanzado más lo que cuelga de los huérfanos (con su ruta) es todo lo vivo.
+    let mut got: BTreeSet<String> = t
+        .nodes
+        .iter()
+        .skip(1)
+        .filter(|n| n.entry.state.is_live() && !n.entry.system)
+        .map(|n| n.path.clone())
+        .collect();
+    assert!(t
+        .orphans
+        .iter()
+        .any(|o| o.reason == OrphanReason::NotIndexed && o.name == "docs"));
+    for o in &t.orphans {
+        // Los de $Extend (sistema) también quedan huérfanos: no son del manifiesto.
+        let p = v.path_of(o.record).unwrap();
+        if !p.starts_with("/$") {
+            got.insert(p);
+        }
+    }
+    let want: BTreeSet<String> = m.files.iter().map(|f| f["path"].clone()).collect();
+    assert_eq!(got, want);
+    // Los directorios de debajo se siguen listando y resolviendo por debajo de la raíz.
+    let docs = healthy.resolve_path("/docs").unwrap().record();
+    assert!(v.list_dir(docs).unwrap().anomalies.is_empty());
+    assert!(matches!(
+        v.resolve_path("/docs"),
+        Err(NtfsError::NotFound { .. })
+    ));
 }

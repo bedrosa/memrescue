@@ -129,13 +129,19 @@ Milestone propio para no retrasar NTFS y la recuperación.
   - **Hecho (#20, ADR-025)**: arranque (estricto, con copia del último sector), localización de
     `$MFT`, registros FILE con fixups, cabeceras de atributo, lectura y enumeración de registros con
     estado, `$MFTMirr`; `mr_api::ntfs_open` y CLI `ntfs-info`; pruebas contra el corpus NTFS en la CI
-    (job `ntfs`). FFI e interfaz llegan con el árbol (#22).
+    (job `ntfs`). FFI e interfaz: con el árbol (#22, hecho).
   - **Hecho (#21, ADR-026)**: atributos tipados, `$ATTRIBUTE_LIST` (también de `$MFT`), runs de
     cualquier atributo, flujos residentes, no residentes, dispersos, con tamaño inicializado menor y
     comprimidos LZNT1 (oráculo de Windows), ADS; lectura con estado por tramo; `mr_api::ntfs_file`,
     `ntfs_read_stream`, `ntfs_copy_stream`; CLI `ntfs-stat` y `ntfs-cat`; SHA-256 de 439 flujos del
-    corpus. FFI e interfaz con el árbol (#22).
-  - Pendiente: índices `$I30` y árbol (#22); borrados (#23).
+    corpus. FFI e interfaz: con el árbol (#22, hecho).
+  - **Hecho (#22, ADR-028)**: índices `$I30` (raíz e `INDX` con fixups, VCN, límites, `$BITMAP`,
+    ciclos; nodos dañados tipados que no bloquean el resto), directorios contrastados con la MFT
+    (entradas reutilizadas o libres nunca como vivas), nombres DOS, enlaces duros, Unicode,
+    `$UpCase`, rutas y huérfanos; `mr_api::ntfs_list_dir`/`ntfs_resolve`/`ntfs_path_of`/árbol como
+    tarea; FFI (`mr_ntfs_*`), C# (`NtfsVolume`), CLI `ntfs-ls` y `ntfs-cat RUTA`; interfaz: pestaña
+    «Sistema de archivos» con árbol, lista, visor y «Guardar como…».
+  - Borrados (#23, ADR-027): la parte de la MFT está hecha; las entradas `INDX` residuales, pendientes.
 - Ficheros borrados (registros MFT no en uso, entradas INDX residuales).
 - **Paridad objetivo**: FS-01…FS-04.
 

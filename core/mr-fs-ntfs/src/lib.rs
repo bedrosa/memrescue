@@ -1,4 +1,4 @@
-//! Lector NTFS (M3, issues #20 y #21): sector de arranque, localización de la MFT, registros FILE,
+//! Lector NTFS (M3, issues #20, #21 y #22): sector de arranque, localización de la MFT, registros FILE,
 //! atributos, runs y lectura del contenido de los flujos (residentes, no residentes, dispersos,
 //! comprimidos con LZNT1 y flujos alternativos).
 //!
@@ -17,6 +17,9 @@
 //! - [`stream`]: lectura de un flujo con el estado de cada tramo (datos, disperso, sin inicializar,
 //!   ilegible...).
 //! - [`lznt1`]: descompresión LZNT1 ([MS-XCA]) con límites estrictos.
+//! - [`index`] (#22): índices `$I30` (raíz e `INDX`) con límites y nodos dañados tipados.
+//! - [`dir`] (#22): listado de directorios contrastado con la MFT, árbol, rutas y huérfanos.
+//! - [`upcase`] (#22): `$UpCase` y colación de nombres.
 //! - [`mft`]: disposición de la MFT, lectura de registros por número y enumeración.
 //! - [`volume`]: [`NtfsVolume::open`]: arranque principal o copia, `$MFT`, `$MFTMirr`, etiqueta;
 //!   [`NtfsVolume::file`] y [`NtfsVolume::open_stream`].
@@ -31,7 +34,9 @@ pub mod attr;
 pub mod bitmap;
 pub mod boot;
 pub mod deleted;
+pub mod dir;
 pub mod file;
+pub mod index;
 pub mod lznt1;
 pub mod mft;
 mod read;
@@ -39,13 +44,16 @@ pub mod record;
 pub mod recover;
 pub mod runs;
 pub mod stream;
+pub mod upcase;
 pub mod values;
 pub mod volume;
 
 #[cfg(test)]
-mod stream_tests;
+mod dir_tests;
 #[cfg(test)]
-mod testvol;
+mod stream_tests;
+#[cfg(any(test, feature = "test-support"))]
+pub mod testvol;
 
 pub use bitmap::{ClusterAlloc, ClusterBitmap};
 pub use boot::{parse_boot, BootError, BootSector};
@@ -53,7 +61,12 @@ pub use deleted::{
     scan_deleted, DeletedEntry, DeletedScan, ParentState, Recoverability, ScanObserver,
     ScanOptions, StreamAssessment,
 };
+pub use dir::{
+    DirEntry, DirListing, EntryState, Orphan, OrphanReason, Tree, TreeAnomaly, TreeIssue, TreeNode,
+    TreeObserver, TreeOptions, TreeStatus,
+};
 pub use file::{FileAnomaly, FileAttribute, NtfsFile, StreamError, StreamIssue, StreamLayout};
+pub use index::{IndexAnomaly, IndexIssue, NodeId};
 pub use mft::{MftLayout, RecordOutcome, RecordState, Records};
 pub use mr_common::Confidence;
 pub use mr_part::Severity;
@@ -102,6 +115,25 @@ pub enum NtfsError {
     /// Lectura de un flujo mayor que el máximo por petición.
     #[error("lectura de {len} bytes (máximo {max} por petición)")]
     ReadTooLarge { len: usize, max: usize },
+    /// El registro no tiene índice de nombres (`$I30`): no es un directorio.
+    #[error("el registro {number} no es un directorio (no tiene índice $I30)")]
+    NotADirectory { number: u64 },
+    /// La raíz del índice `$I30` no es interpretable: el directorio no se puede listar.
+    #[error("registro {number}: {issue}")]
+    IndexRoot { number: u64, issue: IndexIssue },
+    /// Ruta no encontrada.
+    #[error("no existe {path}: no se encuentra «{component}»")]
+    NotFound { path: String, component: String },
+    /// Ruta mal formada.
+    #[error("ruta no válida «{path}»: {reason}")]
+    InvalidPath { path: String, reason: String },
+    /// El fichero (o un antecesor) no cuelga de un directorio válido.
+    #[error("el registro {record} está huérfano: {reason} (padre: registro {}, secuencia {})", parent.record, parent.sequence)]
+    Orphan {
+        record: u64,
+        parent: FileReference,
+        reason: OrphanReason,
+    },
 }
 
 impl NtfsError {
@@ -116,6 +148,11 @@ impl NtfsError {
             NtfsError::NotBaseRecord { .. } => "not_base_record",
             NtfsError::Stream { error, .. } => error.code(),
             NtfsError::ReadTooLarge { .. } => "read_too_large",
+            NtfsError::NotADirectory { .. } => "not_a_directory",
+            NtfsError::IndexRoot { issue, .. } => issue.code(),
+            NtfsError::NotFound { .. } => "not_found",
+            NtfsError::InvalidPath { .. } => "invalid_path",
+            NtfsError::Orphan { reason, .. } => reason.code(),
         }
     }
 }

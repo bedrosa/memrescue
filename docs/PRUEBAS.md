@@ -113,6 +113,20 @@ el SHA-256 de cada imagen debe coincidir con su manifiesto versionado) y ejecuta
 `cargo test -p memrescue-cli --test ntfs_deleted -- --ignored`. En local, `scripts/test.ps1` tiene el
 mismo paso (`-SkipNtfsCorpus` para omitirlo; sin corpus, el paso falla e indica cómo descargarlo).
 
+**Árbol de ficheros (#22).** `core/mr-fs-ntfs/tests/ntfs_corpus.rs` añade tres pruebas: el árbol
+completo de cada manifiesto (sin anomalías ni huérfanos) es exactamente el conjunto de sus rutas
+vivas con tipo y registro (503 rutas, 95 con caracteres no ASCII, hasta 4 niveles), las entradas de
+`ntfs_damaged_mft` que apuntan a registros dañados aparecen como `record_unusable`; cada ruta viva
+se resuelve a su registro también en mayúsculas y con `\`, `path_of` devuelve la ruta del
+manifiesto y el contenido por ruta tiene su SHA-256 (419 ficheros y 84 directorios); y un nodo
+`INDX` de la raíz con un sector ilegible (`FaultyDevice`) se informa sin bloquear el resto: lo que
+colgaba de él aparece como huérfano y su ruta se reconstruye. `cli/tests/ntfs_corpus.rs` comprueba
+`ntfs-ls / -r --json` de las 10 imágenes y `ntfs-cat RUTA` (sin distinguir mayúsculas) de
+`ntfs_basic` y `ntfs_mbr`. Las pruebas de .NET que usan el corpus NTFS (`NtfsTests` de interop y
+`NtfsUiTests`) llevan la categoría `NtfsCorpus`: el job `dotnet` de la CI descarga el corpus con
+`tools/fetch_ntfs_corpus.py` (con `actions: read` solo en ese job) y `scripts/test.ps1
+-SkipNtfsCorpus` las filtra (`Category!=NtfsCorpus`).
+
 **Validación independiente.** Tres comprobaciones que no comparten código entre sí:
 `build_manifests.py` (TSK; además exige que lo que ve TSK coincida con la intención del generador: rutas,
 inodos de ntfs-3g, tamaños, hashes y marcas de tiempo fijadas), `verify_tsk.py` (otra vez TSK, por otras

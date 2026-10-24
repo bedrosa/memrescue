@@ -70,7 +70,9 @@ if (-not $SkipQemu) {
     }
 }
 Step '.NET: compilación (warnings = errores)' { & $Dotnet build app\MemRescue.slnx -c Debug }
-Step '.NET: pruebas de interop y de interfaz (xUnit + UI Automation)' { & $Dotnet test app\MemRescue.slnx -c Debug --no-build }
+# Las pruebas de .NET con el corpus NTFS (interop y UI Automation) llevan la categoría NtfsCorpus.
+$dotnetFilter = if ($SkipNtfsCorpus) { @('--filter', 'Category!=NtfsCorpus') } else { @() }
+Step '.NET: pruebas de interop y de interfaz (xUnit + UI Automation)' { & $Dotnet test app\MemRescue.slnx -c Debug --no-build @dotnetFilter }
 
 function Invoke-GuiSelfTest([string] $name) {
     $manifest = "$refs\$name.manifest.toml"

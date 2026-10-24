@@ -12,5 +12,9 @@ mr-common.workspace = true
 mr-io.workspace = true
 mr-part.workspace = true
 
+[features]
+# Volúmenes NTFS sintéticos (`testvol`) para las pruebas de otros crates.
+test-support = []
+
 [lints]
 workspace = true
