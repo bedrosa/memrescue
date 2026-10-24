@@ -420,6 +420,19 @@ Total: 16 unitarias y 7 de corpus en mr-part, 3 en mr-api, 5 en mr-ffi, 2 de CLI
 existentes (`cargo test -p mr-part -- --ignored` y `cargo test -p memrescue-cli --test corpus --
 --ignored`), sin pasos nuevos.
 
+Copia del particionado (issue #18, PT-10, `formatos/copia-particionado.md`):
+
+| Qué | Pruebas |
+|---|---|
+| Ida y vuelta con todo el corpus | `core/mr-part/tests/backup_corpus.rs` (`--ignored`): `round_trip_over_the_whole_partition_corpus` toma la copia de los **38** manifiestos (con sus `unreadable_lbas` simulados con `FaultyDevice` y la búsqueda exprés incluida), la escribe, la lee y exige igualdad exacta (`==`), mismo texto al reescribirla y comparación sin diferencias con la misma imagen |
+| Ida y vuelta sintética | Unitarias en `core/mr-part/src/backup/tests.rs`: MBR con cadena de EBR, GPT con las dos copias y búsqueda, GPT vista con otro tamaño de sector, sectores de tabla ilegibles (región sin contenido), disco en blanco y de un sector, y `every_variant_round_trips` con **todas** las variantes de anomalía MBR, GPT, de volumen y de búsqueda, todas las confianzas, estados y comprobaciones |
+| Manipulaciones | Bytes de una región editados (los detecta `body_sha256` y, si también se recalcula, la suma de la región), sumas editadas, valor del particionado editado, versión 0, 2 y `"1"`, otro `format`, fichero truncado en cada posición de los primeros 2000 bytes y cada 97 después, no UTF-8, mayor de 32 MiB, campos desconocidos, ausentes, de otro tipo o fuera de rango, variante desconocida, región fuera del origen, identidad incoherente y código de anomalía cambiado; los cambios de espacios o CRLF siguen siendo válidos |
+| Comparación | Unitarias (entrada MBR movida y EBR borrado, entradas GPT primarias dañadas, origen recortado, otro esquema, sectores antes ilegibles) y de corpus (`comparison_reports_differences_on_modified_copies`: copias modificadas de `mbr_basic` y `gpt_basic` en un directorio temporal; el original queda intacto y sigue coincidiendo) |
+| Lector JSON y fuzzing | 4 unitarias del subconjunto JSON (rechazos, anidamiento de 100 000 niveles, línea y columna) y `seeded_fuzz_never_panics` (1500 documentos mutados y 500 aleatorios: sin pánicos; solo pasan mutaciones sin efecto) |
+| CLI | `cli/tests/partition_backup.rs` (3): `partitions --save-backup` (código 2 sin `--overwrite`, nunca sobre el origen, origen intacto), `partition-backup-check` igual (código 0, JSON) y sobre una copia modificada (código 4, `region_changed`, `partition_changed`), copia alterada o truncada (código 1), `find-partitions --save-backup` con la búsqueda y validación de argumentos |
+
+FFI e interfaz de la copia del particionado: pendientes.
+
 Lector NTFS (issue #20, ADR-025, `formatos/ntfs.md`):
 
 - `core/mr-fs-ntfs/src` (33 unitarias): arranque (`boot`: cada campo fuera de rango con su código,

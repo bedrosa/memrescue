@@ -110,7 +110,11 @@ Cerrado por el propietario (`PROGRESO.md`, etapa 8). APM y la copia del particio
 
 Milestone propio para no retrasar NTFS y la recuperación.
 - Apple Partition Map (#17, PT-04).
-- Guardar y cargar una copia del particionado en formato propio (#18, PT-10).
+- **Guardar y cargar una copia del particionado en formato propio: hecho (#18, PT-10)**: formato
+  versionado `memrescue-partition-backup` (`formatos/copia-particionado.md`) con el particionado
+  interpretado y los bytes de los sectores de tabla, ida y vuelta sin pérdidas con todo el corpus,
+  validación estricta y comparación con un origen de solo lectura; API y CLI (`partitions
+  --save-backup`, `partition-backup-check`). Restaurar en disco llega con M12; FFI e interfaz pendientes.
 
 ## M3 · NTFS lectura: **EN CURSO**
 

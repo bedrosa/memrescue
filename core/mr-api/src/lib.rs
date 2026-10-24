@@ -21,6 +21,9 @@
 //!   alternativos) con el estado de cada tramo (#21); [`check_output_path`] valida el destino de
 //!   una extracción y [`create_output`] lo escribe de forma atómica (fichero temporal en el mismo
 //!   directorio y renombrado final; nunca sobrescribe sin petición explícita).
+//! - [`partition_backup`], [`save_partition_backup`], [`load_partition_backup`] y
+//!   [`compare_partition_backup`]: copia del particionado en formato propio y comparación con un
+//!   origen, sin escribir nunca en él (#18).
 //! - [`start_hash_task`]: hashes del fichero completo en segundo plano.
 //! - [`start_verify_task`]: lectura completa tolerante a errores con mapa de validez por sector.
 
@@ -739,6 +742,80 @@ pub fn open_found_volume(
         }
         d
     })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Copia del particionado (#18, PT-10): formato propio en docs/formatos/copia-particionado.md.
+// Solo lectura del origen: comparar nunca escribe en ningún disco (restaurar llega con M12).
+// ---------------------------------------------------------------------------------------------
+
+pub use mr_part::backup::{
+    BackupError as PartitionBackupError, Comparison as PartitionBackupComparison,
+    LayoutBackup as PartitionBackup,
+};
+
+/// Toma la copia del particionado de `src`: tabla interpretada completa y bytes de sus sectores de
+/// tabla. `search`, si se da, se incluye y debe proceder del mismo origen (tamaño de sector y
+/// número de sectores).
+pub fn partition_backup(src: &Source, search: Option<&SearchResult>) -> Result<PartitionBackup> {
+    let info = src.info();
+    if let Some(r) = search {
+        if r.sector_size != info.sector_size || r.sectors != info.sector_count {
+            return Err(ApiError::InvalidArgument(
+                "la búsqueda se hizo sobre otro origen o con otro tamaño de sector".into(),
+            ));
+        }
+    }
+    Ok(mr_part::backup::capture(
+        src.as_ref(),
+        &info.description,
+        search,
+    )?)
+}
+
+/// Guarda la copia en `out` con la política común de salida ([`create_output`]): nunca sobre el
+/// origen, nunca sobrescribe sin `overwrite`, escritura atómica.
+pub fn save_partition_backup(
+    src: &Source,
+    backup: &PartitionBackup,
+    out: &Path,
+    overwrite: bool,
+) -> Result<PathBuf> {
+    use std::io::Write;
+    let mut w = create_output(src, out, overwrite)?;
+    w.write_all(backup.to_text().as_bytes())
+        .map_err(|e| ApiError::Io(mr_io::IoError::Io(e)))?;
+    w.commit()
+}
+
+/// Lee y valida una copia guardada (fichero regular de como mucho
+/// [`mr_part::backup::MAX_FILE_BYTES`]). Una copia alterada, truncada o de otra versión se
+/// rechaza con [`ApiError::InvalidArgument`] y el motivo.
+pub fn load_partition_backup(path: impl AsRef<Path>) -> Result<PartitionBackup> {
+    use std::io::Read;
+    let path = path.as_ref();
+    let io = |e| ApiError::Io(mr_io::IoError::Io(e));
+    let f = std::fs::File::open(path).map_err(io)?;
+    let meta = f.metadata().map_err(io)?;
+    if !meta.is_file() {
+        return Err(ApiError::InvalidArgument(format!(
+            "{} no es un fichero",
+            path.display()
+        )));
+    }
+    let max = mr_part::backup::MAX_FILE_BYTES;
+    let mut bytes = Vec::new();
+    f.take(max + 1).read_to_end(&mut bytes).map_err(io)?;
+    PartitionBackup::from_bytes(&bytes).map_err(|e| ApiError::InvalidArgument(e.to_string()))
+}
+
+/// Compara la copia con el origen sin escribir nada: bytes de las regiones de tabla y
+/// particionado interpretado ([`mr_part::backup::compare`]).
+pub fn compare_partition_backup(
+    src: &Source,
+    backup: &PartitionBackup,
+) -> Result<PartitionBackupComparison> {
+    Ok(mr_part::backup::compare(backup, src.as_ref())?)
 }
 
 /// Abre la imagen en solo lectura y devuelve sus datos básicos.
