@@ -142,15 +142,15 @@ Referencias abreviadas a documentos de investigación: `F1-05` = `investigacion/
 
 | ID | Funcionalidad | Descripción | Ref. DMDE | Evidencias | Verif. | Diseño MemRescue | Estado | Pruebas necesarias | Diferencias pendientes |
 |---|---|---|---|---|---|---|---|---|---|
-| RD-01 | RAID 0 | Stripe | Construct RAID | MAN, F1-08 | M B | `mr-raid` | No iniciado | Arrays sintéticos (mdadm o generador propio) | Lógica DMDE no verificada (INV-03b) |
+| RD-01 | RAID 0 | Stripe | Construct RAID | MAN, F1-08 | M B | `mr-raid` | No iniciado | Arrays sintéticos (mdadm o generador propio) | Lógica DMDE no verificada; fórmulas públicas de md/DDF (INV-03b §3, §6) |
 | RD-02 | RAID 1 (solo lectura) | Espejo | Construct RAID | MAN | M B | `mr-raid` | No iniciado | Idem | - |
 | RD-03 | RAID 4 | Paridad dedicada | Construct RAID | MAN | M B | `mr-raid` | No iniciado | Reconstruir con un disco NULL | - |
-| RD-04 | RAID 5 (4 rotaciones + paridad retrasada) | - | Construct RAID | MAN | M B | `mr-raid` | No iniciado | Cada rotación con mdadm/generador | Definición exacta de "delay" ? |
-| RD-05 | RAID 6 (solo lectura, un NULL) | Doble paridad | Construct RAID | MAN | M B | `mr-raid` (P+Q, GF(2^8)) | No iniciado | Idem | - |
+| RD-04 | RAID 5 (4 rotaciones + paridad retrasada) | - | Construct RAID | MAN | M B | `mr-raid` | No iniciado | Cada rotación con mdadm/generador | Definición exacta de "delay" ? (interpretación propia y sin oráculo público: INV-03b I2, §6.1) |
+| RD-05 | RAID 6 (solo lectura, un NULL) | Doble paridad | Construct RAID | MAN | M B | `mr-raid` (P+Q, GF(2^8)) | No iniciado | Idem | Propuesta: dos ausentes y convenciones de Q de md y DDF (INV-03b §3.3, §7) |
 | RD-06 | Rotación personalizada (orden, −1 XOR, −2 sin uso) | - | Striping | MAN | M | `mr-raid` | No iniciado | Tablas de rotación | - |
 | RD-07 | JBOD/spanned (lectura/escritura) | Concatenación | Construct RAID | MAN | M B | `mr-raid` | No iniciado | - | Escritura bloqueada al principio |
 | RD-08 | Offset y tamaño por disco, disco NULL, read-ahead | - | Construct RAID | MAN | M B | `mr-raid` | No iniciado | - | - |
-| RD-09 | Cálculo automático de parámetros | Estadístico con restricciones | RAID Auto Calculate | MAN, F1-08, `FUN_00671ef0` (no usar) | M B | `mr-raid::detect` (diseño propio) | No iniciado | Arrays con parámetros ocultos | Métrica ? (INV-03b) |
+| RD-09 | Cálculo automático de parámetros | Estadístico con restricciones | RAID Auto Calculate | MAN, F1-08, `FUN_00671ef0` (no usar) | M B | `mr-raid::detect` (diseño propio) | No iniciado | Arrays con parámetros ocultos | Métrica de DMDE ?; métrica propia en INV-03b §8 |
 | RD-10 | Guardar/cargar configuración | - | RAID | MAN | M B | TOML | No iniciado | Ida y vuelta | - |
 | RD-11 | VHD diferenciales encadenados | "DVHD" | RAID | F1-08 | B | `mr-image` | No iniciado | Cadena de VHD | ? |
 
