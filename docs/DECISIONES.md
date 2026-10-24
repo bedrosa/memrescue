@@ -654,3 +654,23 @@ hace y rechazaríamos datos que Windows lee).
 íntegros, sobrescritos con lo que devuelve TSK y ADS). La lectura de un fichero borrado sigue sus
 runs tal como están; su fiabilidad la dará #23. FFI e interfaz llegan con el árbol (#22). Los
 flujos cifrados no se leen (FS-05, M4).
+
+**Addendum (issue #58): publicación sin sustituir.** El punto 6 comprobaba que el destino no
+existía y después llamaba a `std::fs::rename`, que en Windows sustituye un fichero existente: un
+fichero creado por otro proceso entre la comprobación y el renombrado se perdía sin
+`--overwrite`. Se decide:
+
+- **Sin `overwrite`**, `OutputFile::commit` publica con `std::fs::hard_link(temporal, destino)`,
+  que falla de forma atómica con `AlreadyExists` si el destino existe (`OutputExists`, el destino
+  no se toca), y después borra el temporal. El temporal está en el mismo directorio, luego en el
+  mismo volumen. No se usa `MoveFileExW` sin `MOVEFILE_REPLACE_EXISTING` porque exigiría `unsafe`
+  fuera de `mr-ffi`.
+- **Alternativa sin enlaces duros** (FAT, exFAT: `Unsupported`, `ERROR_INVALID_FUNCTION`,
+  `ERROR_NOT_SUPPORTED`; en Unix `EPERM`, `EOPNOTSUPP`): se abre el destino con `create_new` y se
+  copia el temporal. Tampoco sustituye nunca un fichero ajeno, pero no es atómica respecto al
+  contenido: durante la copia el destino existe incompleto. Si la copia falla, se borra ese
+  destino, que solo puede ser el creado por la propia llamada. Otros errores del enlace se
+  devuelven tal cual (no se cae a la copia a ciegas).
+- **Con `overwrite`**, se mantiene `std::fs::rename` (sustitución atómica).
+- El temporal se borra en cualquier error de `commit` y al descartar el `OutputFile`. La CLI
+  devuelve el código 2 también cuando el destino aparece durante la escritura.

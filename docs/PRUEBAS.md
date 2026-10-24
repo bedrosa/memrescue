@@ -502,6 +502,13 @@ Atributos, runs, flujos y LZNT1 (issue #21, ADR-026, `formatos/ntfs.md`):
   deja ni fichero final ni temporal, sustitución fallida que conserva el anterior, origen
   rechazado también con `overwrite`). CLI de corpus: salida existente con código 2 sin
   `--overwrite`, sustituida con él y sin temporales.
+- Publicación sin sustituir (#58), `mr-api`: `create_output_commit_never_replaces_a_concurrent_file`
+  con el enlace duro y con la copia exclusiva forzada (variante interna `Publish::CopyOnly`, solo en
+  pruebas): camino normal, destino creado entre `create_output` y `commit` rechazado con
+  `OutputExists` sin cambiar el fichero ajeno ni dejar temporal, sustitución con `overwrite`, y 64
+  carreras reales con otro hilo que crea el destino en exclusiva (gana exactamente uno y el destino
+  tiene su contenido). `hard_link_unsupported_is_recognised_only_for_unsupported_errors` fija qué
+  errores del enlace activan la copia. No se prueba en un volumen FAT real (requiere montarlo).
 
 Campos del manifiesto NTFS que no se comparan todavía: `[[files]]` `path` (#22) y `recoverable`
 de los sobrescritos (#23).
