@@ -7,6 +7,9 @@
 //! - Truncado en cada frontera de estructura de VHDX (cabeceras, tablas de regiones, registro,
 //!   metadatos, BAT, bloques) y de VMDK (cabecera, descriptor, GD, GT, granos), a ±1 byte.
 //! - Fichero acortado después de abrir (VHDX, VMDK y dividida).
+//! - VHDX con registro pendiente (reproducido en memoria): inversión aleatoria dirigida también a
+//!   las entradas del registro (a veces con sus CRC-32C recalculadas) y fichero acortado después
+//!   de abrir.
 //!
 //! Garantías comprobadas: abrir devuelve `Ok` o un error tipado (nunca pánico ni bloqueo, con un
 //! vigilante de tiempo); con la imagen abierta, cada lectura devuelve datos o error; el modo
@@ -520,6 +523,125 @@ fn build_vhdx() -> Synthetic {
 }
 
 // ---------------------------------------------------------------------------------------------
+// VHDX con registro pendiente
+// ---------------------------------------------------------------------------------------------
+
+const VHDX_LOG_GUID: Guid = [0xD4; 16];
+/// Entradas del registro `(posición en el registro, longitud)`.
+const VHDX_LOG_ENTRIES: [(u64, u64); 2] = [(0, 8192), (8192, 8192)];
+/// Tamaño del fichero con registro (FlushedFileOffset y LastFileOffset).
+const VHDX_LOG_FILE: u64 = 6 * MIB;
+
+enum LogDesc {
+    Data(u64, Vec<u8>),
+    Zero(u64, u64),
+}
+
+/// Entrada del registro según [MS-VHDX]: cabecera `loge`, descriptores `desc`/`zero`, sectores
+/// `data` y CRC-32C de toda la entrada.
+fn vhdx_log_entry(seq: u64, tail: u32, descs: &[LogDesc]) -> Vec<u8> {
+    let desc_sectors = (64 + 32 * descs.len()).div_ceil(4096);
+    let data = descs
+        .iter()
+        .filter(|d| matches!(d, LogDesc::Data(..)))
+        .count();
+    let len = (desc_sectors + data) * 4096;
+    let mut e = vec![0u8; len];
+    put(&mut e, 0, b"loge");
+    put(&mut e, 8, &(len as u32).to_le_bytes());
+    put(&mut e, 12, &tail.to_le_bytes());
+    put(&mut e, 16, &seq.to_le_bytes());
+    put(&mut e, 24, &(descs.len() as u32).to_le_bytes());
+    put(&mut e, 32, &VHDX_LOG_GUID);
+    put(&mut e, 48, &VHDX_LOG_FILE.to_le_bytes());
+    put(&mut e, 56, &VHDX_LOG_FILE.to_le_bytes());
+    let mut k = desc_sectors as u64;
+    for (i, d) in descs.iter().enumerate() {
+        let o = 64 + 32 * i as u64;
+        match d {
+            LogDesc::Data(at, sector) => {
+                put(&mut e, o, b"desc");
+                put(&mut e, o + 4, &sector[4092..]);
+                put(&mut e, o + 8, &sector[..8]);
+                put(&mut e, o + 16, &at.to_le_bytes());
+                let p = k * 4096;
+                put(&mut e, p, b"data");
+                put(&mut e, p + 4, &((seq >> 32) as u32).to_le_bytes());
+                put(&mut e, p + 8, &sector[8..4092]);
+                put(&mut e, p + 4092, &(seq as u32).to_le_bytes());
+                k += 1;
+            }
+            LogDesc::Zero(at, n) => {
+                put(&mut e, o, b"zero");
+                put(&mut e, o + 8, &n.to_le_bytes());
+                put(&mut e, o + 16, &at.to_le_bytes());
+            }
+        }
+        put(&mut e, o + 24, &seq.to_le_bytes());
+    }
+    let c = crc32c(&e);
+    put(&mut e, 4, &c.to_le_bytes());
+    e
+}
+
+/// Recalcula las CRC-32C de cabeceras, tablas de regiones y entradas del registro.
+fn vhdx_log_seal(img: &mut [u8]) {
+    vhdx_seal(img);
+    for (p, l) in VHDX_LOG_ENTRIES {
+        let o = (VHDX_LOG + p) as usize;
+        img[o + 4..o + 8].fill(0);
+        let c = crc32c(&img[o..o + l as usize]);
+        img[o + 4..o + 8].copy_from_slice(&c.to_le_bytes());
+    }
+}
+
+fn vhdx_log_crc_fields() -> Vec<(usize, usize)> {
+    let mut v = vhdx_crc_fields();
+    v.extend(
+        VHDX_LOG_ENTRIES
+            .iter()
+            .map(|&(p, _)| ((VHDX_LOG + p) as usize + 4, 4)),
+    );
+    v
+}
+
+/// El VHDX de [`build_vhdx`] con un registro pendiente de dos entradas: la BAT del fichero está
+/// desfasada (el bloque 2 figura como NOT_PRESENT) y la primera entrada escribe la correcta; la
+/// segunda escribe un sector del bloque 0 y pone otro a ceros. El contenido virtual esperado es
+/// el del fichero tras reproducir el registro.
+fn build_vhdx_with_log() -> Synthetic {
+    let mut s = build_vhdx();
+    let bat_sector = s.file[VHDX_BAT_OFF as usize..(VHDX_BAT_OFF + 4096) as usize].to_vec();
+    put(&mut s.file, VHDX_BAT_OFF + 16, &0u64.to_le_bytes());
+    s.file.resize(VHDX_LOG_FILE as usize, 0);
+    let data0 = s.data_map[0].1;
+    let mark: Vec<u8> = (0..4096u32).map(|i| (i * 7 + 3) as u8).collect();
+    let e1 = vhdx_log_entry(0x1_0000_0020, 0, &[LogDesc::Data(VHDX_BAT_OFF, bat_sector)]);
+    let e2 = vhdx_log_entry(
+        0x1_0000_0021,
+        0,
+        &[
+            LogDesc::Data(data0 + 8192, mark.clone()),
+            LogDesc::Zero(data0 + 16384, 4096),
+        ],
+    );
+    for (e, (p, l)) in [e1, e2].iter().zip(VHDX_LOG_ENTRIES) {
+        assert_eq!(e.len() as u64, l);
+        put(&mut s.file, VHDX_LOG + p, e);
+    }
+    for off in VHDX_HEADERS {
+        put(&mut s.file, off + 48, &VHDX_LOG_GUID);
+    }
+    vhdx_seal(&mut s.file);
+    s.virt[8192..12288].copy_from_slice(&mark);
+    s.virt[16384..20480].fill(0);
+    s.targets.push((VHDX_LOG, 16384));
+    s.boundaries
+        .extend([VHDX_LOG + 8192, VHDX_LOG + 16384, VHDX_LOG_FILE]);
+    s
+}
+
+// ---------------------------------------------------------------------------------------------
 // VMDK (monolithicSparse)
 // ---------------------------------------------------------------------------------------------
 
@@ -684,13 +806,16 @@ fn check_both_modes(open: Opener, path: &Path, ctx: &str) -> (bool, bool) {
     (strict.is_some(), tolerant.is_some())
 }
 
+/// Recalcula las sumas de control (`.0`) y lista los campos que cambia (`.1`).
+type Reseal = (fn(&mut [u8]), fn() -> Vec<(usize, usize)>);
+
 fn random_flips(
     name: &'static str,
     build: fn() -> Synthetic,
     open: Opener,
     seed: u64,
     iters: u32,
-    reseal: Option<fn(&mut [u8])>,
+    reseal: Option<Reseal>,
 ) {
     with_watchdog(move |note| {
         let s = build();
@@ -716,9 +841,9 @@ fn random_flips(
             for &(p, x) in &flips {
                 img[p] ^= x;
             }
-            if let Some(seal) = reseal.filter(|_| rng.below(2) == 0) {
+            if let Some((seal, fields)) = reseal.filter(|_| rng.below(2) == 0) {
                 seal(&mut img);
-                ranges.extend(vhdx_crc_fields());
+                ranges.extend(fields());
             }
             let ctx = format!("{name}, semilla {seed:#x}, iteración {it}, alteraciones {flips:?}");
             note(ctx.clone());
@@ -878,8 +1003,25 @@ fn vhdx_random_byte_flips() {
         open_vhdx,
         0x5648_4458_0001,
         300,
-        Some(vhdx_seal),
+        Some((vhdx_seal, vhdx_crc_fields)),
     );
+}
+
+#[test]
+fn vhdx_with_pending_log_random_byte_flips() {
+    random_flips(
+        "l.vhdx",
+        build_vhdx_with_log,
+        open_vhdx,
+        0x5648_4458_4C4F_4701,
+        300,
+        Some((vhdx_log_seal, vhdx_log_crc_fields)),
+    );
+}
+
+#[test]
+fn vhdx_with_pending_log_shrunk_after_open() {
+    shrink_after_open("ls.vhdx", build_vhdx_with_log, open_vhdx);
 }
 
 #[test]

@@ -86,7 +86,8 @@ confirmación explícita del usuario o descomprimir; hoy se rechazan con errores
 (`ExternalReference`, `UnsupportedFeature`).
 - VHD/VHDX diferenciales con selección explícita del padre (#8).
 - VMDK streamOptimized (#9).
-- Reproducción en memoria del registro pendiente de VHDX (#10).
+- ✔ Reproducción en memoria del registro pendiente de VHDX (#10): validación de entradas y descriptores,
+  secuencia activa, superposición sin escribir el fichero, contrastada con qemu-img (`formatos/vhdx.md`).
 - VMDK multiextensión y flat con confirmación explícita (#11).
 
 ## M2 · Particiones: **TERMINADO 2026-10-18** (plan técnico en `PLAN_M2.md`)

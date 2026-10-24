@@ -40,6 +40,10 @@ Estas herramientas **no** forman parte de MemRescue, no se distribuyen con él y
 - Solo sobre imágenes sintéticas creadas por los generadores de MemRescue en `tests/corpus/generated`.
 - Nunca sobre imágenes de usuarios ni dispositivos.
 - Sin opciones de reparación (`qemu-img check -r` prohibido); solo `create`, `convert`, `info`, `map`, `check` (sin `-r`).
+- Excepción acotada (registro de VHDX, issue #10): `convert --image-opts driver=vhdx,file.filename=…,read-only=off`
+  solo sobre una **copia desechable** creada por la prueba en un directorio temporal, para que qemu reproduzca el
+  registro pendiente en esa copia y sirva de referencia. El fichero que lee MemRescue nunca se pasa a qemu en
+  lectura y escritura.
 
 ## Corpus NTFS: mkntfs, ntfs-3g, libfaketime y The Sleuth Kit (autorizado por el propietario el 2026-10-18, ADR-024)
 

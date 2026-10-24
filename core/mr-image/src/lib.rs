@@ -23,6 +23,7 @@ pub mod split;
 mod tolerant;
 pub mod vhd;
 pub mod vhdx;
+mod vhdx_log;
 pub mod vmdk;
 
 pub use open::{open_image, open_split, OpenOptions, OpenedImage, Reblocked};

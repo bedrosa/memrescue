@@ -9,8 +9,10 @@
 //! - Regiones (alineadas a 1 MiB): registro (log), metadatos y BAT; después, los bloques de datos.
 //!
 //! Decisiones:
-//! - Un registro pendiente (LogGuid ≠ 0) se rechaza como característica no soportada: reproducirlo
-//!   exigiría interpretar transacciones y leer datos que aún no están en su sitio definitivo.
+//! - Un registro pendiente (LogGuid ≠ 0) se valida y se reproduce **en memoria** antes de leer
+//!   las tablas de regiones, los metadatos y la BAT (módulo `vhdx_log`): todas las lecturas del
+//!   fichero pasan por la superposición resultante; el fichero nunca se escribe. Un registro
+//!   pendiente que no supera la validación es `Corrupt` en ambos modos.
 //! - Los discos diferenciales (HasParent) devuelven `ExternalReference` con la ruta del padre
 //!   según el localizador; el padre **nunca** se abre.
 //! - Los bloques NOT_PRESENT, UNDEFINED, ZERO y UNMAPPED se leen como ceros y se informan como
@@ -27,6 +29,7 @@
 use crate::budget::Budget;
 use crate::crc32c::crc32c;
 use crate::tolerant::{self, Damage, Hit, Zone};
+use crate::vhdx_log::{self, Registro};
 use crate::MAX_TABLE_BYTES;
 use mr_io::{Allocation, AllocationRun, BlockDevice, IoError, Result};
 use std::fs::File;
@@ -198,9 +201,19 @@ fn leer(file: &File, offset: u64, buf: &mut [u8]) -> Result<()> {
     })
 }
 
-/// Lee una estructura de tamaño fijo comprobando antes que cabe en el fichero.
+/// Lee del fichero o, si hay un registro reproducido, del fichero tal como queda tras reproducirlo.
+fn leer_en(file: &File, registro: Option<&Registro>, offset: u64, buf: &mut [u8]) -> Result<()> {
+    match registro {
+        Some(r) => r.leer(file, offset, buf),
+        None => leer(file, offset, buf),
+    }
+}
+
+/// Lee una estructura de tamaño fijo comprobando antes que cabe en el fichero (en su tamaño
+/// efectivo, si hay un registro reproducido).
 fn leer_estructura(
     file: &File,
+    registro: Option<&Registro>,
     tam_fichero: u64,
     offset: u64,
     len: usize,
@@ -213,7 +226,7 @@ fn leer_estructura(
         )));
     }
     let mut buf = vec![0u8; len];
-    leer(file, offset, &mut buf)?;
+    leer_en(file, registro, offset, &mut buf)?;
     Ok(buf)
 }
 
@@ -313,6 +326,8 @@ pub struct VhdxImage {
     descartados: u64,
     /// Entradas de mapa de bits con estado no válido ignoradas en modo tolerante.
     mapas_ignorados: u64,
+    /// Registro pendiente reproducido en memoria, si lo había.
+    registro: Option<Registro>,
 }
 
 impl std::fmt::Debug for VhdxImage {
@@ -343,7 +358,7 @@ impl VhdxImage {
                 "fichero demasiado pequeño ({tam_fichero} bytes; mínimo 1 MiB)"
             )));
         }
-        let id = leer_estructura(&file, tam_fichero, 0, 8, "identificador")?;
+        let id = leer_estructura(&file, None, tam_fichero, 0, 8, "identificador")?;
         if id.as_slice() != FIRMA_FICHERO {
             return Err(corrupto("falta el identificador «vhdxfile»"));
         }
@@ -351,7 +366,7 @@ impl VhdxImage {
         // Cabeceras: la válida con mayor número de secuencia.
         let mut activa: Option<Cabecera> = None;
         for off in OFF_CABECERAS {
-            let buf = leer_estructura(&file, tam_fichero, off, TAM_CABECERA, "cabecera")?;
+            let buf = leer_estructura(&file, None, tam_fichero, off, TAM_CABECERA, "cabecera")?;
             if let Some(c) = analizar_cabecera(&buf)? {
                 if activa.as_ref().is_none_or(|a| c.secuencia > a.secuencia) {
                     activa = Some(c);
@@ -366,11 +381,6 @@ impl VhdxImage {
                 "versión de cabecera {} (se admite la 1)",
                 cab.version
             )));
-        }
-        if cab.guid_registro != [0u8; 16] {
-            return Err(no_soportado(
-                "registro pendiente (LogGuid no nulo); no se reproduce todavía",
-            ));
         }
         if cab.version_registro != 0 {
             return Err(no_soportado(format!(
@@ -404,11 +414,31 @@ impl VhdxImage {
             });
         }
 
+        // Registro pendiente: se valida y se reproduce en memoria antes de leer el resto de
+        // estructuras; desde aquí todas las lecturas pasan por él y los límites se comprueban
+        // contra el tamaño efectivo del fichero (LastFileOffset, si es mayor).
+        let mut presupuesto = Budget::new(FORMATO);
+        let registro = if cab.guid_registro != [0u8; 16] {
+            Some(vhdx_log::reproducir(
+                &file,
+                tam_fichero,
+                cab.off_registro,
+                u64::from(cab.long_registro),
+                &cab.guid_registro,
+                &mut presupuesto,
+            )?)
+        } else {
+            None
+        };
+        let reg = registro.as_ref();
+        let tam_fichero = reg.map_or(tam_fichero, Registro::tam_efectivo);
+
         // Tablas de regiones: la primera copia válida.
         let mut regiones = None;
         for off in OFF_TABLAS_REGIONES {
             let buf = leer_estructura(
                 &file,
+                reg,
                 tam_fichero,
                 off,
                 TAM_TABLA_REGIONES,
@@ -481,6 +511,7 @@ impl VhdxImage {
         // Metadatos.
         let tabla = leer_estructura(
             &file,
+            reg,
             tam_fichero,
             metadatos.offset,
             TAM_TABLA_METADATOS,
@@ -549,6 +580,7 @@ impl VhdxImage {
             }
             leer_estructura(
                 &file,
+                reg,
                 tam_fichero,
                 metadatos.offset + u64::from(e.offset),
                 e.longitud as usize,
@@ -621,7 +653,6 @@ impl VhdxImage {
         // Ya sabemos que la BAT cabe en el fichero: la reserva está acotada por su tamaño y por
         // el presupuesto de la apertura. La BAT se lee por trozos; en modo estricto la apertura
         // falla en la primera entrada inválida.
-        let mut presupuesto = Budget::new(FORMATO);
         presupuesto.add_tables(bytes_bat);
         let mut bloques: Vec<u64> = presupuesto.vec(n_bloques, "BAT")?;
         let mut dano = Damage::new(FORMATO, n_bloques, tolerante, &mut presupuesto)?;
@@ -633,7 +664,7 @@ impl VhdxImage {
         while pos < bytes_bat {
             let len = (bytes_bat - pos).min(buf.len() as u64) as usize;
             let trozo_bat = &mut buf[..len];
-            leer(&file, bat.offset + pos, trozo_bat)?;
+            leer_en(&file, reg, bat.offset + pos, trozo_bat)?;
             for e in trozo_bat.as_chunks::<8>().0 {
                 let entrada = u64::from_le_bytes(*e);
                 if (indice + 1).is_multiple_of(ratio + 1) {
@@ -718,6 +749,7 @@ impl VhdxImage {
             tolerante,
             descartados,
             mapas_ignorados,
+            registro,
         })
     }
 
@@ -734,6 +766,13 @@ impl VhdxImage {
             self.sector_logico,
             self.sector_fisico
         );
+        if let Some(r) = &self.registro {
+            let n = r.entradas();
+            s.push_str(&format!(
+                "; registro reproducido en memoria ({n} {})",
+                if n == 1 { "entrada" } else { "entradas" }
+            ));
+        }
         if self.tolerante {
             s.push_str(&tolerant::describe_suffix(
                 self.descartados,
@@ -753,6 +792,11 @@ impl VhdxImage {
     /// `true` si se abrió en modo tolerante.
     pub fn is_tolerant(&self) -> bool {
         self.tolerante
+    }
+
+    /// Entradas del registro pendiente reproducidas en memoria (0 si no había registro pendiente).
+    pub fn replayed_log_entries(&self) -> u64 {
+        self.registro.as_ref().map_or(0, Registro::entradas)
     }
 
     /// Bloques descartados en modo tolerante (0 en modo estricto).
@@ -890,7 +934,7 @@ impl BlockDevice for VhdxImage {
             } else if base == DESCARTADO {
                 return Err(tolerant::discarded_read(FORMATO, "bloque", b, pos, n));
             } else {
-                leer(&self.file, base + dentro, parte)?;
+                leer_en(&self.file, self.registro.as_ref(), base + dentro, parte)?;
             }
             pos += n as u64;
             resto = siguiente;
@@ -1310,13 +1354,14 @@ mod tests {
         poner(&mut img, OFF_CABECERAS[0] + 48, &[0x44; 16]);
         sellar_cabeceras(&mut img);
         assert!(abrir(&img).is_ok());
-        // La más reciente (secuencia 2) con registro pendiente: no soportado.
+        // La más reciente (secuencia 2) con registro pendiente y el registro vacío: no hay nada
+        // válido que reproducir.
         let mut img = construir(&Modelo::basico());
         poner(&mut img, OFF_CABECERAS[1] + 48, &[0x44; 16]);
         sellar_cabeceras(&mut img);
         let r = abrir(&img);
         assert!(
-            matches!(&r, Err(IoError::UnsupportedFeature { detail, .. }) if detail.contains("registro pendiente")),
+            matches!(&r, Err(IoError::Corrupt { detail, .. }) if detail.contains("registro pendiente")),
             "{r:?}"
         );
         // Si su CRC es malo se usa la otra.
@@ -1732,6 +1777,8 @@ mod tests {
             }
         }
     }
+
+    mod registro;
 
     #[test]
     fn guid_en_orden_de_disco() {
