@@ -249,6 +249,21 @@ imagen dividida con `MAX_SEGMENTS` segmentos y un repetido al final
 O(1) de 10 000 tramos no fiables por la FFI (`untrusted_ranges_are_indexed_in_constant_time`) y el perfil
 Release compila con `overflow-checks = true` (`cargo test --release --workspace` pasa con ellas).
 
+Registro pendiente de VHDX (issue #10, `formatos/vhdx.md`): 10 pruebas unitarias en
+`core/mr-image/src/vhdx/tests/registro.rs` con entradas construidas según [MS-VHDX] y un modelo
+independiente (las escrituras aplicadas a mano sobre una copia sin registro deben leerse igual que la
+imagen con el registro pendiente): datos y ceros, BAT y metadatos, varias entradas con vuelta al
+principio del registro, secuencia más reciente incompleta y entrada a medio escribir ignoradas, Tail,
+saltos de secuencia, LastFileOffset y 18 registros no válidos (`Corrupt` en ambos modos), con el
+fichero intacto. En `corruption.rs`, 2 pruebas más: inversiones dirigidas al registro (con las CRC-32C
+de sus entradas recalculadas la mitad de las veces) y fichero acortado después de abrir. Contra
+qemu-img, `core/mr-image/tests/vhdx_log_qemu.rs` (2 ignoradas, las ejecuta el paso «Formatos»): qemu
+reproduce el registro en una **copia desechable** abierta en lectura y escritura
+(`convert --image-opts …,read-only=off`) y la lectura de MemRescue del original debe tener el mismo
+SHA-256; `qemu-img info` del original debe negarse a abrirlo por tener un registro pendiente. Casos:
+registros escritos por qemu vueltos a dejar pendientes (también con sus destinos puestos a ceros) y
+registros sintéticos con vuelta al principio y entrada a medias. El original no cambia.
+
 Memoria acotada al abrir contenedores (issue #38, addendum de ADR-020): `core/mr-ffi/tests/table_memory.rs`
 (4 pruebas, no ignoradas) genera en un directorio temporal imágenes sintéticas con la tabla al límite de
 `MAX_TABLE_BYTES` y entradas duplicadas (VHD con BAT de 256 MiB y bloques de 512 B; VHDX con BAT de
