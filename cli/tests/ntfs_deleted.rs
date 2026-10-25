@@ -131,14 +131,14 @@ fn ntfs_deleted_lists_the_manifest_entries() {
         assert_eq!(code, 0, "{name}: {err}");
         assert!(out.starts_with("{\"records\":"), "{name}");
         assert!(out.contains("\"bitmap_issue\":null"), "{name}");
-        // Entrada: desde {"record":N,"sequence":S,"type" hasta su "streams" (el padre, los dueños
-        // y los problemas no llevan "type").
+        // Entrada: desde {"record":N,"sequence":S,"status" hasta su "streams" (el padre, los
+        // dueños, los problemas y las referencias de índice no llevan "status").
         let entry = |rec: &str| -> Option<&str> {
             let pat = format!("{{\"record\":{rec},\"sequence\":");
             out.match_indices(&pat).find_map(|(i, _)| {
                 let rest = &out[i + pat.len()..];
                 let digits = rest.find(|c: char| !c.is_ascii_digit())?;
-                rest[digits..].starts_with(",\"type\":").then(|| {
+                rest[digits..].starts_with(",\"status\":").then(|| {
                     let all = &out[i..];
                     &all[..all.find("\"streams\"").unwrap_or(all.len())]
                 })
@@ -155,11 +155,23 @@ fn ntfs_deleted_lists_the_manifest_entries() {
             let c = entry(rec).unwrap_or_else(|| panic!("{name} {}", f["path"]));
             assert!(
                 c.starts_with(&format!(
-                    "{{\"record\":{rec},\"sequence\":{},\"type\":\"{}\"",
-                    f["sequence"], f["type"]
+                    "{{\"record\":{rec},\"sequence\":{},\"status\":\"deleted\",\
+                     \"status_message\":\"borrado\",\"origins\":[\"mft_record\"",
+                    f["sequence"]
                 )),
                 "{name} {c}"
             );
+            assert!(
+                c.contains(&format!("\"type\":\"{}\"", f["type"])),
+                "{name} {c}"
+            );
+            // sello.bin: también en el índice del directorio borrado /docs/cartas.
+            let origins = if name == "ntfs_deleted" && rec == "103" {
+                "[\"mft_record\",\"deleted_directory_index\"]"
+            } else {
+                "[\"mft_record\"]"
+            };
+            assert!(c.contains(&format!("\"origins\":{origins},")), "{name} {c}");
             assert!(
                 c.contains(&format!("\"path\":{}", json_str(&f["path"]))),
                 "{name} {c}"
@@ -179,6 +191,29 @@ fn ntfs_deleted_lists_the_manifest_entries() {
         }
         let n = out.matches(",\"namespace\":").count();
         assert_eq!(n, want, "{name}: entradas");
+        // Entradas residuales: lo que muestra el corpus (ver ntfs_deleted_corpus.rs).
+        let (accepted, rejected) = if name == "ntfs_deleted" {
+            (1, 4)
+        } else {
+            (0, 0)
+        };
+        assert!(out.contains("\"nodes_unreadable\":0,\"nodes_invalid\":0,\"free_nodes\":0,"));
+        assert!(
+            out.contains(&format!(
+                "\"accepted\":{accepted},\"rejected\":{rejected},\"duplicates\":0,\
+                 \"live_copies\":0,\"residual_only\":0,\"truncated\":false}}}}"
+            )),
+            "{name}: {}",
+            &out[out.rfind("\"index_entries\"").unwrap()..]
+        );
+        assert!(!out.contains("pending"), "{name}");
+        if name == "ntfs_deleted" {
+            assert!(out.contains(
+                "\"index_entries\":[{\"origin\":\"deleted_directory_index\",\
+                 \"directory\":{\"record\":68,\"sequence\":2},\"vcn\":0,\"offset\":64,\
+                 \"reference\":{\"record\":103,\"sequence\":1},\"name\":\"sello.bin\"}]"
+            ));
+        }
         for d in damaged {
             assert!(entry(&d.to_string()).is_none());
             assert!(
@@ -189,7 +224,18 @@ fn ntfs_deleted_lists_the_manifest_entries() {
         // Texto.
         let (code, out, _) = run(&["ntfs-deleted", &img]);
         assert_eq!(code, 0);
-        assert!(out.contains("Borrados en la MFT:"), "{name}");
+        assert!(out.contains("Borrados: "), "{name}");
+        assert!(out.contains("; 0 solo en índices)"), "{name}");
+        assert!(
+            out.contains(&format!(
+                "{accepted} aceptadas (0 repetidas, 0 copias de entradas vivas), {rejected} \
+                 restos rechazados"
+            )),
+            "{name}: {out}"
+        );
+        if name == "ntfs_deleted" {
+            assert!(out.contains("encontrado en: registro MFT, índice de un directorio borrado"));
+        }
     }
     // Volumen en una partición GPT: sin borrados.
     let (code, out, err) = run(&[

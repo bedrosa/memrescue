@@ -12,8 +12,8 @@ use std::sync::Arc;
 use mr_common::{HashAlgorithm, MultiHasher};
 use mr_fs_ntfs::deleted::{NoObserver, ParentState};
 use mr_fs_ntfs::{
-    recover_stream, scan_deleted, DeletedScan, NtfsError, NtfsVolume, RangeState, RecordState,
-    Recoverability, ScanOptions,
+    recover_stream, scan_deleted, DeletedScan, DeletedStatus, EntryOrigin, NtfsError, NtfsVolume,
+    RangeState, RecordState, Recoverability, ScanOptions,
 };
 use mr_io::{BlockDevice, ImageFile, RangeView};
 use mr_part::{open_coordinates, read_partition_table, Scheme};
@@ -367,4 +367,84 @@ fn unreadable_bitmap_and_data_sectors_are_never_reported_as_recoverable() {
         r.copy.count(RangeState::PossiblyOverwritten),
         a.possibly_overwritten() * cluster
     );
+}
+
+/// Entradas residuales de los índices (#23) tal como las deja ntfs-3g en el corpus: al quitar una
+/// entrada mueve las siguientes y escribe la entrada final encima, así que el espacio libre de los
+/// nodos solo conserva restos con la cabecera pisada (referencia imposible: rechazados, nunca
+/// aceptados); el índice de un directorio borrado (`/docs/cartas`, registro 68) conserva su última
+/// entrada (`sello.bin`, registro 103), que se une a la entrada de la MFT. El corpus no tiene nodos
+/// `INDX` libres. Cada borrado del manifiesto aparece exactamente una vez y ningún vivo aparece.
+#[test]
+#[ignore = "requiere el corpus NTFS (tools/fetch_ntfs_corpus.py)"]
+fn residual_index_entries_match_what_the_corpus_shows() {
+    for m in manifests() {
+        let name = m.top["name"].clone();
+        let v = open(&m);
+        let s = scan(&v);
+        let r = s.residual.clone().expect("búsqueda de residuales hecha");
+        assert_eq!(r.nodes_unreadable + r.nodes_invalid, 0, "{name}");
+        assert_eq!(r.directories_unusable, 0, "{name}");
+        assert_eq!(r.free_nodes, 0, "{name}: el corpus no tiene nodos libres");
+        assert!(r.slack_bytes > 0 && !r.truncated, "{name}");
+        assert_eq!(s.residual_live, 0, "{name}");
+        assert_eq!(s.residual_only().count(), 0, "{name}");
+        let (accepted, rejected) = if name == "ntfs_deleted" {
+            (1, 4)
+        } else {
+            (0, 0)
+        };
+        assert_eq!((r.accepted, r.rejected), (accepted, rejected), "{name}");
+        for f in &m.files {
+            let record: u64 = f["mft_record"].parse().unwrap();
+            let n = s.entries.iter().filter(|e| e.record == record).count();
+            let want = usize::from(f["state"] != "live");
+            assert_eq!(n, want, "{name} {}: veces entre los borrados", f["path"]);
+        }
+        if name == "ntfs_deleted" {
+            let e = s.entry(103).unwrap();
+            assert_eq!(
+                e.origins,
+                [EntryOrigin::MftRecord, EntryOrigin::DeletedDirectoryIndex]
+            );
+            assert_eq!(e.index_refs.len(), 1);
+            assert_eq!(e.index_refs[0].directory.record, 68);
+            assert_eq!(e.index_refs[0].name, "sello.bin");
+            assert_eq!(e.names.len(), 1, "el índice confirma el nombre y el padre");
+            assert_eq!(e.status, DeletedStatus::Deleted);
+            assert_eq!(e.recoverability(), Some(Recoverability::Full));
+            let only_mft = s
+                .entries
+                .iter()
+                .filter(|e| e.origins == [EntryOrigin::MftRecord])
+                .count();
+            assert_eq!(only_mft, s.entries.len() - 1, "{name}");
+        } else {
+            assert!(
+                s.entries
+                    .iter()
+                    .all(|e| e.origins == [EntryOrigin::MftRecord]),
+                "{name}"
+            );
+        }
+    }
+}
+
+/// Un sector ilegible en el nodo INDX del directorio borrado /docs/cartas (clúster 4773 de
+/// ntfs_deleted): el nodo no se interpreta y sello.bin queda solo con su origen en la MFT.
+#[test]
+#[ignore = "requiere el corpus NTFS (tools/fetch_ntfs_corpus.py)"]
+fn unreadable_index_node_is_never_parsed_for_residual_entries() {
+    let all = manifests();
+    let m = &all[find(&all, "ntfs_deleted")];
+    let v = faulty(m, vec![4773 * 8 + 1]);
+    let s = scan(&v);
+    let r = s.residual.clone().unwrap();
+    assert_eq!(r.nodes_unreadable, 1);
+    assert_eq!(r.accepted, 0);
+    // De los 4 restos rechazados, 3 estaban en ese nodo; queda el de /docs (clúster 4611).
+    assert_eq!(r.rejected, 1);
+    let e = s.entry(103).unwrap();
+    assert_eq!(e.origins, [EntryOrigin::MftRecord]);
+    assert_eq!(e.recoverability(), Some(Recoverability::Full));
 }

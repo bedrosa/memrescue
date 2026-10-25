@@ -2,8 +2,8 @@
 
 Crate: `core/mr-fs-ntfs` (`mr_fs_ntfs::NtfsVolume`). Solo lectura. Issues #20, #21 y #22 (M3),
 paridad FS-01 a FS-04, ADR-025, ADR-026 y ADR-028 (índices, árbol y rutas). Los borrados (qué datos
-siguen disponibles y con qué fiabilidad) son de #23 (FS-16, ADR-027): la parte de la MFT está hecha
-y las entradas `INDX` residuales, pendientes.
+siguen disponibles y con qué fiabilidad) son de #23 (FS-16, ADR-027): registros MFT no en uso y
+entradas residuales de los índices `INDX`, combinados.
 
 ## Especificación usada
 
@@ -29,6 +29,8 @@ stream.read(offset, len) -> Result<StreamChunk, _>         // bytes + estado de 
 stream.copy_to(&mut impl Write) -> Result<CopyReport, _>   // flujo entero con memoria acotada
 lznt1::decompress(src, límite)          // [MS-XCA] con límites estrictos
 scan_deleted(&volume, &ScanOptions, &observador) -> Result<Option<DeletedScan>, _>  // #23; None = cancelado
+residual::residual_entries(&volume, registro)          // entradas residuales del índice de un directorio
+residual::parse_candidates(búfer, desde, hasta, &DirContext)  // validación estricta de restos
 ClusterBitmap::open(&volume).runs(lcn, n)              // asignación libre/asignado/desconocido
 recover_stream(&volume, n, "nombre", &mut w, &observador) -> Result<Option<RecoveryReport>, _>
 stream.with_suspect_clusters(tramos)    // lo leído de esos clústeres: possibly_overwritten
@@ -67,18 +69,30 @@ stream.with_suspect_clusters(tramos)    // lo leído de esos clústeres: possibl
   **solo** en esos bytes, se listan en la salida de errores (desplazamiento, longitud, estado y LBA)
   y el código de salida es 3. Un registro no en uso (borrado) se lee igual, con un aviso.
 - #23: `mr_api::ntfs_deleted(volumen, ctx)` y `start_ntfs_deleted_task(Arc<NtfsVolume>)`
-  (cancelable, progreso en registros leídos de las dos pasadas más entradas evaluadas; al cancelar,
-  `ApiError::Cancelled`), `ntfs_recover_record(origen, volumen, registro, salida, sobrescribir)` y
-  `ntfs_recover_stream(..., flujo, ..., ctx)`: evalúan y abren el flujo antes de crear la salida
-  (un error no deja ficheros) y escriben con `create_output`.
+  (cancelable, progreso en registros leídos de las dos pasadas, entradas evaluadas y directorios
+  cuyo índice se lee; al cancelar, `ApiError::Cancelled`), `ntfs_recover_record(origen, volumen,
+  registro, salida, sobrescribir)` y `ntfs_recover_stream(..., flujo, ..., ctx)`: evalúan y abren el
+  flujo antes de crear la salida (un error no deja ficheros) y escriben con `create_output`.
+  `ntfs_recover_deleted(origen, volumen, registro, secuencia, flujo, salida, sobrescribir, ctx)` y
+  `start_ntfs_recover_task` (la de la interfaz y la FFI) exigen además un registro base no en uso
+  con la secuencia de la entrada y con `$FILE_NAME`: una entrada solo residual (registro
+  reutilizado, dañado o libre) nunca se recupera.
 - CLI (#23): `ntfs-deleted <imagen> [ORIGEN] [--json]` (borrados con registro, secuencia, tipo,
-  tamaño, ruta o `<huérfano N>/nombre`, estado del padre, recuperabilidad y resumen de cada flujo
-  no íntegro; registros no interpretables aparte; código 3 si hay registros MFT ilegibles o
-  `$Bitmap` no se puede usar) y `ntfs-recover <imagen> --record N -o SALIDA [--stream NOMBRE]
-  [--overwrite] [ORIGEN]` (política de salida de `ntfs-cat -o`; en la salida de errores, la
-  recuperabilidad, los tramos posiblemente sobrescritos con LCN y dueño y los tramos con patrón;
-  código 3 si algún byte no es fiable).
-- FFI e interfaz: con el árbol (#22, ver «Índices, directorios y rutas»).
+  tamaño, ruta o `<huérfano N>/nombre`, estado del padre, recuperabilidad, resumen de cada flujo
+  no íntegro, orígenes y, en las solo residuales, su estado; registros no interpretables aparte;
+  recuentos de la búsqueda en los índices; código 3 si hay registros MFT o nodos de índice
+  ilegibles o `$Bitmap` no se puede usar). En JSON, cada entrada lleva `status`,
+  `status_message`, `origins` e `index_entries` (directorio, VCN o `null` en la raíz,
+  desplazamiento, referencia y nombre de cada entrada de índice) y el resultado, `index_entries`
+  con los recuentos (directorios, nodos, ilegibles, no válidos, libres, bytes de espacio libre,
+  aceptadas, rechazadas, repetidas, copias de entradas vivas, solo residuales, truncado).
+  `ntfs-recover <imagen> --record N -o SALIDA [--stream NOMBRE] [--overwrite] [ORIGEN]` (política
+  de salida de `ntfs-cat -o`; en la salida de errores, la recuperabilidad, los tramos posiblemente
+  sobrescritos con LCN y dueño y los tramos con patrón; código 3 si algún byte no es fiable).
+- FFI (#23): `mr_ntfs_deleted_*` (tarea, estados 16 a 19 de `mr_ntfs_entry`, detalle con
+  recuperabilidad, orígenes y clústeres, textos) y `mr_ntfs_recover_*` (tarea, informe y tramos
+  sospechosos con su dueño); C# `NtfsVolume.StartDeletedScan` / `StartRecover`. Interfaz:
+  «Mostrar borrados» y «Recuperar…» en la pestaña «Sistema de archivos» (ver «Ficheros borrados»).
 
 Módulos y frontera con los siguientes issues:
 
@@ -92,13 +106,14 @@ Módulos y frontera con los siguientes issues:
 | `file` | `NtfsFile` (base + extensiones), `FileAnomaly`, `StreamLayout`, `StreamError`, `StreamIssue` | - |
 | `stream` | `DataStream`: lectura con estado por tramo, compresión, `copy_to`, clústeres sospechosos (#23) | #22 |
 | `bitmap` (#23) | `ClusterBitmap`: `$Bitmap` por páginas, `alloc_runs` | - |
-| `deleted` (#23) | `scan_deleted`, `ClaimIndex`, `assess_layout`, `DeletedEntry`, `StreamAssessment`, `ParentState` | INDX residuales (tras #22) |
+| `deleted` (#23) | `scan_deleted`, `ClaimIndex`, `assess_layout`, `DeletedEntry`, `DeletedStatus`, `EntryOrigin`, `StreamAssessment`, `ParentState`, combinación con las residuales | M4 |
+| `residual` (#23) | entradas residuales de los índices: `parse_candidates`, `collect_directory`, `ResidualEntry`, `ResidualStats` | - |
 | `recover` (#23) | `recovery_stream`, `recover_stream`, `RecoveryReport` | M4 |
 | `lznt1` | descompresor [MS-XCA] | - |
 | `mft` | `MftLayout` (tramos en disco de cada registro), `RecordOutcome`, `Records` | #22, #23 |
 | `volume` | apertura, copia del arranque, `$MFTMirr`, `$Volume`, extensiones de `$MFT`, `file`, `open_stream`, `attribute_stream`, `stream_view`, `upcase` | - |
-| `index` (#22) | `$INDEX_ROOT`, nodos `INDX`, `$BITMAP`, `IndexReader` (`walk`, `find`), `IndexIssue` | #23 (entradas residuales del espacio libre de los nodos) |
-| `dir` (#22) | `DirEntry`, `EntryState`, `list_dir`, `lookup`, `resolve_path`, `path_of`, `tree`, huérfanos | #23 (borrados en el árbol) |
+| `index` (#22) | `$INDEX_ROOT`, nodos `INDX`, `$BITMAP`, `IndexReader` (`walk`, `find`; `slot_count`, `slot_allocated`, `read_slot` y `root_value` para #23), `IndexIssue` | - |
+| `dir` (#22) | `DirEntry`, `EntryState`, `list_dir`, `lookup`, `resolve_path`, `path_of`, `tree`, huérfanos | - |
 | `upcase` (#22) | `$UpCase`, plegado simple, colación | - |
 | `testvol` | volúmenes sintéticos (también para otros crates con la característica `test-support`) | - |
 
@@ -155,7 +170,8 @@ nodo fuera del orden de colación, `index_order` (informativo, y la búsqueda re
 está en uso y su secuencia es la de la referencia; si no, `stale_not_in_use` (libre: borrado),
 `stale_reused` (otra secuencia), `record_unusable` (con el estado del registro: dañado, ilegible...) o
 `invalid_reference` (fuera de la MFT o extensión). Solo las vivas son ficheros; las demás se listan
-con su estado (#23 las expondrá como residuales). Además: `entry_name_not_in_record` (el registro no
+con su estado (las libres y reutilizadas son también entradas residuales de #23, origen
+`index_stale`). Además: `entry_name_not_in_record` (el registro no
 tiene ese nombre en este directorio), `entry_parent_mismatch` (la clave dice estar en otro
 directorio), `entry_duplicate` y `entry_self_reference` (la entrada «.» de la raíz no se lista ni se
 informa). Tamaño, fechas y atributos salen del registro (`$DATA` principal y
@@ -393,8 +409,8 @@ no necesita Windows.
 
 ## Ficheros borrados (#23, ADR-027)
 
-Módulos `deleted` (descubrimiento y clasificación), `bitmap` (`$Bitmap`) y `recover`. Solo la
-parte de la MFT: las entradas `INDX` residuales están **pendientes** (tras #22).
+Módulos `deleted` (descubrimiento, clasificación y combinación), `residual` (entradas residuales de
+los índices), `bitmap` (`$Bitmap`) y `recover`.
 
 **Descubrimiento** (`scan_deleted(volumen, opciones, observador)`, pasada 1 por la MFT):
 
@@ -419,7 +435,8 @@ estado, ruta, tamaños (del `$DATA` principal o, sin él, del `$FILE_NAME`), fec
 
 La ruta se construye por la cadena de padres de la MFT (directorios vivos o borrados con la
 secuencia coherente, como mucho 1024 niveles y 2 millones de directorios recordados) solo si llega
-a la raíz (registro 5); si no, se muestra `<huérfano N>/nombre`. No usa los índices `$I30` (#22).
+a la raíz (registro 5); si no, se muestra `<huérfano N>/nombre`. No usa los índices `$I30` (#22): los
+índices aportan otra fuente de entradas (ver «Entradas residuales de los índices»).
 
 **Dueños** (pasada 2): con los clústeres de los flujos borrados como consulta, se recorren los
 registros en uso (base y extensiones; los de una extensión cuentan para su base) y se guardan solo
@@ -470,10 +487,78 @@ recuento por estado, los tramos no fiables, los tramos sospechosos en bytes con 
 dueño, y el resumen. Un registro en uso se copia tal cual; uno dañado o ilegible es
 `RecordUnusable`; uno libre (sin `$FILE_NAME`) también.
 
-**Pendiente: entradas `INDX` residuales.** Tras #22 serán otra fuente de entradas
-(`EntryOrigin` tendrá su variante): las que coincidan con un registro de la lista añadirán nombres o
-rutas; las que apunten a un registro reutilizado se clasificarán con `assess_layout` si hay runs o
-como `none` si solo queda el `$FILE_NAME` del índice.
+**Entradas residuales de los índices** (`residual`, después de las dos pasadas; se omite al
+recuperar un fichero y con `ScanOptions::residual = false`). Se lee el índice `$I30` de cada
+directorio (registro base con el indicador de directorio, vivo o borrado; la raíz y los registros
+16 en adelante) y se buscan cuatro tipos de restos:
+
+| Origen (`EntryOrigin`) | Dónde | Qué se examina |
+|---|---|---|
+| `index_slack` | nodo asignado (raíz o `INDX` con su bit de `$BITMAP` a 1) de un directorio vivo | el espacio libre: entre los bytes en uso y los asignados de la cabecera de nodo |
+| `index_free_node` | nodo `INDX` con su bit de `$BITMAP` a 0 de un directorio vivo | todo el nodo desde la primera entrada hasta los bytes asignados |
+| `deleted_directory_index` | raíz y nodos `INDX` de un directorio borrado (registro no en uso) | todo el nodo |
+| `index_stale` | parte en uso de un nodo asignado de un directorio vivo | las entradas cuyo registro no es interpretable como vivo con esa secuencia (ver «Contraste con la MFT»), salvo las que apuntan a un registro dañado o ilegible: son daños de un fichero vivo, no borrados (el listado los informa como `record_unusable`) |
+
+Sin `$BITMAP` utilizable no se sabe qué nodos están libres: todos se tratan como asignados (su espacio
+libre se examina y su parte en uso se contrasta con la MFT). Cada nodo `INDX` se lee entero por el
+mapa de validez y solo se usa si **todos** sus bytes son fiables (un sector ilegible nunca se
+interpreta: `nodes_unreadable`), tiene firma `INDX`, secuencia de actualización sin tolerancia, VCN
+de la cabecera igual al de su posición y cabecera de nodo dentro de límites (si no, `nodes_invalid`).
+La raíz sale del registro (ya validado con sus fixups). Hasta 2^20 nodos por índice y, en total,
+`ScanOptions::max_residual` entradas (1 millón; `truncated`).
+
+**Validación estricta de cada candidata** (`parse_candidates`, posiciones alineadas a 8 dentro del
+tramo, sin leer nunca fuera de él):
+
+1. Indicadores sin bits desconocidos y sin el de última entrada.
+2. Longitud exactamente `alinear8(0x10 + clave) (+ 8 si tiene subnodo)` y dentro del tramo.
+3. Clave de exactamente `0x42 + 2 × caracteres` bytes que es un `$FILE_NAME` válido (longitud de
+   nombre no nula, espacio de nombres 0..3), sin unidades nulas ni `/`.
+4. Padre de la clave = el directorio que se lee: mismo número y misma secuencia (en un directorio
+   borrado, la de antes de liberarlo, una menos que la actual).
+5. Referencia plausible: registro 16 o mayor, dentro de la MFT, distinto del propio directorio y
+   con secuencia distinta de 0.
+
+Lo que no cumple 1 a 4 no es una candidata (se avanza 8 bytes); lo que cumple 1 a 4 pero no 5 se
+cuenta como **resto rechazado** (`rejected`). Una candidata aceptada salta su longitud. Una misma
+entrada (registro, secuencia, directorio, nombre y origen) vista varias veces cuenta una vez
+(`duplicates`).
+
+**Combinación con la MFT** (`DeletedStatus`), según lo que es hoy el registro de la referencia:
+
+| Registro | Resultado |
+|---|---|
+| En uso, base, misma secuencia | copia de una entrada viva: se descarta (`live_copies`); nunca se presenta un vivo como borrado |
+| No en uso con la secuencia de la referencia o una más, y es un borrado de la MFT | se une a esa entrada: un origen más, el nombre del índice si no lo tenía y la referencia de índice (`index_refs`); aparece **una sola vez** con todos sus orígenes |
+| No en uso con esa secuencia, sin entrada de la MFT (libre, sin `$FILE_NAME`) | `residual_record_free` |
+| En uso con otra secuencia, extensión de otro fichero o liberado con otra secuencia | `residual_record_reused`: el contenido es de otro fichero, nada que recuperar |
+| Dañado, ilegible, vacío, fuera del origen... | `residual_record_unusable` con el estado: no se conocen sus runs |
+
+Las entradas solo residuales se agrupan por (registro, secuencia de la referencia): varios nombres
+(p. ej. largo y DOS) son una entrada con el nombre que no es DOS. Llevan el nombre, el padre, los
+tamaños, los atributos y las fechas de la clave del índice (`TIMES_FROM_INDEX` en la FFI), la ruta
+por la cadena de padres de la MFT y recuperabilidad siempre `none` (nunca se presentan como
+recuperables; `ntfs_recover_deleted` las rechaza).
+
+**Lo que deja ntfs-3g (corpus).** Al quitar una entrada, ntfs-3g mueve las siguientes hacia el
+principio del nodo y escribe la entrada final encima: el espacio libre conserva restos de las
+entradas movidas, pero con la cabecera pisada (la referencia queda con bytes de la entrada final y
+apunta fuera de la MFT). En `ntfs_deleted` hay 4 restos así (1 en el nodo de `/docs`, 3 en el de
+`/docs/cartas`): los 4 se rechazan y ninguno se acepta. El índice del directorio borrado
+`/docs/cartas` (registro 68) conserva su última entrada en uso, `sello.bin` (registro 103), que se
+une a su entrada de la MFT (orígenes `mft_record` y `deleted_directory_index`). El corpus no tiene
+nodos `INDX` libres ni entradas solo residuales; en las demás imágenes no hay restos que pasen la
+validación ni rechazados. Esos casos se prueban con volúmenes sintéticos.
+
+**Interfaz.** En la pestaña «Sistema de archivos», «Mostrar borrados» (`FsShowDeletedToggle`) lanza
+la búsqueda (una vez por origen, con progreso) y rehace el árbol: los directorios borrados aparecen
+bajo su padre como `nombre (borrado)` (`FsDeletedDir<registro>`), los borrados sin ruta en
+`<borrados sin ruta>` (`FsDeletedOrphans`) y la lista de cada directorio añade sus borrados
+(`FsDeleted<registro>`) y entradas solo residuales (`FsResidual<registro>_<secuencia>`) con su estado,
+orígenes y la columna «Recuperable». «Recuperar…» (`FsRecoverButton`) solo se habilita en un fichero
+borrado con su registro: pide el destino (con confirmación si existe), recupera con
+`StartRecover` (escritura atómica, nunca sobre el origen) e informa de los bytes posiblemente
+sobrescritos y de cada tramo con su dueño (aviso y registro de actividad).
 
 ## MFT, estados de registro y límites
 
@@ -533,6 +618,27 @@ son el estado de cada registro.
   residente, borrados con secuencias incrementadas, extensiones ajenas, reutilizadas, ilegibles, con
   lista propia, fuera de la MFT, solapadas, repetidas o con hueco, errores de flujo, extensiones de
   `$MFT` y fuzzing de 600 volúmenes con registros mutados.
+- #23, entradas residuales (`core/mr-fs-ntfs/src/residual_tests.rs`, 7, con
+  `testvol::residual_volume`): candidatas estrictas (entrada completa, con subnodo, cortada por el
+  tramo, otro directorio, directorio borrado con su secuencia, tramos fuera del búfer y cada
+  entrada mal formada de `testvol::malformed_slack`); espacio libre con un borrado dos veces, un
+  registro reutilizado, uno dañado, una copia de una entrada viva y restos mal formados; nodo libre
+  válido con un borrado, un registro libre y nombres DOS y largo de un registro dañado; nodo libre
+  con un sector ilegible (`FaultyDevice`: nunca se interpreta) y nodo libre con fixups rotos; raíz
+  de índice de un directorio borrado; combinación con la MFT (una entrada por fichero con todos
+  sus orígenes, estados, recuperabilidad `none` de las solo residuales, nombre largo preferido,
+  fechas de la clave, ningún vivo); búsqueda opcional, omitida con `focus` y con límite; entradas
+  caducadas de `tree_volume` (reutilizado sí; registro dañado no; fuera de la MFT rechazada);
+  fuzzing de 5000 tramos de candidatas (aleatorios y mutados) y 300 volúmenes con los nodos
+  mutados (sin pánicos, sin vivos como borrados, sin repetidos, nada recuperable sin registro).
+  Corpus (`ntfs_deleted_corpus.rs`, 2 más): lo que muestra el corpus (arriba) en las 10 imágenes,
+  cada borrado del manifiesto exactamente una vez y ningún vivo; y un sector ilegible en el nodo
+  del directorio borrado (sello.bin queda solo con la MFT). `mr-api` (1: borrados con residuales
+  y `ntfs_recover_deleted` que rechaza vivos, reutilizados, libres, dañados y otra secuencia sin
+  crear la salida), `mr-ffi` (3: estructuras, tarea de borrados con estados 16-19, orígenes y
+  textos, tarea de recuperación con la política de salida), C# (`NtfsTests`: 3 más con el corpus),
+  CLI (`ntfs-deleted --json` y texto con los recuentos de los índices y los orígenes) e interfaz
+  (`NtfsDeletedUiTests`).
 - #23 (`core/mr-fs-ntfs/src`, 13 unitarias más; `deleted_tests.rs` y `bitmap.rs`): bits de
   `$Bitmap` y sus límites (bytes no fiables, fuera del mapa, desbordamiento) con fuzzing de 5000
   consultas contra un modelo; páginas leídas una vez; `$Bitmap` ilegible, corto o no en uso;
@@ -579,16 +685,21 @@ son el estado de cada registro.
   `possibly_overwritten`; `ntfs-cat` no evalúa (solo avisa de que el registro no está en uso).
 - Borrados: una escritura en un clúster libre sin asignarlo no se detecta (el contenido se da por
   original); de dos borrados que reclaman el mismo clúster libre no se sabe cuál es el original
-  (ninguno es `full`); las rutas salen de la cadena de padres de la MFT, no de los índices; las
-  entradas `INDX` residuales están pendientes (tras #22); el corpus no tiene borrados con
-  `$ATTRIBUTE_LIST`, comprimidos ni huérfanos (solo sintéticos).
+  (ninguno es `full`); las rutas salen de la cadena de padres de la MFT, no de los índices; el
+  corpus no tiene borrados con `$ATTRIBUTE_LIST`, comprimidos ni huérfanos (solo sintéticos).
+- Entradas residuales: un resto con la cabecera pisada (lo habitual en ntfs-3g) se rechaza aunque
+  su clave sea legible: no se adivina la referencia; tampoco se buscan entradas desalineadas ni en
+  nodos con algún sector ilegible o con fixups que no cuadran (la parte legible no se usa). Una
+  entrada solo residual no tiene datos recuperables: los runs de su registro se perdieron o son de
+  otro fichero (la búsqueda de contenido sin registro es del escaneo completo, M6). Los índices de
+  directorios que no son `$I30` no se examinan. El corpus de ntfs-3g no tiene nodos libres ni
+  entradas solo residuales (solo sintéticos); los volúmenes de Windows, que no mueven las entradas
+  igual, no se han probado.
 - El corpus de ntfs-3g no tiene ficheros comprimidos ni `$ATTRIBUTE_LIST`: la compresión se
   comprueba con los vectores de Windows y volúmenes sintéticos, y las extensiones con volúmenes
   sintéticos.
 - No se reparan registros desde `$MFTMirr` salvo el registro 0 para localizar la MFT.
 - Solo se interpretan índices `$I30` (nombres de fichero); `$SII`, `$SDH`, `$O`, `$Q` y `$R` no.
-- Las entradas residuales del espacio libre de los nodos `INDX` (más allá de los bytes en uso) y los
-  nodos libres según `$BITMAP` no se leen: son de #23.
 - El corpus de ntfs-3g tiene índices de uno o dos niveles y sin nombres DOS: los árboles B profundos,
   los nodos menores que un clúster y los nombres 8.3 se comprueban con volúmenes sintéticos.
 - La copia de un fichero desde la interfaz o la FFI hereda la limitación de `create_output`: un enlace

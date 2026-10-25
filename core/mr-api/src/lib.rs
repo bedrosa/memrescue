@@ -29,9 +29,10 @@
 //! - [`partition_backup`], [`save_partition_backup`], [`load_partition_backup`] y
 //!   [`compare_partition_backup`]: copia del particionado en formato propio y comparación con un
 //!   origen, sin escribir nunca en él (#18).
-//! - [`ntfs_deleted`] / [`start_ntfs_deleted_task`]: ficheros borrados de la MFT con su
-//!   recuperabilidad (cancelable, con progreso); [`ntfs_recover_record`] y [`ntfs_recover_stream`]:
-//!   recuperación de un borrado con el estado de cada tramo (#23).
+//! - [`ntfs_deleted`] / [`start_ntfs_deleted_task`]: ficheros borrados de la MFT y entradas
+//!   residuales de los índices con su recuperabilidad (cancelable, con progreso);
+//!   [`ntfs_recover_record`], [`ntfs_recover_stream`], [`ntfs_recover_deleted`] y
+//!   [`start_ntfs_recover_task`]: recuperación de un borrado con el estado de cada tramo (#23).
 //! - [`ntfs_list_dir`], [`ntfs_resolve`], [`ntfs_path_of`] y [`start_ntfs_tree_task`] (#22):
 //!   directorios contrastados con la MFT, rutas y árbol completo cancelable con progreso;
 //!   [`ntfs_stream_source`] presenta un fichero como origen (visor) y [`ntfs_copy_file`] /
@@ -473,8 +474,11 @@ impl mr_fs_ntfs::ScanObserver for TaskContext {
 }
 
 /// Ficheros y directorios borrados del volumen (registros base no en uso con `$FILE_NAME`) con la
-/// recuperabilidad de cada flujo según `$Bitmap` y los runs de los ficheros vivos (#23). Recorre
-/// la MFT dos veces; progreso en registros leídos y entradas evaluadas. Al cancelar,
+/// recuperabilidad de cada flujo según `$Bitmap` y los runs de los ficheros vivos, y las entradas
+/// residuales de los índices de directorio combinadas con ellos (#23: una entrada por fichero con
+/// todos sus orígenes; las solo residuales con registro reutilizado, dañado o libre, siempre con
+/// recuperabilidad `none`). Recorre la MFT dos veces y los índices de todos los directorios;
+/// progreso en registros leídos, entradas evaluadas y directorios. Al cancelar,
 /// [`ApiError::Cancelled`].
 pub fn ntfs_deleted(
     vol: &mr_fs_ntfs::NtfsVolume,
@@ -535,6 +539,67 @@ pub fn ntfs_recover_stream(
     })?;
     w.commit()?;
     Ok(report)
+}
+
+/// Recupera el flujo `stream` de un fichero **borrado** (ver [`ntfs_recover_stream`]): antes de
+/// crear nada exige que el registro `record` sea un registro base no en uso con la secuencia
+/// `sequence` (la de la entrada de [`ntfs_deleted`]). Así nunca se recupera con el nombre de un
+/// borrado el contenido de un registro reutilizado por otro fichero, ni una entrada solo residual
+/// (registro reutilizado, dañado o libre: no hay runs que seguir).
+#[allow(clippy::too_many_arguments)]
+pub fn ntfs_recover_deleted(
+    src: &Source,
+    vol: &mr_fs_ntfs::NtfsVolume,
+    record: u64,
+    sequence: u16,
+    stream: &str,
+    out: &Path,
+    overwrite: bool,
+    ctx: &TaskContext,
+) -> Result<mr_fs_ntfs::RecoveryReport> {
+    let f = vol.file(record)?;
+    if f.in_use() {
+        return Err(ApiError::InvalidArgument(format!(
+            "el registro {record} está en uso (secuencia {}): no es un fichero borrado; su \
+             contenido es de otro fichero",
+            f.header.sequence
+        )));
+    }
+    if f.header.sequence != sequence {
+        return Err(ApiError::InvalidArgument(format!(
+            "el registro {record} tiene la secuencia {} y la entrada borrada la {sequence}: el \
+             registro ya no es ese fichero",
+            f.header.sequence
+        )));
+    }
+    if f.file_names().is_empty() {
+        return Err(ApiError::InvalidArgument(format!(
+            "el registro {record} está libre (sin $FILE_NAME): no hay datos conocidos que recuperar"
+        )));
+    }
+    ntfs_recover_stream(src, vol, record, stream, out, overwrite, ctx)
+}
+
+/// Lanza [`ntfs_recover_deleted`] en segundo plano (progreso de la evaluación; cancelable antes
+/// de escribir: entonces no queda ninguna salida). La ruta y el registro se comprueban antes de
+/// lanzar la tarea.
+#[allow(clippy::too_many_arguments)]
+pub fn start_ntfs_recover_task(
+    src: Source,
+    vol: Arc<mr_fs_ntfs::NtfsVolume>,
+    record: u64,
+    sequence: u16,
+    stream: String,
+    out: std::path::PathBuf,
+    overwrite: bool,
+) -> Result<Arc<Task<mr_fs_ntfs::RecoveryReport>>> {
+    check_output_path(&src, &out)?;
+    if !overwrite && out.exists() {
+        return Err(ApiError::OutputExists(out));
+    }
+    Task::spawn(move |ctx| {
+        ntfs_recover_deleted(&src, &vol, record, sequence, &stream, &out, overwrite, ctx)
+    })
 }
 
 /// Comprueba que `out` puede ser el fichero de salida de una extracción del origen `src`: no es

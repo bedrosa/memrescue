@@ -48,6 +48,11 @@ public sealed class SourceEntry(Source source, ImageFormat detected, bool forced
 
     public Dictionary<ulong, NtfsDirectoryListing> FsListings { get; } = [];
 
+    /// <summary>«Mostrar borrados» en este origen y la búsqueda de borrados (a petición, una vez).</summary>
+    public bool FsShowDeleted { get; set; }
+
+    public NtfsDeletedScan? FsDeleted { get; set; }
+
     public void Dispose()
     {
         Ntfs?.Dispose();

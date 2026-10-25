@@ -6,7 +6,7 @@ using Xunit;
 namespace MemRescue.Core.Interop.Tests;
 
 /// <summary>
-/// Árbol de ficheros NTFS (#22) a través de la DLL real contra el corpus NTFS
+/// Árbol de ficheros NTFS (#22) y borrados (#23) a través de la DLL real contra el corpus NTFS
 /// (<c>tests/corpus/ntfs/generated</c>, descargado con <c>python -I -X utf8 tools/fetch_ntfs_corpus.py</c>;
 /// <c>MR_NTFS_CORPUS</c> para otra ubicación).
 /// </summary>
@@ -214,6 +214,142 @@ public sealed class NtfsTests : IDisposable
             }
             Assert.Equal(1234, new FileInfo(output).Length);
             Assert.Equal(["diseño copia.bin"], Directory.GetFiles(_dir).Select(Path.GetFileName));
+        }
+    }
+
+    /// <summary>Todas las claves de cada <c>[[files]]</c> del manifiesto.</summary>
+    private static List<Dictionary<string, string>> RawFiles(string name)
+    {
+        var path = Path.Combine(RepoRoot(), "tests", "corpus", "ntfs", "manifests", name + ".manifest.toml");
+        var files = new List<Dictionary<string, string>>();
+        Dictionary<string, string>? cur = null;
+        foreach (var raw in File.ReadLines(path))
+        {
+            var l = raw.Trim();
+            if (l.StartsWith('['))
+            {
+                cur = l == "[[files]]" ? [] : null;
+                if (cur is not null)
+                {
+                    files.Add(cur);
+                }
+                continue;
+            }
+            if (cur is not null && l.Split(" = ", 2) is [var k, var v])
+            {
+                cur[k] = v.Trim('"');
+            }
+        }
+        return files;
+    }
+
+    [Fact]
+    public void Deleted_struct_layouts_match_header()
+    {
+        Assert.Equal(88, Marshal.SizeOf<MrNtfsDeletedInfo>());
+        Assert.Equal(48, Marshal.SizeOf<MrNtfsDeletedDetail>());
+        Assert.Equal(56, Marshal.SizeOf<MrNtfsRecoverReport>());
+        Assert.Equal(48, Marshal.SizeOf<MrNtfsSuspectRange>());
+        Assert.Equal(80, Marshal.OffsetOf<MrNtfsDeletedInfo>(nameof(MrNtfsDeletedInfo.ResidualRejected)).ToInt32());
+        Assert.Equal(24, Marshal.OffsetOf<MrNtfsDeletedDetail>(nameof(MrNtfsDeletedDetail.Clusters)).ToInt32());
+        Assert.Equal(40, Marshal.OffsetOf<MrNtfsRecoverReport>(nameof(MrNtfsRecoverReport.Recoverability)).ToInt32());
+        Assert.Equal(40, Marshal.OffsetOf<MrNtfsSuspectRange>(nameof(MrNtfsSuspectRange.Owner)).ToInt32());
+    }
+
+    /// <summary>
+    /// Borrados (#23): cada borrado del manifiesto aparece una vez con su ruta, secuencia y recuperabilidad;
+    /// ningún vivo; en ntfs_deleted, sello.bin también desde el índice del directorio borrado (lo único que
+    /// deja ntfs-3g que pase la validación; los restos del espacio libre se rechazan).
+    /// </summary>
+    [Theory]
+    [InlineData("ntfs_deleted", 1ul, 4ul)]
+    [InlineData("ntfs_overwritten", 0ul, 0ul)]
+    public async Task Deleted_scan_matches_the_manifest(string name, ulong accepted, ulong rejected)
+    {
+        var files = RawFiles(name);
+        var (img, _, vol) = Open(name, false);
+        using (img)
+        using (vol)
+        {
+            using var task = vol.StartDeletedScan();
+            Assert.Equal(EngineTaskState.Completed, await task.WaitAsync());
+            var s = task.GetResult();
+            Assert.Equal((accepted, rejected), (s.ResidualAccepted, s.ResidualRejected));
+            Assert.Equal(0ul, s.ResidualOnlyCount);
+            Assert.False(s.IndexUnreadable || s.BitmapUnusable || s.Truncated);
+            foreach (var f in files)
+            {
+                var record = ulong.Parse(f["mft_record"]);
+                var found = s.Entries.Where(e => e.Entry.Record == record).ToList();
+                if (f["state"] == "live")
+                {
+                    Assert.Empty(found);
+                    continue;
+                }
+                var e = Assert.Single(found);
+                Assert.Equal(NtfsEntryState.Deleted, e.Entry.State);
+                Assert.Equal(f["path"], e.Path);
+                Assert.Equal(uint.Parse(f["sequence"]), e.Entry.Sequence);
+                Assert.True(e.Origins.HasFlag(NtfsOrigins.Mft));
+                if (f["type"] == "file")
+                {
+                    Assert.Equal(f["recoverable"], e.Recoverability switch
+                    {
+                        NtfsRecoverability.Full => "full",
+                        NtfsRecoverability.Partial => "partial",
+                        NtfsRecoverability.None => "none",
+                        _ => "?",
+                    });
+                    Assert.True(e.CanRecover);
+                }
+                else
+                {
+                    Assert.Equal(NtfsRecoverability.NotApplicable, e.Recoverability);
+                }
+            }
+            if (name == "ntfs_deleted")
+            {
+                var sello = s.Entries.Single(e => e.Entry.Record == 103);
+                Assert.Equal(NtfsOrigins.Mft | NtfsOrigins.DeletedDirectoryIndex, sello.Origins);
+                Assert.Contains("índice de un directorio borrado", sello.OriginsText);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task Recover_writes_deleted_files_and_reports_possibly_overwritten_ranges()
+    {
+        var files = RawFiles("ntfs_overwritten");
+        var (img, _, vol) = Open("ntfs_overwritten", false);
+        using (img)
+        using (vol)
+        {
+            var partial = files.Single(f => f.GetValueOrDefault("recoverable") == "partial" && f["state"] != "live");
+            var record = ulong.Parse(partial["mft_record"]);
+            var output = Path.Combine(_dir, "parcial.bin");
+            using (var task = vol.StartRecover(record, uint.Parse(partial["sequence"]), output))
+            {
+                Assert.Equal(EngineTaskState.Completed, await task.WaitAsync());
+                var r = task.GetReport();
+                Assert.False(r.AllTrustworthy);
+                Assert.Equal(NtfsRecoverability.Partial, r.Recoverability);
+                Assert.Equal(ulong.Parse(partial["size"]), r.Bytes);
+                Assert.True(r.PossiblyOverwrittenBytes > 0);
+                Assert.NotEmpty(r.Suspect);
+                Assert.All(r.Suspect, x => Assert.Equal(NtfsClusterState.OwnedByLiveFile, x.State));
+                Assert.Contains("/sobrescritura/nuevo_2.bin", r.Suspect.Select(x => x.Description));
+                Assert.Contains("posiblemente sobrescritos", r.Summary);
+            }
+            Assert.Equal(partial["recovered_sha256"], Convert.ToHexStringLower(SHA256.HashData(File.ReadAllBytes(output))));
+            // Nunca sobre una salida existente sin confirmación; nunca un registro en uso o con otra secuencia.
+            Assert.Equal(EngineStatus.AlreadyExists,
+                Assert.Throws<EngineException>(() => vol.StartRecover(record, uint.Parse(partial["sequence"]), output)).Status);
+            var live = files.First(f => f["state"] == "live" && f["type"] == "file");
+            Assert.Equal(EngineStatus.InvalidArgument,
+                Assert.Throws<EngineException>(() => vol.StartRecover(ulong.Parse(live["mft_record"]), 1, Path.Combine(_dir, "vivo.bin"))).Status);
+            Assert.Equal(EngineStatus.InvalidArgument,
+                Assert.Throws<EngineException>(() => vol.StartRecover(record, 1, Path.Combine(_dir, "otra.bin"))).Status);
+            Assert.Equal(["parcial.bin"], Directory.GetFiles(_dir).Select(Path.GetFileName));
         }
     }
 

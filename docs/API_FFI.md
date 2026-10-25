@@ -197,7 +197,7 @@ existe sin `MR_NTFS_COPY_OVERWRITE`).
 | `mr_ntfs_volume_info(volume, out)` | Serie, registros MFT, clústeres, tamaños, versión (`MR_NTFS_VERSION_KNOWN`), confianza, `MR_NTFS_BOOT_FROM_BACKUP`, `MR_NTFS_UPCASE_FROM_VOLUME` (si no, plegado simple), LCN de `$MFT`, nº de anomalías |
 | `mr_ntfs_volume_label` / `mr_ntfs_volume_anomaly_text` | Etiqueta; anomalía `"<código>\n<descripción>"` |
 | `mr_ntfs_list_dir(volume, record, out_listing)` | Lista el directorio (5 = raíz) en un handle de listado. Registro sin `$I30` → `MR_ERR_INVALID_ARGUMENT`; registro no utilizable → `MR_ERR_CORRUPT` |
-| `mr_ntfs_listing_info` / `_entry` / `_entry_name` / `_anomaly_text` / `_free` | Recuentos (entradas, vivas, anomalías, `unreadable`); `mr_ntfs_entry` por índice (orden de colación): `state` (`MR_NTFS_ENTRY_LIVE` 1, `STALE_NOT_IN_USE` 2, `STALE_REUSED` 3, `RECORD_UNUSABLE` 4 con `record_state`, `INVALID_REFERENCE` 5; 16-31 reservados para #23), registro y secuencia, padre, tamaños, 4 FILETIME, atributos DOS, `flags` (`DIRECTORY`, `SYSTEM`, `NAME_LOSSY`, `HAS_DOS_NAME`, `TIMES_FROM_INDEX`), espacio de nombres, enlaces, secuencia actual; nombre en UTF-8 (U+FFFD en las unidades sueltas) |
+| `mr_ntfs_listing_info` / `_entry` / `_entry_name` / `_anomaly_text` / `_free` | Recuentos (entradas, vivas, anomalías, `unreadable`); `mr_ntfs_entry` por índice (orden de colación): `state` (`MR_NTFS_ENTRY_LIVE` 1, `STALE_NOT_IN_USE` 2, `STALE_REUSED` 3, `RECORD_UNUSABLE` 4 con `record_state`, `INVALID_REFERENCE` 5; 16-19 son de los borrados, ver abajo, y hasta 31 reservados), registro y secuencia, padre, tamaños, 4 FILETIME, atributos DOS, `flags` (`DIRECTORY`, `SYSTEM`, `NAME_LOSSY`, `HAS_DOS_NAME`, `TIMES_FROM_INDEX`), espacio de nombres, enlaces, secuencia actual; nombre en UTF-8 (U+FFFD en las unidades sueltas) |
 | `mr_ntfs_resolve(volume, path, len, out)` | Ruta absoluta (`/` o `\`) sin distinguir mayúsculas → `mr_ntfs_entry`. No existe → `MR_ERR_NOT_FOUND`; componente que no es un directorio o ruta mal formada → `MR_ERR_INVALID_ARGUMENT` |
 | `mr_ntfs_path_of(volume, record, buf, cap, out_len)` | Ruta por las referencias al padre; huérfano → `MR_ERR_CORRUPT` con el motivo |
 | `mr_ntfs_tree_start(volume, flags, out_task)` | Árbol completo (tarea; progreso = entradas + registros revisados; cancelada con resultado parcial). `MR_NTFS_TREE_NO_ORPHANS` omite la búsqueda de huérfanos |
@@ -257,6 +257,28 @@ padre 2: …» y las notas (marca de tiempo distinta, `parent_linkage2`, víncul
 `EngineStatus.ExternalMismatch`. Pruebas: `open_ex_layout_and_differencing_chain` (tamaños y
 desplazamientos, cadena, indicaciones, códigos, validación de la estructura) y
 `ContainerTests.DifferencingVhdOpensOnlyWithTheExplicitParentChain`.
+
+**Borrados y recuperación (#23, ampliación compatible de la ABI 3).** Registros MFT no en uso y
+entradas residuales de los índices `$I30` combinados (una entrada por fichero con todos sus
+orígenes; `formatos/ntfs.md`, «Ficheros borrados»).
+
+| Función | Descripción |
+|---|---|
+| `mr_ntfs_deleted_start(volume, out_task)` | Búsqueda de borrados como tarea (progreso = registros de las dos pasadas + entradas evaluadas + directorios; cancelable) |
+| `mr_ntfs_deleted_result(task, out)` | `mr_ntfs_deleted_info` (88 bytes): registros, entradas, solo residuales, problemas, directorios y nodos de índice leídos, ilegibles y libres, residuales aceptadas y restos rechazados; `flags` `MR_NTFS_DELETED_ENTRIES_TRUNCATED` 1, `BITMAP_UNUSABLE` 2, `CLAIMS_TRUNCATED` 4, `RESIDUAL_TRUNCATED` 8, `INDEX_UNREADABLE` 16, `MFT_UNREADABLE` 32 |
+| `mr_ntfs_deleted_entry(task, index, out)` | `mr_ntfs_entry` con `state` `MR_NTFS_ENTRY_DELETED` 16 (registro MFT no en uso, con o sin índices), `RESIDUAL_REUSED` 17 (solo índice; registro reutilizado: su contenido es de otro fichero; `found_sequence` = la actual), `RESIDUAL_UNUSABLE` 18 (solo índice; `record_state` del registro) o `RESIDUAL_FREE` 19 (solo índice; registro libre sin `$FILE_NAME`). En las solo residuales, `sequence` es la de la referencia del índice, las fechas, tamaños y atributos salen de la clave (`TIMES_FROM_INDEX`) |
+| `mr_ntfs_deleted_detail(task, index, out)` | `mr_ntfs_deleted_detail` (48 bytes): `recoverability` (`MR_NTFS_RECOVERABLE_NOT_APPLICABLE` 0, `FULL` 1, `PARTIAL` 2, `NONE` 3; las solo residuales siempre `NONE`), `origins` (`MR_NTFS_ORIGIN_MFT` 1, `INDEX_STALE` 2, `INDEX_SLACK` 4, `INDEX_FREE_NODE` 8, `DELETED_DIRECTORY_INDEX` 16), `parent_state` (`MR_NTFS_PARENT_LIVE` 1, `DELETED` 2, `ORPHAN` 3), flujos, referencias de índice y clústeres del flujo principal (con contenido, libres, posiblemente sobrescritos) |
+| `mr_ntfs_deleted_text(task, index, field, buf, cap, out_len)` | `MR_NTFS_DELETED_TEXT_NAME` 0, `_PATH` 1 (ruta o `<huérfano N>/nombre`), `_SUMMARY` 2 (motivo de la recuperabilidad o estado de la residual), `_ORIGINS` 3; otro campo → `MR_ERR_INVALID_ARGUMENT` |
+| `mr_ntfs_recover_start(volume, record, sequence, stream, len, out_path, len, flags, out_task)` | Recuperación de un borrado como tarea. Antes de lanzarla: la ruta (como `mr_ntfs_copy_start`; existente → `MR_ERR_ALREADY_EXISTS` salvo `MR_NTFS_RECOVER_OVERWRITE`) y el registro (no en uso, con esa secuencia y con `$FILE_NAME`; si no, `MR_ERR_INVALID_ARGUMENT`: una entrada solo residual o un registro reutilizado nunca se recuperan). Temporal y renombrado final |
+| `mr_ntfs_recover_result(task, out)` | `mr_ntfs_recover_report` (56 bytes): bytes, no fiables, posiblemente sobrescritos, con patrón de relleno, recuperabilidad del flujo, secuencia, nº de tramos sospechosos, `MR_NTFS_RECOVER_RANGES_TRUNCATED` |
+| `mr_ntfs_recover_suspect(task, index, out)` | `mr_ntfs_suspect_range` (48 bytes): bytes del flujo, LCN y clústeres, `state` (`MR_NTFS_CLUSTER_FREE` 1, `OWNED` 2, `ALLOCATED` 3, `UNKNOWN` 4, `SHARED_WITH_DELETED` 5) y `owner` (registro o `MR_NTFS_NO_OWNER`) |
+| `mr_ntfs_recover_text(task, index, buf, cap, out_len)` | `index` = `UINT32_MAX`: resumen de la recuperabilidad; si no, dueño del tramo sospechoso (ruta del fichero vivo o descripción) |
+
+En C#: `NtfsVolume.StartDeletedScan()` → `NtfsDeletedTask.GetResult()` (`NtfsDeletedScan` con
+`NtfsDeletedEntry`: entrada, ruta, resumen, orígenes, recuperabilidad, `CanRecover`) y
+`NtfsVolume.StartRecover(record, sequence, path, stream, overwrite)` → `NtfsRecoverTask.GetReport()`
+(`NtfsRecoveryReport` con los tramos sospechosos y su dueño); `NtfsEntryState.Deleted`,
+`ResidualReused`, `ResidualUnusable`, `ResidualFree`.
 
 ## Modo tolerante de contenedores (`MR_OPEN_TOLERANT`, ADR-020)
 

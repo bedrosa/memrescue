@@ -31,11 +31,18 @@
 //! los demás casos; un flujo cuya disposición no se puede usar (cifrado, extensiones
 //! incoherentes...) es `none`. Nunca se dice `full` si algún clúster tiene otro dueño.
 //!
-//! **Pendiente** (tras #22): las entradas `INDX` residuales (entradas de índice de directorio
-//! en el espacio libre de los bloques `INDX`) serán otra fuente de entradas
-//! ([`EntryOrigin`] tendrá una variante para ellas); las que coincidan con un registro de esta
-//! lista añadirán nombres o rutas, y las que apunten a un registro reutilizado se clasificarán con
-//! [`assess_layout`] cuando haya runs o como `none` si solo queda el `$FILE_NAME` del índice.
+//! **Entradas residuales de los índices** ([`crate::residual`], tras las dos pasadas): se leen los
+//! índices `$I30` de todos los directorios (vivos y borrados) y se aceptan, con validación
+//! estricta, las entradas del espacio libre de los nodos, de los nodos libres según `$BITMAP`, de
+//! los índices de directorios borrados y las caducadas de la parte en uso. Cada una se contrasta
+//! con su registro: si es un borrado ya encontrado en la MFT, lo enriquece (otro origen, nombre y
+//! padre confirmados o nuevos) y el fichero aparece una sola vez; si el registro está en uso con la
+//! misma secuencia es una copia de una entrada viva y se descarta (nunca se presenta un fichero
+//! vivo como borrado); si el registro se reutilizó (otra secuencia), se informa como residual con
+//! el registro reutilizado y sin datos recuperables (el contenido es de otro fichero); si el
+//! registro no es utilizable o está libre sin nombre, se informa con el nombre, los tamaños y las
+//! fechas de la clave del índice y recuperabilidad `none` (no se conocen sus runs). Ver
+//! [`DeletedStatus`].
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
@@ -45,6 +52,7 @@ use crate::bitmap::{BitmapIssue, ClusterAlloc, ClusterBitmap};
 use crate::file::{FileAnomaly, Geometry, NtfsFile, SegmentKind, StreamError, StreamLayout};
 use crate::mft::{RecordOutcome, RecordState};
 use crate::record::{FileRecord, FileReference};
+use crate::residual::{collect_directory, ResidualEntry, ResidualStats, MAX_RESIDUAL_ENTRIES};
 use crate::runs::decode_runs;
 use crate::values::{FileName, Namespace, Times};
 use crate::{NtfsError, NtfsVolume};
@@ -75,6 +83,10 @@ pub struct ScanOptions {
     pub max_entries: usize,
     pub max_claims: usize,
     pub max_ranges_per_stream: usize,
+    /// Buscar entradas residuales en los índices de directorio (se omite con `focus`).
+    pub residual: bool,
+    /// Máximo de entradas residuales aceptadas.
+    pub max_residual: usize,
 }
 
 impl Default for ScanOptions {
@@ -84,6 +96,8 @@ impl Default for ScanOptions {
             max_entries: MAX_ENTRIES,
             max_claims: MAX_CLAIMS,
             max_ranges_per_stream: MAX_RANGES_PER_STREAM,
+            residual: true,
+            max_residual: MAX_RESIDUAL_ENTRIES,
         }
     }
 }
@@ -719,21 +733,153 @@ impl fmt::Display for ParentState {
     }
 }
 
-/// Origen de una entrada borrada.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Origen de una entrada borrada (una entrada puede tener varios).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[non_exhaustive]
 pub enum EntryOrigin {
     /// Registro base de la MFT no en uso.
     MftRecord,
-    // Pendiente (#23 tras #22): entrada `INDX` residual.
+    /// Entrada de la parte en uso de un índice vivo que apunta a un registro que ya no es ese
+    /// fichero (caducada).
+    IndexStale,
+    /// Entrada en el espacio libre de un nodo (entre los bytes en uso y los asignados).
+    IndexSlack,
+    /// Entrada de un nodo `INDX` libre según `$BITMAP` del índice.
+    IndexFreeNode,
+    /// Entrada del índice de un directorio borrado.
+    DeletedDirectoryIndex,
+}
+
+impl EntryOrigin {
+    pub const ALL: [EntryOrigin; 5] = [
+        EntryOrigin::MftRecord,
+        EntryOrigin::IndexStale,
+        EntryOrigin::IndexSlack,
+        EntryOrigin::IndexFreeNode,
+        EntryOrigin::DeletedDirectoryIndex,
+    ];
+
+    /// Código estable.
+    pub fn code(self) -> &'static str {
+        match self {
+            EntryOrigin::MftRecord => "mft_record",
+            EntryOrigin::IndexStale => "index_stale",
+            EntryOrigin::IndexSlack => "index_slack",
+            EntryOrigin::IndexFreeNode => "index_free_node",
+            EntryOrigin::DeletedDirectoryIndex => "deleted_directory_index",
+        }
+    }
+
+    /// Texto breve en español.
+    pub fn label(self) -> &'static str {
+        match self {
+            EntryOrigin::MftRecord => "registro MFT",
+            EntryOrigin::IndexStale => "entrada caducada del índice",
+            EntryOrigin::IndexSlack => "espacio libre de un nodo del índice",
+            EntryOrigin::IndexFreeNode => "nodo libre del índice",
+            EntryOrigin::DeletedDirectoryIndex => "índice de un directorio borrado",
+        }
+    }
+
+    /// `true` si sale de un índice (entrada residual).
+    pub fn is_index(self) -> bool {
+        self != EntryOrigin::MftRecord
+    }
+}
+
+/// Qué se sabe del registro de una entrada.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeletedStatus {
+    /// Registro de la MFT no en uso con sus atributos: borrado con su recuperabilidad.
+    Deleted,
+    /// Solo hay entradas de índice y el registro se reutilizó (en uso con otra secuencia, es una
+    /// extensión de otro fichero o se volvió a liberar): el contenido es de otro fichero.
+    RecordReused { found_sequence: u16 },
+    /// Solo hay entradas de índice y el registro no es interpretable: no se conocen sus runs.
+    RecordUnusable {
+        state: RecordState,
+        detail: Option<String>,
+    },
+    /// Solo hay entradas de índice y el registro está libre sin `$FILE_NAME` (sin datos conocidos).
+    RecordFree { found_sequence: u16 },
+}
+
+impl DeletedStatus {
+    /// Código estable.
+    pub fn code(&self) -> &'static str {
+        match self {
+            DeletedStatus::Deleted => "deleted",
+            DeletedStatus::RecordReused { .. } => "residual_record_reused",
+            DeletedStatus::RecordUnusable { .. } => "residual_record_unusable",
+            DeletedStatus::RecordFree { .. } => "residual_record_free",
+        }
+    }
+
+    /// `true` si la entrada tiene el registro con sus atributos (se puede evaluar y recuperar).
+    pub fn has_record(&self) -> bool {
+        *self == DeletedStatus::Deleted
+    }
+
+    /// Secuencia actual del registro, si se pudo leer.
+    pub fn found_sequence(&self) -> Option<u16> {
+        match self {
+            DeletedStatus::RecordReused { found_sequence }
+            | DeletedStatus::RecordFree { found_sequence } => Some(*found_sequence),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for DeletedStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DeletedStatus::Deleted => write!(f, "borrado"),
+            DeletedStatus::RecordReused { found_sequence } => write!(
+                f,
+                "entrada residual, registro reutilizado (secuencia actual {found_sequence}): el contenido es de otro fichero, nada que recuperar"
+            ),
+            DeletedStatus::RecordUnusable { state, detail } => {
+                write!(
+                    f,
+                    "entrada residual, registro no utilizable ({})",
+                    state.label()
+                )?;
+                if let Some(d) = detail {
+                    write!(f, ": {d}")?;
+                }
+                write!(f, "; sin runs conocidos, nada que recuperar")
+            }
+            DeletedStatus::RecordFree { found_sequence } => write!(
+                f,
+                "entrada residual, registro libre sin $FILE_NAME (secuencia actual {found_sequence}); sin runs conocidos, nada que recuperar"
+            ),
+        }
+    }
+}
+
+/// Dónde se vio una entrada de índice de un fichero borrado.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexRef {
+    pub origin: EntryOrigin,
+    /// Directorio cuyo índice la contiene (número y secuencia actual).
+    pub directory: FileReference,
+    pub node: crate::index::NodeId,
+    pub offset: usize,
+    /// Referencia de la entrada.
+    pub reference: FileReference,
+    pub name: String,
 }
 
 /// Fichero o directorio borrado.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeletedEntry {
-    pub origin: EntryOrigin,
+    /// Fuentes que la encontraron, sin repetir y ordenadas (la MFT primero).
+    pub origins: Vec<EntryOrigin>,
+    /// Qué se sabe del registro ([`DeletedStatus::Deleted`] si sale de la MFT).
+    pub status: DeletedStatus,
     pub record: u64,
-    /// Secuencia actual del registro (el sistema de archivos la incrementa al liberarlo).
+    /// Con [`DeletedStatus::Deleted`], la secuencia actual del registro (el sistema de archivos la
+    /// incrementa al liberarlo); en una entrada solo residual, la de la referencia del índice.
     pub sequence: u16,
     pub is_directory: bool,
     /// Nombre elegido (`$FILE_NAME` no DOS si lo hay).
@@ -757,6 +903,8 @@ pub struct DeletedEntry {
     pub anomalies: Vec<FileAnomaly>,
     /// Flujos `$DATA` (el principal primero).
     pub streams: Vec<StreamAssessment>,
+    /// Entradas de índice residuales que la nombran.
+    pub index_refs: Vec<IndexRef>,
 }
 
 impl DeletedEntry {
@@ -765,9 +913,31 @@ impl DeletedEntry {
         self.streams.iter().find(|s| s.name.is_empty())
     }
 
-    /// Recuperabilidad del flujo principal (`None` sin `$DATA`, p. ej. directorios).
+    /// Recuperabilidad del flujo principal (`None` sin `$DATA`, p. ej. directorios). Una entrada
+    /// solo residual (registro reutilizado, no utilizable o libre) es siempre `none`: no hay runs
+    /// conocidos o son de otro fichero.
     pub fn recoverability(&self) -> Option<Recoverability> {
+        if !self.status.has_record() {
+            return (!self.is_directory).then_some(Recoverability::None);
+        }
         self.main_stream().map(|s| s.recoverability)
+    }
+
+    /// `true` si alguna fuente es la MFT.
+    pub fn from_mft(&self) -> bool {
+        self.origins.contains(&EntryOrigin::MftRecord)
+    }
+
+    /// `true` si alguna fuente es un índice.
+    pub fn from_index(&self) -> bool {
+        self.origins.iter().any(|o| o.is_index())
+    }
+
+    fn add_origin(&mut self, o: EntryOrigin) {
+        if !self.origins.contains(&o) {
+            self.origins.push(o);
+            self.origins.sort_unstable();
+        }
     }
 
     /// Ruta para mostrar: la completa o `<huérfano>/nombre`.
@@ -827,11 +997,26 @@ pub struct DeletedScan {
     pub directories_truncated: bool,
     /// Dueños vivos nombrados en las evaluaciones.
     pub owners: BTreeMap<u64, OwnerInfo>,
+    /// Búsqueda de entradas residuales en los índices (`None` si no se hizo).
+    pub residual: Option<ResidualStats>,
+    /// Entradas residuales que eran copias de entradas vivas (descartadas).
+    pub residual_live: u64,
+    /// Entradas residuales repetidas (mismo registro, secuencia, directorio y nombre).
+    pub residual_duplicates: u64,
 }
 
 impl DeletedScan {
+    /// Entrada del registro `record` (la de la MFT si hay varias).
     pub fn entry(&self, record: u64) -> Option<&DeletedEntry> {
-        self.entries.iter().find(|e| e.record == record)
+        self.entries
+            .iter()
+            .find(|e| e.record == record && e.status.has_record())
+            .or_else(|| self.entries.iter().find(|e| e.record == record))
+    }
+
+    /// Entradas que salen solo de los índices.
+    pub fn residual_only(&self) -> impl Iterator<Item = &DeletedEntry> {
+        self.entries.iter().filter(|e| !e.status.has_record())
     }
 
     /// Texto del motivo de un flujo con los dueños por nombre (como el `reason` del manifiesto).
@@ -1055,7 +1240,8 @@ fn pending_entry(
     anomalies.extend(f.value_anomalies());
     Ok(Some(Pending {
         entry: DeletedEntry {
-            origin: EntryOrigin::MftRecord,
+            origins: vec![EntryOrigin::MftRecord],
+            status: DeletedStatus::Deleted,
             record: f.number,
             sequence: f.header.sequence,
             is_directory: f.is_directory(),
@@ -1072,6 +1258,7 @@ fn pending_entry(
             backref_extensions,
             anomalies,
             streams: Vec::new(),
+            index_refs: Vec::new(),
         },
         layouts,
     }))
@@ -1325,6 +1512,36 @@ pub fn scan_deleted(
         };
         owners.insert(o, info);
     }
+    // Entradas residuales de los índices.
+    let mut residual = None;
+    let mut residual_live = 0u64;
+    let mut residual_duplicates = 0u64;
+    if opts.residual && opts.focus.is_none() {
+        let mut list: Vec<u64> = dirs
+            .keys()
+            .copied()
+            .filter(|&d| d == ROOT_RECORD || d >= crate::dir::FIRST_USER_RECORD)
+            .collect();
+        list.sort_unstable();
+        p.total = p.total.saturating_add(list.len() as u64);
+        let mut found: Vec<ResidualEntry> = Vec::new();
+        let mut stats = ResidualStats::default();
+        for d in list {
+            match vol.file(d) {
+                Ok(f) => stats.add(&collect_directory(vol, &f, &mut found, opts.max_residual)),
+                Err(NtfsError::Io(e)) => return Err(NtfsError::Io(e)),
+                Err(_) => stats.directories_unusable += 1,
+            }
+            if !p.step(1) {
+                return Ok(None);
+            }
+        }
+        let (live, dups) = combine_residual(vol, &dirs, &mut entries, found)?;
+        residual_live = live;
+        residual_duplicates = dups;
+        residual = Some(stats);
+    }
+
     obs.progress(p.total, p.total);
     Ok(Some(DeletedScan {
         records: count,
@@ -1339,7 +1556,180 @@ pub fn scan_deleted(
         claims_truncated: live.truncated() || deleted.truncated(),
         directories_truncated,
         owners,
+        residual,
+        residual_live,
+        residual_duplicates,
     }))
+}
+
+/// Qué es hoy el registro al que apunta una entrada residual.
+enum ResidualTarget {
+    Live,
+    NotInUse {
+        found: u16,
+    },
+    Reused {
+        found: u16,
+    },
+    Unusable {
+        state: RecordState,
+        detail: Option<String>,
+    },
+}
+
+fn residual_target(vol: &NtfsVolume, r: FileReference) -> Result<ResidualTarget, NtfsError> {
+    Ok(match vol.read_record(r.record)? {
+        RecordOutcome::Parsed(rec) => {
+            let h = rec.header();
+            if !h.is_base() {
+                ResidualTarget::Reused { found: h.sequence }
+            } else if h.in_use() {
+                if h.sequence == r.sequence {
+                    ResidualTarget::Live
+                } else {
+                    ResidualTarget::Reused { found: h.sequence }
+                }
+            } else if seq_matches(h.sequence, r.sequence, false) {
+                ResidualTarget::NotInUse { found: h.sequence }
+            } else {
+                ResidualTarget::Reused { found: h.sequence }
+            }
+        }
+        o => ResidualTarget::Unusable {
+            state: o.state(),
+            detail: o.detail(),
+        },
+    })
+}
+
+/// `true` si `names` ya tiene ese nombre en ese directorio.
+fn has_name(names: &[FileName], k: &FileName) -> bool {
+    names
+        .iter()
+        .any(|n| n.parent.record == k.parent.record && n.name == k.name)
+}
+
+/// Combina las entradas residuales con los borrados de la MFT (ver el módulo). Devuelve las
+/// descartadas por ser copias de entradas vivas y las repetidas.
+fn combine_residual(
+    vol: &NtfsVolume,
+    dirs: &HashMap<u64, DirInfo>,
+    entries: &mut Vec<DeletedEntry>,
+    found: Vec<ResidualEntry>,
+) -> Result<(u64, u64), NtfsError> {
+    let mut live = 0u64;
+    let mut dups = 0u64;
+    // Repetidas: misma referencia, directorio, nombre y fuente (la misma entrada vista en dos
+    // fuentes añade los dos orígenes).
+    let mut seen: BTreeSet<(u64, u16, u64, Vec<u16>, EntryOrigin)> = BTreeSet::new();
+    let mut by_record: HashMap<u64, usize> = HashMap::new();
+    for (i, e) in entries.iter().enumerate() {
+        if e.status.has_record() {
+            by_record.insert(e.record, i);
+        }
+    }
+    let mut residual: BTreeMap<(u64, u16), DeletedEntry> = BTreeMap::new();
+    for r in found {
+        if !seen.insert((
+            r.reference.record,
+            r.reference.sequence,
+            r.directory.record,
+            r.units.clone(),
+            r.origin,
+        )) {
+            dups += 1;
+            continue;
+        }
+        let at = IndexRef {
+            origin: r.origin,
+            directory: r.directory,
+            node: r.node,
+            offset: r.offset,
+            reference: r.reference,
+            name: r.key.name.clone(),
+        };
+        let status = match residual_target(vol, r.reference)? {
+            ResidualTarget::Live => {
+                live += 1;
+                continue;
+            }
+            ResidualTarget::NotInUse { found } => {
+                if let Some(&i) = by_record.get(&r.reference.record) {
+                    let e = &mut entries[i];
+                    e.add_origin(r.origin);
+                    if !has_name(&e.names, &r.key) {
+                        e.names.push(r.key.clone());
+                    }
+                    e.index_refs.push(at);
+                    continue;
+                }
+                DeletedStatus::RecordFree {
+                    found_sequence: found,
+                }
+            }
+            ResidualTarget::Reused { found } => DeletedStatus::RecordReused {
+                found_sequence: found,
+            },
+            ResidualTarget::Unusable { state, detail } => {
+                DeletedStatus::RecordUnusable { state, detail }
+            }
+        };
+        let key = (r.reference.record, r.reference.sequence);
+        if let Some(e) = residual.get_mut(&key) {
+            e.add_origin(r.origin);
+            if !has_name(&e.names, &r.key) {
+                e.names.push(r.key.clone());
+            }
+            // Se prefiere un nombre que no sea DOS (8.3).
+            if e.namespace == Namespace::Dos && r.key.namespace != Namespace::Dos {
+                e.name = r.key.name.clone();
+                e.namespace = r.key.namespace;
+                e.parent = r.key.parent;
+            }
+            e.index_refs.push(at);
+            continue;
+        }
+        let k = r.key;
+        let parent_state = parent_state(vol, dirs, k.parent)?;
+        let path = if parent_state.is_orphan() {
+            None
+        } else {
+            build_path(dirs, k.parent, &k.name)
+        };
+        residual.insert(
+            key,
+            DeletedEntry {
+                origins: vec![r.origin],
+                status,
+                record: r.reference.record,
+                sequence: r.reference.sequence,
+                is_directory: k.file_attributes & crate::dir::FILE_NAME_INDEX_PRESENT != 0,
+                name: k.name.clone(),
+                namespace: k.namespace,
+                parent: k.parent,
+                parent_state,
+                path,
+                size: k.data_size,
+                allocated_size: k.allocated_size,
+                times: k.times,
+                names: vec![k],
+                extensions: Vec::new(),
+                backref_extensions: Vec::new(),
+                anomalies: Vec::new(),
+                streams: Vec::new(),
+                index_refs: vec![at],
+            },
+        );
+    }
+    // Ruta de las que cambiaron de nombre preferido.
+    for e in residual.values_mut() {
+        if e.parent_state.is_orphan() {
+            continue;
+        }
+        e.path = build_path(dirs, e.parent, &e.name);
+    }
+    entries.extend(residual.into_values());
+    Ok((live, dups))
 }
 
 #[cfg(test)]

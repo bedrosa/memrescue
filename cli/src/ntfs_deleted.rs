@@ -1,5 +1,5 @@
-//! `ntfs-deleted` y `ntfs-recover`: ficheros borrados de la MFT con su recuperabilidad y
-//! recuperación con el estado de cada tramo (#23).
+//! `ntfs-deleted` y `ntfs-recover`: ficheros borrados de la MFT y entradas residuales de los
+//! índices con su recuperabilidad, y recuperación con el estado de cada tramo (#23).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -7,7 +7,7 @@ use std::thread;
 use std::time::Duration;
 
 use mr_api::mr_fs_ntfs::deleted::{ClusterState, DeletedEntry, DeletedScan, StreamAssessment};
-use mr_api::mr_fs_ntfs::{NtfsVolume, RangeState, RecordState, RecoveryReport};
+use mr_api::mr_fs_ntfs::{NodeId, NtfsVolume, RangeState, RecordState, RecoveryReport};
 use mr_api::task::TaskState;
 
 use crate::json_str;
@@ -112,14 +112,40 @@ fn entry_json(s: &DeletedScan, e: &DeletedEntry) -> String {
         })
         .collect();
     let list = |v: &[u64]| v.iter().map(u64::to_string).collect::<Vec<_>>().join(",");
+    let origins: Vec<String> = e.origins.iter().map(|o| json_str(o.code())).collect();
+    let index: Vec<String> = e
+        .index_refs
+        .iter()
+        .map(|r| {
+            format!(
+                "{{\"origin\":{},\"directory\":{{\"record\":{},\"sequence\":{}}},\"vcn\":{},\
+                 \"offset\":{},\"reference\":{{\"record\":{},\"sequence\":{}}},\"name\":{}}}",
+                json_str(r.origin.code()),
+                r.directory.record,
+                r.directory.sequence,
+                match r.node {
+                    NodeId::Root => "null".to_string(),
+                    NodeId::Vcn(v) => v.to_string(),
+                },
+                r.offset,
+                r.reference.record,
+                r.reference.sequence,
+                json_str(&r.name)
+            )
+        })
+        .collect();
     format!(
-        "{{\"record\":{},\"sequence\":{},\"type\":{},\"name\":{},\"namespace\":{},\"path\":{},\
+        "{{\"record\":{},\"sequence\":{},\"status\":{},\"status_message\":{},\"origins\":[{}],\
+         \"type\":{},\"name\":{},\"namespace\":{},\"path\":{},\
          \"parent\":{{\"record\":{},\"sequence\":{},\"state\":{}}},\"size\":{},\
          \"allocated_size\":{},\"times\":{{\"created\":{},\"modified\":{},\"mft_modified\":{},\
          \"accessed\":{}}},\"extensions\":[{}],\"backref_extensions\":[{}],\"anomalies\":[{}],\
-         \"recoverable\":{},\"streams\":[{}]}}",
+         \"recoverable\":{},\"streams\":[{}],\"index_entries\":[{}]}}",
         e.record,
         e.sequence,
+        json_str(e.status.code()),
+        json_str(&e.status.to_string()),
+        origins.join(","),
         json_str(if e.is_directory { "dir" } else { "file" }),
         json_str(&e.name),
         json_str(e.namespace.code()),
@@ -138,7 +164,33 @@ fn entry_json(s: &DeletedScan, e: &DeletedEntry) -> String {
         anomalies.join(","),
         e.recoverability()
             .map_or_else(|| "null".into(), |r| json_str(r.code())),
-        streams.join(",")
+        streams.join(","),
+        index.join(",")
+    )
+}
+
+fn index_json(s: &DeletedScan) -> String {
+    let Some(r) = &s.residual else {
+        return "null".into();
+    };
+    format!(
+        "{{\"directories\":{},\"directories_unusable\":{},\"nodes\":{},\"nodes_unreadable\":{},\
+         \"nodes_invalid\":{},\"free_nodes\":{},\"slack_bytes\":{},\"accepted\":{},\
+         \"rejected\":{},\"duplicates\":{},\"live_copies\":{},\"residual_only\":{},\
+         \"truncated\":{}}}",
+        r.directories,
+        r.directories_unusable,
+        r.nodes,
+        r.nodes_unreadable,
+        r.nodes_invalid,
+        r.free_nodes,
+        r.slack_bytes,
+        r.accepted,
+        r.rejected,
+        s.residual_duplicates,
+        s.residual_live,
+        s.residual_only().count(),
+        r.truncated
     )
 }
 
@@ -180,7 +232,7 @@ fn scan_json(s: &DeletedScan) -> String {
         "{{\"records\":{},\"counts\":{{{}}},\"free_records\":{},\"loose_extensions\":{},\
          \"entries_truncated\":{},\"claims_truncated\":{},\"directories_truncated\":{},\
          \"bitmap_issue\":{},\"entries\":[{}],\"problems\":[{}],\"problems_truncated\":{},\
-         \"index_entries\":\"pending\"}}",
+         \"index_entries\":{}}}",
         s.records,
         counts.join(","),
         s.free_records,
@@ -191,18 +243,21 @@ fn scan_json(s: &DeletedScan) -> String {
         bitmap,
         entries.join(","),
         problems.join(","),
-        s.problems_truncated
+        s.problems_truncated,
+        index_json(s)
     )
 }
 
 fn scan_text(s: &DeletedScan) {
     let dirs = s.entries.iter().filter(|e| e.is_directory).count();
+    let residual = s.residual_only().count();
     println!(
-        "Borrados en la MFT: {} ({} ficheros, {} directorios) de {} registros; {} registros \
-         libres; {} extensiones no en uso",
+        "Borrados: {} ({} ficheros, {} directorios; {} solo en índices) de {} registros; {} \
+         registros libres; {} extensiones no en uso",
         s.entries.len(),
         s.entries.len() - dirs,
         dirs,
+        residual,
         s.records,
         s.free_records,
         s.loose_extensions
@@ -233,6 +288,13 @@ fn scan_text(s: &DeletedScan) {
         );
         if e.parent_state.is_orphan() {
             println!("{:28}{}", "", e.parent_state);
+        }
+        if !e.status.has_record() {
+            println!("{:28}{}", "", e.status);
+        }
+        if e.from_index() {
+            let o: Vec<&str> = e.origins.iter().map(|o| o.label()).collect();
+            println!("{:28}encontrado en: {}", "", o.join(", "));
         }
         for a in &e.streams {
             let label = if a.name.is_empty() {
@@ -265,13 +327,45 @@ fn scan_text(s: &DeletedScan) {
             println!("  ... y más");
         }
     }
-    println!(
-        "Entradas INDX residuales: pendientes (se añadirán tras el árbol de directorios, #22)."
-    );
+    match &s.residual {
+        Some(r) => {
+            println!(
+                "Entradas residuales de los índices: {} directorios, {} nodos ({} libres), {} \
+                 bytes de espacio libre; {} aceptadas ({} repetidas, {} copias de entradas \
+                 vivas), {} restos rechazados; {} solo en índices",
+                r.directories,
+                r.nodes,
+                r.free_nodes,
+                r.slack_bytes,
+                r.accepted,
+                s.residual_duplicates,
+                s.residual_live,
+                r.rejected,
+                residual
+            );
+            if r.nodes_unreadable > 0 {
+                println!(
+                    "AVISO: {} nodos de índice con sectores ilegibles (no se interpretan)",
+                    r.nodes_unreadable
+                );
+            }
+            if r.nodes_invalid > 0 || r.directories_unusable > 0 {
+                println!(
+                    "AVISO: {} nodos de índice no válidos y {} directorios sin índice utilizable",
+                    r.nodes_invalid, r.directories_unusable
+                );
+            }
+            if r.truncated {
+                println!("AVISO: demasiadas entradas residuales: lista incompleta");
+            }
+        }
+        None => println!("Entradas residuales de los índices: no se buscaron."),
+    }
 }
 
-/// `ntfs-deleted`: lista los borrados con su recuperabilidad. Código 3 si hay registros de la MFT
-/// ilegibles o `$Bitmap` no es utilizable (la evaluación no es completa).
+/// `ntfs-deleted`: lista los borrados (MFT e índices) con su recuperabilidad. Código 3 si hay
+/// registros de la MFT o nodos de índice ilegibles o `$Bitmap` no es utilizable (la evaluación no
+/// es completa).
 pub fn list(v: NtfsVolume, json: bool) -> Result<(), (u8, String)> {
     let op = |e: &dyn std::fmt::Display| (1u8, e.to_string());
     let task = mr_api::start_ntfs_deleted_task(Arc::new(v)).map_err(|e| op(&e))?;
@@ -296,11 +390,13 @@ pub fn list(v: NtfsVolume, json: bool) -> Result<(), (u8, String)> {
         .iter()
         .filter(|p| p.state == RecordState::Unreadable)
         .count();
-    if unreadable > 0 || s.bitmap_issue.is_some() {
+    let nodes = s.residual.as_ref().map_or(0, |r| r.nodes_unreadable);
+    if unreadable > 0 || nodes > 0 || s.bitmap_issue.is_some() {
         return Err((
             3,
             format!(
-                "evaluación incompleta: {unreadable} registros MFT ilegibles{}",
+                "evaluación incompleta: {unreadable} registros MFT ilegibles, {nodes} nodos de \
+                 índice ilegibles{}",
                 s.bitmap_issue
                     .as_ref()
                     .map(|b| format!("; {b}"))

@@ -146,8 +146,12 @@ Milestone propio para no retrasar NTFS y la recuperación.
     `$UpCase`, rutas y huérfanos; `mr_api::ntfs_list_dir`/`ntfs_resolve`/`ntfs_path_of`/árbol como
     tarea; FFI (`mr_ntfs_*`), C# (`NtfsVolume`), CLI `ntfs-ls` y `ntfs-cat RUTA`; interfaz: pestaña
     «Sistema de archivos» con árbol, lista, visor y «Guardar como…».
-  - Borrados (#23, ADR-027): la parte de la MFT está hecha; las entradas `INDX` residuales, pendientes.
-- Ficheros borrados (registros MFT no en uso, entradas INDX residuales).
+  - **Hecho (#23, ADR-027 y su adenda)**: ficheros borrados (registros MFT no en uso, entradas `INDX`
+    residuales del espacio libre de los nodos, de los nodos libres, de los índices de directorios
+    borrados y caducadas) combinados en una entrada por fichero, con recuperabilidad conservadora
+    por clúster y recuperación con el tramo `possibly_overwritten`; API, FFI, C#, CLI
+    `ntfs-deleted`/`ntfs-recover` e interfaz («Mostrar borrados», «Recuperar…»).
+- Ficheros borrados (registros MFT no en uso, entradas INDX residuales): **hecho (#23)**.
 - **Paridad objetivo**: FS-01…FS-04.
 
 ## M4 · VFS + motor de recuperación v1  *(prioridad 1)*

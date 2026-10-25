@@ -510,6 +510,10 @@ enum Entry {
     NtfsCopy(Box<ntfs::CopyEntry>),
     /// Extensiones de un descriptor VMDK separado (#11); no abre ningún fichero.
     VmdkExtents(Box<mr_api::VmdkExtentPlan>),
+    /// Búsqueda de borrados NTFS en segundo plano (#23).
+    NtfsDeleted(Box<ntfs::DeletedEntryTask>),
+    /// Recuperación de un borrado NTFS en segundo plano (#23).
+    NtfsRecover(Box<ntfs::RecoverEntry>),
 }
 
 /// Tarea de búsqueda de particiones con su resultado y el origen en que se hizo.
@@ -2725,6 +2729,8 @@ pub unsafe extern "C" fn mr_task_status_get(task: u64, out: *mut MrTaskStatus) -
                 Entry::Search(e) => (e.task.state(), e.task.progress()),
                 Entry::NtfsTree(e) => (e.task.state(), e.task.progress()),
                 Entry::NtfsCopy(e) => (e.task.state(), e.task.progress()),
+                Entry::NtfsDeleted(e) => (e.task.state(), e.task.progress()),
+                Entry::NtfsRecover(e) => (e.task.state(), e.task.progress()),
                 Entry::Source(_)
                 | Entry::Partitions { .. }
                 | Entry::Ntfs(_)
@@ -2770,6 +2776,14 @@ pub extern "C" fn mr_task_cancel(task: u64) -> i32 {
                 e.task.cancel();
                 true
             }
+            Entry::NtfsDeleted(e) => {
+                e.task.cancel();
+                true
+            }
+            Entry::NtfsRecover(e) => {
+                e.task.cancel();
+                true
+            }
             Entry::Source(_)
             | Entry::Partitions { .. }
             | Entry::Ntfs(_)
@@ -2794,7 +2808,9 @@ pub extern "C" fn mr_task_free(task: u64) -> i32 {
                 | Entry::Verify { .. }
                 | Entry::Search(_)
                 | Entry::NtfsTree(_)
-                | Entry::NtfsCopy(_),
+                | Entry::NtfsCopy(_)
+                | Entry::NtfsDeleted(_)
+                | Entry::NtfsRecover(_),
             ) => {}
             _ => return bad_task(task),
         }
@@ -2805,6 +2821,8 @@ pub extern "C" fn mr_task_free(task: u64) -> i32 {
             Some(Entry::Search(e)) => e.task.cancel(),
             Some(Entry::NtfsTree(e)) => e.task.cancel(),
             Some(Entry::NtfsCopy(e)) => e.task.cancel(),
+            Some(Entry::NtfsDeleted(e)) => e.task.cancel(),
+            Some(Entry::NtfsRecover(e)) => e.task.cancel(),
             _ => {}
         }
         MR_OK

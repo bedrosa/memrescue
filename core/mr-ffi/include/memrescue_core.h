@@ -50,6 +50,9 @@
  * (mr_source_open_ex con mr_open_options versionada y lista de mr_str; hoy, la cadena de padres
  * de un disco diferencial VHD/VHDX), MR_OPEN_IGNORE_LINK_MISMATCH, mr_image_external_hints y el
  * código MR_ERR_EXTERNAL_MISMATCH (17).
+ * Añadido sin cambiar la ABI 3 (M3, issue #23): borrados de la MFT y entradas residuales de los
+ * índices como tarea (mr_ntfs_deleted_*, estados 16-19 de mr_ntfs_entry) y recuperación de un
+ * borrado como tarea (mr_ntfs_recover_*).
  */
 #ifndef MEMRESCUE_CORE_H
 #define MEMRESCUE_CORE_H
@@ -630,7 +633,7 @@ mr_status mr_found_volume_open(uint64_t task, uint32_t index, uint32_t flags,
  * Un volumen sobrevive al cierre de su origen; los listados y tareas, a la liberación del volumen.
  * Cada entrada de directorio está contrastada con la MFT: solo MR_NTFS_ENTRY_LIVE es un fichero
  * vivo; las demás son entradas del índice cuyo registro está libre, reutilizado, ilegible o
- * dañado (16-31 reservados para borrados y residuales, #23).
+ * dañado. Los estados 16-19 son de los borrados (mr_ntfs_deleted_entry, #23; hasta 31 reservados).
  */
 #define MR_NTFS_BOOT_FROM_BACKUP    1u
 #define MR_NTFS_VERSION_KNOWN       2u
@@ -882,6 +885,124 @@ mr_status mr_vmdk_extents_free(uint64_t list);
 mr_status mr_source_open_vmdk(const uint8_t *path, size_t path_len, uint32_t sector_size,
                               uint32_t flags, const mr_approved_file *files, uint32_t count,
                               uint64_t *out_source);
+
+/*
+ * Borrados (M3, issue #23): registros MFT no en uso con sus atributos y entradas residuales de
+ * los índices $I30 (espacio libre de los nodos, nodos libres según $BITMAP, índices de
+ * directorios borrados y entradas caducadas), validadas de forma estricta y combinadas: una
+ * entrada por fichero con todos sus orígenes. Una entrada solo residual nunca es recuperable.
+ */
+#define MR_NTFS_ENTRY_DELETED            16u  /* registro MFT no en uso (con o sin índice) */
+#define MR_NTFS_ENTRY_RESIDUAL_REUSED    17u  /* solo índice; registro reutilizado: es de otro */
+#define MR_NTFS_ENTRY_RESIDUAL_UNUSABLE  18u  /* solo índice; registro dañado...: record_state */
+#define MR_NTFS_ENTRY_RESIDUAL_FREE      19u  /* solo índice; registro libre sin $FILE_NAME */
+
+#define MR_NTFS_ORIGIN_MFT                     1u
+#define MR_NTFS_ORIGIN_INDEX_STALE             2u   /* parte en uso de un índice vivo */
+#define MR_NTFS_ORIGIN_INDEX_SLACK             4u   /* espacio libre de un nodo */
+#define MR_NTFS_ORIGIN_INDEX_FREE_NODE         8u   /* nodo libre según $BITMAP */
+#define MR_NTFS_ORIGIN_DELETED_DIRECTORY_INDEX 16u  /* índice de un directorio borrado */
+
+#define MR_NTFS_RECOVERABLE_NOT_APPLICABLE 0u   /* directorio o sin $DATA */
+#define MR_NTFS_RECOVERABLE_FULL           1u
+#define MR_NTFS_RECOVERABLE_PARTIAL        2u
+#define MR_NTFS_RECOVERABLE_NONE           3u
+
+#define MR_NTFS_PARENT_LIVE     1u
+#define MR_NTFS_PARENT_DELETED  2u
+#define MR_NTFS_PARENT_ORPHAN   3u
+
+#define MR_NTFS_DELETED_ENTRIES_TRUNCATED   1u   /* mr_ntfs_deleted_info.flags */
+#define MR_NTFS_DELETED_BITMAP_UNUSABLE     2u
+#define MR_NTFS_DELETED_CLAIMS_TRUNCATED    4u
+#define MR_NTFS_DELETED_RESIDUAL_TRUNCATED  8u
+#define MR_NTFS_DELETED_INDEX_UNREADABLE   16u   /* nodos de índice ilegibles (no se interpretan) */
+#define MR_NTFS_DELETED_MFT_UNREADABLE     32u
+
+#define MR_NTFS_DELETED_TEXT_NAME     0u
+#define MR_NTFS_DELETED_TEXT_PATH     1u   /* ruta o "<huérfano N>/nombre" */
+#define MR_NTFS_DELETED_TEXT_SUMMARY  2u   /* motivo de la recuperabilidad o estado residual */
+#define MR_NTFS_DELETED_TEXT_ORIGINS  3u
+
+typedef struct mr_ntfs_deleted_info {  /* 88 bytes */
+    uint32_t struct_size;
+    uint32_t flags;              /* MR_NTFS_DELETED_* */
+    uint64_t records;
+    uint64_t entry_count;
+    uint64_t residual_only_count;
+    uint64_t problem_count;      /* registros MFT no interpretables */
+    uint64_t index_directories;
+    uint64_t index_nodes;
+    uint64_t index_nodes_unreadable;
+    uint64_t index_free_nodes;
+    uint64_t residual_accepted;
+    uint64_t residual_rejected;  /* restos con estructura válida y referencia imposible */
+} mr_ntfs_deleted_info;
+
+typedef struct mr_ntfs_deleted_detail {  /* 48 bytes */
+    uint32_t struct_size;
+    uint32_t recoverability;     /* MR_NTFS_RECOVERABLE_* (flujo principal) */
+    uint32_t origins;            /* MR_NTFS_ORIGIN_* */
+    uint32_t parent_state;       /* MR_NTFS_PARENT_* */
+    uint32_t stream_count;
+    uint32_t index_ref_count;
+    uint64_t clusters;           /* flujo principal: clústeres con contenido */
+    uint64_t free_clusters;
+    uint64_t possibly_overwritten_clusters;
+} mr_ntfs_deleted_detail;
+
+#define MR_NTFS_RECOVER_OVERWRITE          1u   /* mr_ntfs_recover_start: sustituir la salida */
+#define MR_NTFS_RECOVER_RANGES_TRUNCATED   1u   /* mr_ntfs_recover_report.flags */
+#define MR_NTFS_CLUSTER_FREE                1u
+#define MR_NTFS_CLUSTER_OWNED               2u   /* owner = fichero vivo */
+#define MR_NTFS_CLUSTER_ALLOCATED           3u
+#define MR_NTFS_CLUSTER_UNKNOWN             4u
+#define MR_NTFS_CLUSTER_SHARED_WITH_DELETED 5u   /* owner = el otro borrado */
+#define MR_NTFS_NO_OWNER                    UINT64_MAX
+
+typedef struct mr_ntfs_recover_report {  /* 56 bytes */
+    uint32_t struct_size;
+    uint32_t flags;
+    uint64_t bytes;
+    uint64_t untrusted_bytes;    /* patrón de relleno + posiblemente sobrescritos */
+    uint64_t possibly_overwritten_bytes;
+    uint64_t filled_bytes;
+    uint32_t recoverability;     /* MR_NTFS_RECOVERABLE_* del flujo evaluado */
+    uint32_t suspect_count;      /* mr_ntfs_recover_suspect */
+    uint32_t sequence;
+    uint32_t reserved;
+} mr_ntfs_recover_report;
+
+typedef struct mr_ntfs_suspect_range {  /* 48 bytes */
+    uint32_t struct_size;
+    uint32_t state;              /* MR_NTFS_CLUSTER_* */
+    uint64_t offset;             /* bytes del flujo */
+    uint64_t length;
+    uint64_t lcn;
+    uint64_t clusters;
+    uint64_t owner;              /* registro o MR_NTFS_NO_OWNER */
+} mr_ntfs_suspect_range;
+
+/* Tarea: progreso = registros de las dos pasadas + entradas evaluadas + directorios. */
+mr_status mr_ntfs_deleted_start(uint64_t volume, uint64_t *out_task);
+mr_status mr_ntfs_deleted_result(uint64_t task, mr_ntfs_deleted_info *out);
+/* state MR_NTFS_ENTRY_DELETED ... RESIDUAL_FREE; en una entrada solo residual, sequence es la de
+ * la referencia del índice y found_sequence la actual del registro (0 si no se pudo leer). */
+mr_status mr_ntfs_deleted_entry(uint64_t task, uint64_t index, mr_ntfs_entry *out);
+mr_status mr_ntfs_deleted_detail(uint64_t task, uint64_t index, mr_ntfs_deleted_detail *out);
+mr_status mr_ntfs_deleted_text(uint64_t task, uint64_t index, uint32_t field,
+                               uint8_t *buf, size_t cap, size_t *out_len);
+/* Recuperación de un borrado como tarea. Antes de lanzarla: ruta (como mr_ntfs_copy_start) y
+ * registro (no en uso, con esa secuencia y con $FILE_NAME; si no, MR_ERR_INVALID_ARGUMENT). */
+mr_status mr_ntfs_recover_start(uint64_t volume, uint64_t record, uint32_t sequence,
+                                const uint8_t *stream, size_t stream_len,
+                                const uint8_t *out_path, size_t out_path_len,
+                                uint32_t flags, uint64_t *out_task);
+mr_status mr_ntfs_recover_result(uint64_t task, mr_ntfs_recover_report *out);
+mr_status mr_ntfs_recover_suspect(uint64_t task, uint32_t index, mr_ntfs_suspect_range *out);
+/* index = UINT32_MAX: resumen de la recuperabilidad; si no, dueño del tramo sospechoso. */
+mr_status mr_ntfs_recover_text(uint64_t task, uint32_t index,
+                               uint8_t *buf, size_t cap, size_t *out_len);
 
 mr_status mr_task_status_get(uint64_t task, mr_task_status *out);
 mr_status mr_task_cancel(uint64_t task);

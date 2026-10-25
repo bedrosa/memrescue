@@ -812,6 +812,44 @@ escritura en un clúster libre sin asignarlo no se detecta (el contenido se da p
 evaluación no lee los datos: los sectores ilegibles aparecen al recuperar. Numeración provisional:
 puede cambiar al integrar las ramas paralelas.
 
+**Adenda (2026-10-25, cierre de #23): entradas residuales de los índices.** Tras el árbol (#22,
+ADR-028), los índices `$I30` son una segunda fuente de borrados (detalle en `formatos/ntfs.md`,
+«Entradas residuales de los índices»):
+7. **Dónde**: espacio libre de los nodos asignados (entre los bytes en uso y los asignados), nodos
+   `INDX` libres según `$BITMAP` (enteros), índices de directorios borrados (enteros) y entradas de
+   la parte en uso de índices vivos cuyo registro está libre o reutilizado. Una entrada en uso que
+   apunta a un registro dañado o ilegible es un daño de un fichero vivo (ADR-028), no un borrado.
+8. **Validación estricta, sin adivinar**: un nodo con algún sector no fiable, sin firma, con fixups o
+   VCN incorrectos o con la cabecera fuera de límites no se usa; cada candidata necesita
+   indicadores conocidos, longitud exacta para su clave, una clave `$FILE_NAME` de tamaño exacto y
+   válida, el padre igual al directorio que se lee (número y secuencia) y una referencia plausible
+   (registro de usuario dentro de la MFT, secuencia no nula). Un resto con la estructura y el padre
+   correctos pero referencia imposible se cuenta como rechazado y nunca se presenta.
+9. **Combinación**: una entrada por fichero con todos sus orígenes (`EntryOrigin`: `mft_record`,
+   `index_stale`, `index_slack`, `index_free_node`, `deleted_directory_index`). Si el registro es un
+   borrado de la MFT, la entrada de índice lo enriquece (origen, nombre y padre confirmados); si es
+   un vivo con esa secuencia, es una copia y se descarta; si se reutilizó, se informa como residual
+   con el registro reutilizado (el contenido es de otro fichero); si no es utilizable o está libre
+   sin nombre, se informa con el nombre, los tamaños y las fechas de la clave. Las entradas solo
+   residuales son siempre `none`: no se clasifican con `assess_layout` porque los runs que tendrían
+   son los de otro fichero o no existen; la recuperación de la interfaz y la FFI exige el registro no
+   en uso con la secuencia de la entrada.
+10. **ABI**: estados 16 a 19 de `mr_ntfs_entry` (`DELETED`, `RESIDUAL_REUSED`, `RESIDUAL_UNUSABLE`,
+    `RESIDUAL_FREE`; hasta 31 reservados), `mr_ntfs_deleted_*` y `mr_ntfs_recover_*`, ampliación
+    compatible de la ABI 3.
+
+**Alternativas (adenda).** Aceptar restos con la cabecera pisada reconstruyendo la referencia (en el
+corpus de ntfs-3g es lo único que queda en el espacio libre, pero la referencia no se puede saber y
+un nombre sin registro no dice qué datos hay); clasificar con `assess_layout` los runs de un registro
+reutilizado (serían los del fichero nuevo); listar las residuales aparte sin unirlas a la MFT (el
+mismo fichero aparecería dos veces).
+
+**Consecuencias (adenda).** En el corpus de ntfs-3g, el espacio libre solo tiene restos con la
+cabecera pisada (4 en `ntfs_deleted`, todos rechazados) y el índice del directorio borrado
+`/docs/cartas` aporta `sello.bin`, unido a su entrada de la MFT; cada borrado del manifiesto sigue
+apareciendo exactamente una vez y ningún vivo aparece. Los nodos libres, las entradas solo
+residuales y los restos mal formados se prueban con volúmenes sintéticos y fuzzing. Cierra #23.
+
 ---
 
 ## ADR-028 · Árbol NTFS: entradas contrastadas con la MFT, nodos dañados que no bloquean y fichero como origen (Aceptada, 2026-10-24)
@@ -832,7 +870,7 @@ fichero desde la interfaz sin romper las reglas de ADR-019 y ADR-026. #23 añadi
 2. **Entrada viva solo si la MFT lo confirma**: el registro existe, es interpretable, es base, está en
    uso y tiene la secuencia de la referencia. Si no, la entrada se lista con su estado (registro
    libre, reutilizado, no utilizable, referencia no válida), nunca como fichero vivo; #23 las
-   expondrá como residuales (los códigos 16-31 del estado quedan reservados en la ABI).
+   expone como residuales (estados 16-19 de la ABI, ver la adenda de ADR-027).
 3. **Nombres**: las entradas DOS de un registro que tiene otra entrada no DOS en el mismo directorio
    no se listan (nombre corto aparte); los enlaces duros aparecen en cada directorio; UTF-16 con
    sustitución de las unidades sueltas (U+FFFD), marcado, y comparaciones con las unidades

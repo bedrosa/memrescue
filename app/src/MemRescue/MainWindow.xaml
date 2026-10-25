@@ -352,6 +352,12 @@
                             <Button x:Name="FsSaveAsButton" Content="Guardar como…" IsEnabled="False"
                                     AutomationProperties.AutomationId="FsSaveAsButton" Click="FsSaveAs_Click"
                                     ToolTip="Copia el fichero seleccionado a otro lugar (nunca sobre el origen; si el destino existe se pide confirmación; escritura atómica)" />
+                            <Button x:Name="FsRecoverButton" Content="Recuperar…" IsEnabled="False" Margin="4,0,0,0"
+                                    AutomationProperties.AutomationId="FsRecoverButton" Click="FsRecover_Click"
+                                    ToolTip="Recupera el fichero borrado seleccionado (nunca sobre el origen; si el destino existe se pide confirmación; escritura atómica; informa de los tramos posiblemente sobrescritos)" />
+                            <CheckBox x:Name="FsShowDeletedToggle" Content="Mostrar borrados" Margin="12,0,0,0" VerticalAlignment="Center" IsEnabled="False"
+                                      AutomationProperties.AutomationId="FsShowDeletedToggle" Checked="FsShowDeleted_Changed" Unchecked="FsShowDeleted_Changed"
+                                      ToolTip="Añade al árbol y a la lista los ficheros borrados de la MFT y las entradas residuales de los índices de directorio, con su recuperabilidad" />
                             <TextBlock x:Name="FsPathLabel" Text="Ruta:" VerticalAlignment="Center" Margin="12,0,4,0" />
                             <TextBox x:Name="FsPathBox" Width="260" VerticalContentAlignment="Center" KeyDown="FsPathBox_KeyDown"
                                      AutomationProperties.AutomationId="FsPathBox"
@@ -390,6 +396,7 @@
                                         <GridViewColumn Header="Creado (UTC)" Width="130" DisplayMemberBinding="{Binding CreatedText}" />
                                         <GridViewColumn Header="Registro" Width="80" DisplayMemberBinding="{Binding RecordText}" />
                                         <GridViewColumn Header="Estado" Width="170" DisplayMemberBinding="{Binding StateText}" />
+                                        <GridViewColumn Header="Recuperable" Width="90" DisplayMemberBinding="{Binding RecoverableText}" />
                                     </GridView>
                                 </ListView.View>
                             </ListView>

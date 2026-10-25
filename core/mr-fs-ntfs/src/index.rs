@@ -565,6 +565,8 @@ pub struct IndexReader<'v> {
     record: u64,
     in_use: bool,
     root: Node,
+    /// Valor de `$INDEX_ROOT` tal como está en el registro (para el espacio libre de la raíz, #23).
+    root_value: Vec<u8>,
     block_size: u32,
     vcn_unit: u64,
     alloc: Option<StreamLayout>,
@@ -653,6 +655,7 @@ impl<'v> IndexReader<'v> {
             record: number,
             in_use: file.in_use(),
             root,
+            root_value: value.to_vec(),
             block_size,
             vcn_unit,
             alloc,
@@ -727,16 +730,19 @@ impl<'v> IndexReader<'v> {
             .filter(|o| o.is_multiple_of(bs))
             .filter(|o| o.checked_add(bs).is_some_and(|e| e <= layout.data_size))
             .ok_or(IndexIssue::SubnodeOutOfRange { vcn })?;
-        if let Some(bm) = &self.bitmap {
-            let bit = offset / bs;
-            let set = usize::try_from(bit / 8)
-                .ok()
-                .and_then(|i| bm.get(i))
-                .is_some_and(|b| b & (1 << (bit % 8)) != 0);
-            if !set {
-                return Err(IndexIssue::NodeUnallocated { vcn });
-            }
+        if self.slot_allocated(offset / bs) == Some(false) {
+            return Err(IndexIssue::NodeUnallocated { vcn });
         }
+        let mut buf = self.read_block(offset, vcn)?;
+        parse_block(&mut buf, vcn)
+    }
+
+    /// Lee los bytes del nodo en `offset` de `$INDEX_ALLOCATION` (sin aplicar fixups). Un nodo con
+    /// algún byte no fiable es [`IndexIssue::BlockUnreadable`] y nunca se interpreta.
+    fn read_block(&self, offset: u64, vcn: u64) -> Result<Vec<u8>, IndexIssue> {
+        let Some(layout) = &self.alloc else {
+            return Err(IndexIssue::AllocationMissing);
+        };
         let stream = self.vol.stream_view(layout, self.record, self.in_use);
         let chunk = stream.read(offset, self.block_size as usize).map_err(|e| {
             IndexIssue::BlockUnreadable {
@@ -748,11 +754,61 @@ impl<'v> IndexReader<'v> {
                 detail: r.to_string(),
             });
         }
-        let mut buf = chunk.data;
-        if buf.len() != self.block_size as usize {
+        if chunk.data.len() != self.block_size as usize {
             return Err(IndexIssue::SubnodeOutOfRange { vcn });
         }
-        parse_block(&mut buf, vcn)
+        Ok(chunk.data)
+    }
+
+    /// Nodos que caben en `$INDEX_ALLOCATION` (0 sin asignación utilizable).
+    pub fn slot_count(&self) -> u64 {
+        self.alloc
+            .as_ref()
+            .map_or(0, |l| l.data_size / u64::from(self.block_size))
+    }
+
+    /// Bit de `$BITMAP` del nodo `slot` (`None` si `$BITMAP` no es utilizable).
+    pub fn slot_allocated(&self, slot: u64) -> Option<bool> {
+        let bm = self.bitmap.as_ref()?;
+        Some(
+            usize::try_from(slot / 8)
+                .ok()
+                .and_then(|i| bm.get(i))
+                .is_some_and(|b| b & (1 << (slot % 8)) != 0),
+        )
+    }
+
+    /// VCN del nodo `slot`.
+    pub fn slot_vcn(&self, slot: u64) -> u64 {
+        slot.saturating_mul(u64::from(self.block_size)) / self.vcn_unit
+    }
+
+    /// Lee el nodo `slot` sin mirar `$BITMAP` (#23: nodos libres): bytes fiables, firma `INDX`,
+    /// secuencia de actualización sin tolerancia y VCN de la cabecera igual al de la posición.
+    /// Devuelve el nodo con los fixups ya aplicados.
+    pub fn read_slot(&self, slot: u64) -> Result<Vec<u8>, IndexIssue> {
+        let bs = u64::from(self.block_size);
+        let vcn = self.slot_vcn(slot);
+        let offset = slot
+            .checked_mul(bs)
+            .filter(|o| {
+                o.checked_add(bs)
+                    .is_some_and(|e| e <= self.slot_count() * bs)
+            })
+            .ok_or(IndexIssue::SubnodeOutOfRange { vcn })?;
+        let mut buf = self.read_block(offset, vcn)?;
+        parse_block(&mut buf, vcn)?;
+        Ok(buf)
+    }
+
+    /// Valor de `$INDEX_ROOT` tal como está en el registro.
+    pub fn root_value(&self) -> &[u8] {
+        &self.root_value
+    }
+
+    /// `true` si el registro del directorio está en uso.
+    pub fn in_use(&self) -> bool {
+        self.in_use
     }
 
     fn note(&mut self, node: NodeId, issue: IndexIssue) {

@@ -356,6 +356,69 @@ mod tests {
     }
 
     #[test]
+    fn deleted_scan_includes_residual_entries_and_recovery_refuses_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("residual.img");
+        std::fs::write(&p, mr_fs_ntfs::testvol::residual_volume().image).unwrap();
+        let src = crate::open_source(&p, 0).unwrap();
+        let vol = Arc::new(crate::ntfs_open(&src).unwrap());
+        let t = crate::start_ntfs_deleted_task(Arc::clone(&vol)).unwrap();
+        let s = t.wait().unwrap();
+        assert!(s.residual.is_some());
+        let codes: Vec<(u64, &str)> = s
+            .entries
+            .iter()
+            .map(|e| (e.record, e.status.code()))
+            .collect();
+        assert!(codes.contains(&(18, "deleted")));
+        assert!(codes.contains(&(19, "residual_record_reused")));
+        let (done, total) = t.progress();
+        assert!(done == total && total > 0);
+        // Recuperación del borrado 18 (secuencia 2): contenido residente íntegro.
+        let ctx = TaskContext::detached();
+        let out = dir.path().join("borrado.txt");
+        let r = crate::ntfs_recover_deleted(&src, &vol, 18, 2, "", &out, false, &ctx).unwrap();
+        assert!(r.is_clean());
+        assert_eq!(std::fs::read(&out).unwrap(), b"hola borrado");
+        // Nunca sin confirmación sobre una salida existente.
+        assert!(matches!(
+            crate::start_ntfs_recover_task(
+                Arc::clone(&src),
+                Arc::clone(&vol),
+                18,
+                2,
+                String::new(),
+                out.clone(),
+                false
+            ),
+            Err(ApiError::OutputExists(_))
+        ));
+        // Registro reutilizado (19 en uso), secuencia distinta, registro libre, dañado o vivo:
+        // error y ninguna salida.
+        for (rec, seq) in [(19u64, 1u16), (18, 1), (21, 4), (20, 1), (17, 1)] {
+            let o = dir.path().join(format!("no-{rec}.bin"));
+            assert!(
+                crate::ntfs_recover_deleted(&src, &vol, rec, seq, "", &o, false, &ctx).is_err(),
+                "{rec}"
+            );
+            assert!(!o.exists(), "{rec}");
+        }
+        // La tarea.
+        let t = crate::start_ntfs_recover_task(
+            Arc::clone(&src),
+            Arc::clone(&vol),
+            24,
+            2,
+            String::new(),
+            dir.path().join("hijo.txt"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(t.wait().unwrap().copy.bytes, 4);
+        assert_eq!(std::fs::read(dir.path().join("hijo.txt")).unwrap(), b"hijo");
+    }
+
+    #[test]
     fn copy_follows_the_output_policy() {
         let (d, src, vol) = volume();
         let out = d.path().join("copia.bin");
