@@ -21,7 +21,7 @@ Implementación original a partir de la especificación pública; no se ha usado
 | VHDX dinámico | Soportado |
 | Bloques de 1 MiB a 256 MiB (potencia de 2) | Soportado |
 | Sector lógico 512 B y 4096 B | Soportado (4096 B solo probado con imágenes sintéticas: qemu-img no ofrece esa opción) |
-| Diferencial (HasParent) | `IoError::ExternalReference` con la ruta del localizador; el padre **nunca** se abre |
+| Diferencial (HasParent) | Sin padres indicados: `IoError::ExternalReference` con la ruta del localizador; el padre **nunca** se abre por su cuenta. Con la cadena que indica el usuario (#8): soportado (ver «Discos diferenciales») |
 | Registro pendiente (LogGuid ≠ 0) | **Reproducido en memoria** (el fichero nunca se escribe); registro no válido → `Corrupt` (ver «Registro pendiente») |
 | Registro pendiente de más de 64 MiB | `UnsupportedFeature` (Hyper-V y qemu usan 1 MiB) |
 | Versión de cabecera ≠ 1 o versión de registro ≠ 0 | `UnsupportedFeature` |
@@ -48,8 +48,9 @@ con un registro pendiente añade «; registro reproducido en memoria (N entradas
    zona de cabeceras, registro y regiones.
 5. **Metadatos**: firma `metadata`, ≤ 2047 entradas, cada elemento dentro de la región (desde 64 KiB)
    y ≤ 1 MiB; duplicados → `Corrupt`; metadato requerido desconocido → `UnsupportedFeature`.
-   - File Parameters: bloque potencia de 2 entre 1 MiB y 256 MiB; HasParent → `ExternalReference`
-     (preferencia de clave: `relative_path`, `absolute_win32_path`, `volume_path`, `parent_linkage`).
+   - File Parameters: bloque potencia de 2 entre 1 MiB y 256 MiB; HasParent sin padres indicados →
+     `ExternalReference` (preferencia de clave: `relative_path`, `absolute_win32_path`, `volume_path`,
+     `parent_linkage`); con padres, el localizador es obligatorio (ver «Discos diferenciales»).
    - Logical/Physical Sector Size: 512 o 4096.
    - Virtual Disk Size: no nulo, múltiplo del sector lógico, ≤ 64 TiB.
 6. **BAT**: `chunk ratio = (2^23 × sector lógico) / bloque`; entradas totales
@@ -133,12 +134,88 @@ ninguna secuencia válida con LogGuid ≠ 0, abre sin reproducir; aquí eso es `
 saber si las estructuras del fichero quedaron a medio actualizar). qemu redondea un LastFileOffset no
 alineado; aquí es `Corrupt` (la especificación exige múltiplos de 1 MiB).
 
+## Discos diferenciales (incidencia 8)
+
+Módulos `vhdx.rs` (capa) y `differencing.rs` (cadena), ADR-018 con su addendum. El padre **nunca** se abre
+por su cuenta: el llamador pasa en `ApprovedFiles` (módulo `external.rs`, compartido con #11) los ficheros
+que eligió y confirmó el usuario, con los papeles `parent:1` (padre inmediato), `parent:2`… hasta el disco
+base.
+
+- **Localizador** (metadato Parent Locator, requerido en un diferencial; si falta, `Corrupt`): tipo
+  (GUID), número de entradas y pares clave/valor UTF-16LE con desplazamientos relativos al elemento.
+  Cada entrada debe quedar dentro del elemento, con longitudes pares y clave no vacía (si no, `Corrupt`).
+  Indicaciones (`external_hints`): `locator_type` y todos los pares tal como están
+  (`parent_linkage`, `parent_linkage2`, `relative_path`, `volume_path`, `absolute_win32_path`…),
+  saneados; nunca se usan como rutas.
+- **Vínculo**: el DataWriteGuid de la cabecera activa del padre debe ser `parent_linkage` (GUID en texto
+  `{…}`) o, si existe, `parent_linkage2`, que la especificación admite como alternativo (la descripción
+  lo anota). Sin `parent_linkage` válido el vínculo no se puede verificar. En ambos casos,
+  `ExternalMismatch` salvo petición explícita (`--ignore-parent-mismatch`), que queda en la descripción.
+  Además: el padre es VHDX, mismo tamaño virtual y sector lógico, sin ciclos (ruta canónica y
+  DataWriteGuid) y como mucho 16 padres.
+- **BAT de un diferencial**: `ceil(n / chunk_ratio) × (chunk_ratio + 1)` entradas, porque también el
+  último grupo incompleto lleva su entrada de mapa de bits de sectores (en un disco sin padre son
+  `n + (n − 1) / chunk_ratio`). Las entradas de bloque más allá del último bloque se ignoran.
+- **Estados de bloque en un diferencial**: NOT_PRESENT y UNDEFINED → contenido del padre; ZERO → ceros;
+  UNMAPPED → ceros (la capa descartó esos datos; devolver los del padre resucitaría datos que el
+  sistema invitado ya había liberado, y la especificación permite leerlos como ceros); FULLY_PRESENT →
+  fichero; PARTIALLY_PRESENT → por sector según el mapa de bits.
+- **Mapa de bits de sectores**: un bloque de 1 MiB por grupo de `chunk_ratio` bloques (entrada de la
+  BAT con estado PRESENT y desplazamiento ≥ 1 MiB, entera dentro del fichero; NOT_PRESENT permitido).
+  Un bit por sector lógico, **el bit 0 de cada byte es el primer sector** (al revés que en VHD): bit a 1
+  → sector del fichero; a 0 → sector del padre. Se lee por bloque (≤ 64 KiB) con caché de una entrada y
+  a través de la superposición del registro pendiente si la hay. Los mapas de bits entran en la
+  detección de solapes (ADR-020) como zonas: un bloque que solapa un mapa de bits invalida ambos.
+- **Daños** (ADR-020): en modo estricto son `Corrupt` una entrada de mapa de bits con estado no válido o
+  fuera del fichero, un bloque PARTIALLY_PRESENT cuyo grupo no tiene mapa de bits válido y los solapes
+  de mapas de bits. En modo tolerante se descartan los bloques PARTIALLY_PRESENT afectados (se leen con
+  error y `allocation` los da como `Data`): un bloque descartado **nunca** se lee del padre.
+- **`allocation`**: `Data` lo que la capa tiene (bloques o sectores presentes), `Sparse` lo ZERO/UNMAPPED
+  de la capa y, para el resto, lo que informe el padre (`Data`, conservador, si no puede).
+
+Pruebas (VHD y VHDX):
+
+- Unitarias (`core/mr-image/src/differencing_tests.rs`, 11, con `diff_builder.rs`, que construye VHD y
+  VHDX dinámicos y diferenciales según las especificaciones; los sectores no escritos de un bloque
+  asignado llevan basura `0xEE` para detectar cualquier lectura indebida): cadenas de 1 y 2 niveles
+  (lectura completa y 200 rangos irregulares, `allocation` sector a sector, sectores de 4096 B,
+  descripción, rutas de los padres e inmutabilidad), VHDX con PARTIALLY_PRESENT, ZERO, UNDEFINED y
+  UNMAPPED, referencia externa sin padres o con la cadena incompleta, indicaciones de ambos formatos,
+  vínculo que no coincide (rechazado; aceptado con petición explícita y advertido), `parent_linkage2`
+  y localizador sin `parent_linkage`, ficheros que sobran, imagen no diferencial con padres, ciclo por
+  ruta y por identidad (una copia), tamaño y formato distintos, rutas de dispositivo y ficheros
+  inexistentes, 16 padres sí y 17 no, modo tolerante (un bloque descartado no cae en el padre; mapa de
+  bits ausente o con estado no válido) y 200 corrupciones aleatorias de los localizadores (VHD y VHDX)
+  sin pánicos; papeles que no son `parent:1 … parent:N` y el mismo fichero con dos papeles. `external.rs`:
+  saneado y límite de las indicaciones.
+- Con qemu-img (`core/mr-image/tests/differencing_qemu.rs`, 2, `--ignored`): qemu-img 11.1.2 no crea
+  diferenciales VHD ni VHDX («Backing file not supported for file format 'vpc'/'vhdx'»), no abre un
+  VHDX diferencial («not supported») y abre un VHD de tipo 4 como si fuera dinámico (sin padre), así
+  que no puede convertir la cadena. La prueba usa como referencia independiente el **disco base**: un
+  RAW de 8 MiB se convierte a VHD/VHDX dinámico con qemu-img y de vuelta a RAW (igual al original). Los
+  diferenciales de 1 y 2 niveles (bloques de 64 KiB y 2 MiB en VHD, 1 y 2 MiB en VHDX) se construyen
+  según la especificación enlazados al id único / DataWriteGuid que escribió qemu-img; la imagen
+  esperada es la referencia de qemu-img con las escrituras de cada capa encima. Se comparan el SHA-256
+  de la lectura completa en trozos irregulares, 300 rangos aleatorios y `allocation` sector a sector
+  (escrito por una capa o datos según `qemu-img map` del base), y que ningún fichero cambia. Nunca se
+  usan `commit` ni `rebase`. Resultado (2026-10-25): 2/2; SHA-256 de 1 nivel
+  `6993a977…5fcf51ef` y de 2 niveles `8e74afe6…0fe0a60f85` (iguales en VHD y VHDX, mismas
+  escrituras).
+- API (`core/mr-api/tests/differencing.rs`), FFI (`open_ex_layout_and_differencing_chain`), CLI
+  (`cli/tests/differencing.rs`), C# (`ContainerTests.DifferencingVhdOpensOnlyWithTheExplicitParentChain`)
+  e interfaz (`DifferencingUiTests`, `PRUEBAS_UI.md`).
+
+Limitaciones: no se ha probado con diferenciales escritos por Hyper-V (Windows no permite crearlos sin
+el módulo de Hyper-V o privilegios de administrador en este entorno); la cadena mezcla solo capas del
+mismo formato (como exige la especificación).
+
 ## Decisiones
 
 - **Registro pendiente**: se reproduce en memoria (apartado anterior); nunca se escribe el fichero.
   Las cabeceras antiguas con LogGuid ≠ 0 pero menor secuencia no afectan.
 - **Tablas de regiones**: se toma la primera copia válida; no se exige que ambas coincidan.
-- **UNDEFINED/UNMAPPED** se entregan como **dispersos** (`Allocation::Sparse`, ceros; en el mapa de
+- **UNDEFINED/UNMAPPED** (en discos sin padre; en diferenciales ver «Discos diferenciales») se entregan
+  como **dispersos** (`Allocation::Sparse`, ceros; en el mapa de
   validez, estado `Sparse`), igual que `qemu-img` (que los convierte a RAW como ceros). Motivos: solo
   se abren discos sin padre (HasParent es `ExternalReference`), así que no hay otro disco del que
   heredar el contenido; la especificación declara indefinido el contenido de un bloque UNDEFINED y

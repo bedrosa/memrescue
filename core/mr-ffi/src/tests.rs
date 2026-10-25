@@ -2013,3 +2013,175 @@ fn cancelled_search_keeps_its_partial_result() {
     assert_eq!(mr_task_free(t), MR_OK);
     assert_eq!(mr_source_close(src), MR_OK);
 }
+
+// ---------- Ficheros externos: discos diferenciales (mr_source_open_ex, issue #8) ----------
+
+#[path = "../../mr-image/src/diff_builder.rs"]
+mod diff_builder;
+
+fn open_ex(p: &str, flags: u32, externals: &[&str]) -> Result<u64, i32> {
+    let list: Vec<MrStr> = externals
+        .iter()
+        .map(|s| MrStr {
+            ptr: s.as_ptr(),
+            len: s.len(),
+        })
+        .collect();
+    let o = MrOpenOptions {
+        struct_size: std::mem::size_of::<MrOpenOptions>() as u32,
+        flags,
+        sector_size: 0,
+        external_count: list.len() as u32,
+        externals: if list.is_empty() {
+            std::ptr::null()
+        } else {
+            list.as_ptr()
+        },
+        reserved: 0,
+    };
+    let mut h = 0u64;
+    let rc = unsafe { mr_source_open_ex(p.as_ptr(), p.len(), &o, &mut h) };
+    if rc == MR_OK {
+        Ok(h)
+    } else {
+        Err(rc)
+    }
+}
+
+fn hints(p: &str) -> (i32, String, u32) {
+    let mut buf = vec![0u8; 4096];
+    let (mut len, mut count) = (0usize, 0u32);
+    let rc = unsafe {
+        mr_image_external_hints(
+            p.as_ptr(),
+            p.len(),
+            buf.as_mut_ptr(),
+            buf.len(),
+            &mut len,
+            &mut count,
+        )
+    };
+    (
+        rc,
+        String::from_utf8_lossy(&buf[..len.min(buf.len())]).into_owned(),
+        count,
+    )
+}
+
+#[test]
+fn open_ex_layout_and_differencing_chain() {
+    use diff_builder as db;
+    assert_eq!(std::mem::size_of::<MrOpenOptions>(), 32);
+    assert_eq!(std::mem::size_of::<MrStr>(), 16);
+    assert_eq!(std::mem::offset_of!(MrOpenOptions, externals), 16);
+    assert_eq!(
+        (MR_OPEN_IGNORE_LINK_MISMATCH, MR_ERR_EXTERNAL_MISMATCH),
+        (8, 17)
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let size = 16 * 4096u64;
+    let w0 = db::writes(0, 0..40);
+    let w1 = db::writes(1, [2, 50]);
+    let base_b = db::vhd_layer(size, 4096, [0xAB; 16], None, &w0);
+    let child_b = db::vhd_layer(
+        size,
+        4096,
+        [0xCD; 16],
+        Some(&db::VhdParent::new([0xAB; 16], "base.vhd")),
+        &w1,
+    );
+    let other_b = db::vhd_layer(size, 4096, [0x11; 16], None, &w0);
+    let write = |n: &str, b: &[u8]| {
+        let p = dir.path().join(n);
+        std::fs::write(&p, b).unwrap();
+        p.to_str().unwrap().to_string()
+    };
+    let base = write("base.vhd", &base_b);
+    let child = write("child.vhd", &child_b);
+    let other = write("other.vhd", &other_b);
+
+    // Indicaciones sin abrir el padre; ninguna en un disco que no es diferencial.
+    let (rc, text, n) = hints(&child);
+    assert_eq!(rc, MR_OK);
+    assert_eq!(n, 5);
+    assert!(text.lines().any(|l| l == "parent_name\tbase.vhd"), "{text}");
+    assert!(
+        text.lines().any(|l| l == "locator_W2ru\t.\\base.vhd"),
+        "{text}"
+    );
+    assert_eq!(hints(&base), (MR_OK, String::new(), 0));
+    assert_eq!(hints("C:\\no\\existe.vhd").0, MR_ERR_IO);
+
+    // Sin padres: referencia externa (también con mr_source_open).
+    assert_eq!(open(&child, 0, 0), Err(MR_ERR_EXTERNAL_REFERENCE));
+    assert_eq!(open_ex(&child, 0, &[]), Err(MR_ERR_EXTERNAL_REFERENCE));
+    let h = open_ex(&child, 0, &[&base]).unwrap();
+    assert!(describe(h).starts_with("VHD diferencial"));
+    let mut buf = vec![0u8; 512];
+    let mut len = 0usize;
+    assert_eq!(
+        unsafe { mr_source_read(h, 50, 1, buf.as_mut_ptr(), buf.len(), &mut len) },
+        MR_OK
+    );
+    assert_eq!(buf, db::sector_data(1, 50));
+    assert_eq!(
+        unsafe { mr_source_read(h, 3, 1, buf.as_mut_ptr(), buf.len(), &mut len) },
+        MR_OK
+    );
+    assert_eq!(buf, db::sector_data(0, 3));
+    assert_eq!(mr_source_close(h), MR_OK);
+
+    // Vínculo que no coincide: código propio; con el bit explícito se abre y se advierte.
+    assert_eq!(open_ex(&child, 0, &[&other]), Err(MR_ERR_EXTERNAL_MISMATCH));
+    assert!(last_error().contains("no corresponde"), "{}", last_error());
+    let h = open_ex(&child, MR_OPEN_IGNORE_LINK_MISMATCH, &[&other]).unwrap();
+    assert!(describe(h).contains("NO verificado"));
+    assert_eq!(mr_source_close(h), MR_OK);
+    // Ficheros que sobran, rutas de dispositivo y combinaciones no válidas.
+    assert_eq!(open_ex(&base, 0, &[&child]), Err(MR_ERR_EXTERNAL_MISMATCH));
+    assert_eq!(
+        open_ex(&child, 0, &[r"\\.\PhysicalDrive0"]),
+        Err(MR_ERR_PATH_REJECTED)
+    );
+    assert_eq!(open_ex(&child, 0, &[""]), Err(MR_ERR_INVALID_ARGUMENT));
+    assert_eq!(
+        open_ex(&child, MR_OPEN_SPLIT, &[&base]),
+        Err(MR_ERR_INVALID_ARGUMENT)
+    );
+    assert_eq!(open_ex(&child, 16, &[&base]), Err(MR_ERR_INVALID_ARGUMENT));
+    let many: Vec<&str> = (0..=MR_MAX_EXTERNAL_FILES).map(|_| base.as_str()).collect();
+    assert_eq!(open_ex(&child, 0, &many), Err(MR_ERR_INVALID_ARGUMENT));
+
+    // Estructura: tamaño desconocido, reservado, punteros nulos.
+    let mut h = 0u64;
+    let mut o = MrOpenOptions {
+        struct_size: 24,
+        flags: 0,
+        sector_size: 0,
+        external_count: 0,
+        externals: std::ptr::null(),
+        reserved: 0,
+    };
+    let rc = unsafe { mr_source_open_ex(child.as_ptr(), child.len(), &o, &mut h) };
+    assert_eq!(rc, MR_ERR_INVALID_ARGUMENT);
+    o.struct_size = 32;
+    o.reserved = 1;
+    let rc = unsafe { mr_source_open_ex(child.as_ptr(), child.len(), &o, &mut h) };
+    assert_eq!(rc, MR_ERR_INVALID_ARGUMENT);
+    o.reserved = 0;
+    o.external_count = 1;
+    let rc = unsafe { mr_source_open_ex(child.as_ptr(), child.len(), &o, &mut h) };
+    assert_eq!(rc, MR_ERR_INVALID_ARGUMENT);
+    let rc = unsafe { mr_source_open_ex(child.as_ptr(), child.len(), std::ptr::null(), &mut h) };
+    assert_eq!(rc, MR_ERR_INVALID_ARGUMENT);
+    let rc = unsafe { mr_source_open_ex(child.as_ptr(), child.len(), &o, std::ptr::null_mut()) };
+    assert_eq!(rc, MR_ERR_INVALID_ARGUMENT);
+    // Un RAW con struct correcto y sin externos se abre como con mr_source_open.
+    let (_d, raw) = temp_image("r.img", 4, 512);
+    let h = open_ex(&raw, 0, &[]).unwrap();
+    assert_eq!(mr_source_close(h), MR_OK);
+
+    assert_eq!(std::fs::read(&base).unwrap(), base_b);
+    assert_eq!(std::fs::read(&child).unwrap(), child_b);
+}

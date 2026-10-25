@@ -46,6 +46,10 @@
  * aprobadas explícitamente (mr_vmdk_extents_list, mr_vmdk_extents_info, mr_vmdk_extents_describe,
  * mr_vmdk_extents_issue, mr_vmdk_extent_get, mr_vmdk_extent_name, mr_vmdk_extent_issue,
  * mr_vmdk_extents_free y mr_source_open_vmdk con mr_approved_file versionada).
+ * Añadido sin cambiar la ABI 3 (M1.5, issue #8): ficheros externos aprobados por el usuario
+ * (mr_source_open_ex con mr_open_options versionada y lista de mr_str; hoy, la cadena de padres
+ * de un disco diferencial VHD/VHDX), MR_OPEN_IGNORE_LINK_MISMATCH, mr_image_external_hints y el
+ * código MR_ERR_EXTERNAL_MISMATCH (17).
  */
 #ifndef MEMRESCUE_CORE_H
 #define MEMRESCUE_CORE_H
@@ -79,6 +83,8 @@ typedef int32_t mr_status;
 #define MR_ERR_UNSUPPORTED_FEATURE 14  /* variante del formato aún no soportada */
 #define MR_ERR_NOT_FOUND          15   /* ruta NTFS que no existe (#22) */
 #define MR_ERR_ALREADY_EXISTS     16   /* la salida ya existe y no se pidió sustituirla (#22) */
+#define MR_ERR_EXTERNAL_MISMATCH  17   /* un fichero externo indicado no corresponde (padre de otro
+                                          disco, tamaño o sector distintos, ciclo, cadena > 16) */
 #define MR_ERR_PANIC              99
 
 /* Algoritmos de hash (máscara de bits para *_hash_start, valor único para mr_hash_result). */
@@ -114,6 +120,10 @@ typedef int32_t mr_status;
                                      mr_source_describe indica «modo tolerante» y cuántos se
                                      descartaron. Sin este bit se rechazan con MR_ERR_CORRUPT.
                                      Sin efecto en RAW e imágenes divididas. */
+#define MR_OPEN_IGNORE_LINK_MISMATCH 8u /* solo mr_source_open_ex: aceptar un fichero externo cuyo
+                                     vínculo de identidad no coincide (petición explícita del
+                                     usuario); mr_source_describe lo advierte con «NO verificado» */
+#define MR_MAX_EXTERNAL_FILES 64u  /* máximo de elementos en mr_open_options.externals */
 
 /* Estado de cada sector (mr_source_read_mapped, mr_verify_untrusted_range). */
 #define MR_SECTOR_READ        0u  /* leído al primer intento */
@@ -191,6 +201,27 @@ typedef struct mr_read_options {
     uint32_t reserved;           /* debe ser 0 */
 } mr_read_options;
 
+/* Cadena UTF-8 de entrada (16 bytes en x64), sin terminador. */
+typedef struct mr_str {
+    const uint8_t *ptr;
+    size_t len;
+} mr_str;
+
+/* Opciones de mr_source_open_ex (32 bytes en x64). struct_size = sizeof(mr_open_options); un
+ * tamaño desconocido se rechaza. externals: ficheros externos que el usuario eligió y confirmó, en
+ * orden (disco diferencial: padre inmediato primero, hasta el base). El motor nunca abre otros:
+ * cada ruta pasa la política de rutas y se abre en solo lectura; si no corresponde
+ * (MR_ERR_EXTERNAL_MISMATCH), si falta un padre (MR_ERR_EXTERNAL_REFERENCE) o si la imagen no usa
+ * ficheros externos y la lista no está vacía (MR_ERR_EXTERNAL_MISMATCH), la apertura falla. */
+typedef struct mr_open_options {
+    uint32_t struct_size;
+    uint32_t flags;              /* MR_OPEN_* (MR_OPEN_SPLIT no admite externals) */
+    uint32_t sector_size;        /* 0 = nativo */
+    uint32_t external_count;     /* ≤ MR_MAX_EXTERNAL_FILES */
+    const mr_str *externals;     /* NULL si external_count = 0 */
+    uint64_t reserved;           /* debe ser 0 */
+} mr_open_options;
+
 uint32_t  mr_abi_version(void);
 mr_status mr_engine_version(uint8_t *buf, size_t cap, size_t *out_len);
 mr_status mr_last_error(uint8_t *buf, size_t cap, size_t *out_len);
@@ -203,6 +234,14 @@ mr_status mr_image_info_get(const uint8_t *path, size_t path_len, uint32_t secto
 /* Orígenes (imágenes abiertas en solo lectura) */
 mr_status mr_source_open(const uint8_t *path, size_t path_len, uint32_t sector_size,
                          uint32_t flags, uint64_t *out_source);
+/* Apertura con opciones versionadas y ficheros externos aprobados por el usuario. */
+mr_status mr_source_open_ex(const uint8_t *path, size_t path_len, const mr_open_options *options,
+                            uint64_t *out_source);
+/* Indicaciones del contenedor sobre los ficheros externos que necesita (padre de un disco
+ * diferencial), sin abrir ningún otro fichero: una línea "clave\tvalor" por indicación; vacía si
+ * no necesita ninguno. Solo para mostrarlas: nunca se usan como rutas. */
+mr_status mr_image_external_hints(const uint8_t *path, size_t path_len,
+                                  uint8_t *buf, size_t cap, size_t *out_len, uint32_t *out_count);
 mr_status mr_source_info(uint64_t source, mr_image_info *out);
 mr_status mr_source_describe(uint64_t source, uint8_t *buf, size_t cap, size_t *out_len);
 /* Lectura estricta: falla ante cualquier error de lectura. */

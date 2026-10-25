@@ -10,7 +10,10 @@
 //! - Dinámico: cabecera dinámica de 1024 bytes (`cxsparse`) en `data_offset`, BAT de
 //!   `max_table_entries` entradas u32 (sector del bloque o `0xFFFFFFFF` si no está asignado) y,
 //!   por cada bloque asignado, un mapa de bits de sectores seguido de los datos del bloque.
-//! - Diferencial: necesita el disco padre; nunca se abre (`IoError::ExternalReference`).
+//! - Diferencial: como el dinámico, pero los bloques no asignados y los sectores con su bit a 0
+//!   se leen del disco padre. [`VhdImage::open`] devuelve `IoError::ExternalReference` (nunca abre
+//!   el padre); la cadena solo se abre con los ficheros que indica el usuario
+//!   (`crate::differencing`, incidencia 8).
 //!
 //! Modo tolerante ([`VhdImage::open_with`], ADR-020): las entradas de la BAT cuyo bloque queda
 //! fuera de la zona de datos, solapa la copia del pie, la cabecera dinámica, la BAT u otro bloque
@@ -19,10 +22,13 @@
 //! críticos (`Corrupt` en ambos modos).
 
 use crate::budget::{Budget, TABLE_CHUNK};
+use crate::differencing::{self, Layer, Link};
+use crate::external::ExternalHint;
 use crate::tolerant::{self, Damage, Hit, Zone};
-use mr_io::{Allocation, AllocationRun, BlockDevice, IoError, Result};
+use mr_io::{Allocation, AllocationRun, BlockDevice, ImageFormat, IoError, Result};
 use std::fs::File;
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 const FORMAT: &str = "VHD";
 const SECTOR: u64 = 512;
@@ -45,6 +51,7 @@ const F_DATA_OFFSET: usize = 16;
 const F_CURRENT_SIZE: usize = 48;
 const F_DISK_TYPE: usize = 60;
 const F_CHECKSUM: usize = 64;
+const F_UNIQUE_ID: usize = 68;
 
 // Desplazamientos de los campos de la cabecera dinámica.
 const H_TABLE_OFFSET: usize = 16;
@@ -53,8 +60,14 @@ const H_MAX_ENTRIES: usize = 28;
 const H_BLOCK_SIZE: usize = 32;
 const H_CHECKSUM: usize = 36;
 const H_PARENT_ID: usize = 40;
+const H_PARENT_TIMESTAMP: usize = 56;
 const H_PARENT_NAME: usize = 64;
 const H_PARENT_NAME_LEN: usize = 512;
+const H_LOCATORS: usize = 576;
+const LOCATOR_ENTRIES: usize = 8;
+const LOCATOR_LEN: usize = 24;
+/// Tamaño máximo de los datos de un localizador de padre que se leen (solo son indicaciones).
+const MAX_LOCATOR_BYTES: u32 = 64 * 1024;
 
 const DISK_FIXED: u32 = 2;
 const DISK_DYNAMIC: u32 = 3;
@@ -130,6 +143,7 @@ struct Footer {
     data_offset: u64,
     current_size: u64,
     disk_type: u32,
+    unique_id: [u8; 16],
 }
 
 /// Valida cookie, suma de control y versión de un pie de 512 bytes.
@@ -148,10 +162,13 @@ fn parse_footer(b: &[u8; FOOTER_LEN]) -> std::result::Result<Footer, String> {
     if version >> 16 != 1 {
         return Err(format!("versión de formato no reconocida {version:#010x}"));
     }
+    let mut unique_id = [0u8; 16];
+    unique_id.copy_from_slice(&b[F_UNIQUE_ID..F_UNIQUE_ID + 16]);
     Ok(Footer {
         data_offset: be64(b, F_DATA_OFFSET),
         current_size: be64(b, F_CURRENT_SIZE),
         disk_type: be32(b, F_DISK_TYPE),
+        unique_id,
     })
 }
 
@@ -172,7 +189,17 @@ struct DynHeader {
     max_entries: u32,
     block_size: u32,
     parent_id: [u8; 16],
+    parent_timestamp: u32,
     parent_name: String,
+    locators: Vec<RawLocator>,
+}
+
+/// Entrada de localizador de padre de la cabecera dinámica (sin interpretar).
+#[derive(Debug, Clone, Copy)]
+struct RawLocator {
+    code: [u8; 4],
+    data_len: u32,
+    data_offset: u64,
 }
 
 fn parse_dyn_header(b: &[u8; DYN_HEADER_LEN]) -> Result<DynHeader> {
@@ -203,12 +230,26 @@ fn parse_dyn_header(b: &[u8; DYN_HEADER_LEN]) -> Result<DynHeader> {
         .map(|&c| u16::from_be_bytes(c))
         .take_while(|&u| u != 0)
         .collect();
+    let locators = (0..LOCATOR_ENTRIES)
+        .map(|i| H_LOCATORS + i * LOCATOR_LEN)
+        .filter_map(|o| {
+            let mut code = [0u8; 4];
+            code.copy_from_slice(&b[o..o + 4]);
+            (code != [0u8; 4]).then(|| RawLocator {
+                code,
+                data_len: be32(b, o + 8),
+                data_offset: be64(b, o + 16),
+            })
+        })
+        .collect();
     Ok(DynHeader {
         table_offset: be64(b, H_TABLE_OFFSET),
         max_entries: be32(b, H_MAX_ENTRIES),
         block_size: be32(b, H_BLOCK_SIZE),
         parent_id,
+        parent_timestamp: be32(b, H_PARENT_TIMESTAMP),
         parent_name: String::from_utf16_lossy(&units),
+        locators,
     })
 }
 
@@ -243,13 +284,29 @@ enum Layout {
     Dynamic(Dynamic),
 }
 
-/// Imagen VHD fija o dinámica abierta en solo lectura.
+/// Referencia al padre de un VHD diferencial (cabecera dinámica). Solo indicaciones: nunca se
+/// usa para abrir nada.
+#[derive(Debug, Clone)]
+struct ParentRef {
+    id: [u8; 16],
+    timestamp: u32,
+    name: String,
+    /// Localizadores: (código de plataforma, texto decodificado o motivo por el que no se leyó).
+    locators: Vec<(String, String)>,
+}
+
+/// Imagen VHD fija, dinámica o diferencial abierta en solo lectura.
 pub struct VhdImage {
     file: File,
     size: u64,
     layout: Layout,
     footer_source: FooterSource,
     tolerant: bool,
+    unique_id: [u8; 16],
+    /// Padre que referencia un disco diferencial (`None` en fijos y dinámicos).
+    parent_ref: Option<ParentRef>,
+    /// Padre enlazado (solo en discos diferenciales abiertos con su cadena).
+    parent: Option<Arc<dyn BlockDevice>>,
 }
 
 /// Estado del sector `s` en el mapa de bits (bit más significativo = primer sector del byte).
@@ -305,6 +362,12 @@ impl VhdImage {
     /// Como [`Self::open`]; con `tolerant`, las entradas de la BAT inválidas o ambiguas no impiden
     /// abrir la imagen: sus bloques se descartan (ver la documentación del módulo).
     pub fn open_with(file: File, tolerant: bool) -> Result<VhdImage> {
+        Self::open_inner(file, tolerant, false)
+    }
+
+    /// Como [`Self::open_with`], pero con `differencing` un disco diferencial se abre sin padre
+    /// (para enlazarlo después con la cadena indicada por el usuario).
+    fn open_inner(file: File, tolerant: bool, differencing: bool) -> Result<VhdImage> {
         let file_size = file.metadata()?.len();
         if file_size < OLD_FOOTER_LEN as u64 {
             return Err(corrupt(format!(
@@ -375,6 +438,7 @@ impl VhdImage {
             )));
         }
 
+        let mut parent_ref = None;
         let layout = match footer.disk_type {
             DISK_FIXED => {
                 if size != data_end {
@@ -385,7 +449,22 @@ impl VhdImage {
                 Layout::Fixed
             }
             DISK_DYNAMIC => {
-                Layout::Dynamic(Self::open_dynamic(&file, &footer, data_end, tolerant)?)
+                let h = Self::read_dyn_header(&file, &footer, data_end)?;
+                Layout::Dynamic(Self::open_dynamic(&file, &footer, &h, data_end, tolerant)?)
+            }
+            DISK_DIFFERENCING if differencing => {
+                let h = Self::read_dyn_header(&file, &footer, data_end)?;
+                parent_ref = Some(ParentRef {
+                    id: h.parent_id,
+                    timestamp: h.parent_timestamp,
+                    name: h.parent_name.clone(),
+                    locators: h
+                        .locators
+                        .iter()
+                        .map(|l| read_locator(&file, l, data_end))
+                        .collect(),
+                });
+                Layout::Dynamic(Self::open_dynamic(&file, &footer, &h, data_end, tolerant)?)
             }
             DISK_DIFFERENCING => return Err(Self::differencing_error(&file, &footer, data_end)),
             t @ (0 | 1 | 5 | 6) => {
@@ -402,6 +481,9 @@ impl VhdImage {
             layout,
             footer_source,
             tolerant,
+            unique_id: footer.unique_id,
+            parent_ref,
+            parent: None,
         })
     }
 
@@ -435,10 +517,10 @@ impl VhdImage {
     fn open_dynamic(
         file: &File,
         footer: &Footer,
+        h: &DynHeader,
         data_end: u64,
         tolerant: bool,
     ) -> Result<Dynamic> {
-        let h = Self::read_dyn_header(file, footer, data_end)?;
         let size = footer.current_size;
 
         let block_size = u64::from(h.block_size);
@@ -579,9 +661,15 @@ impl VhdImage {
     pub fn describe(&self) -> String {
         let mut s = match &self.layout {
             Layout::Fixed => "VHD fijo".to_string(),
-            Layout::Dynamic(d) => {
-                format!("VHD dinámico, bloques de {}", human_size(d.block_size))
-            }
+            Layout::Dynamic(d) => format!(
+                "VHD {}, bloques de {}",
+                if self.parent_ref.is_some() {
+                    "diferencial"
+                } else {
+                    "dinámico"
+                },
+                human_size(d.block_size)
+            ),
         };
         match self.footer_source {
             FooterSource::End512 => {}
@@ -650,6 +738,60 @@ impl VhdImage {
         })
     }
 
+    /// Contenido de los sectores que esta capa no tiene: ceros en un disco dinámico y el padre en
+    /// uno diferencial (`ExternalReference` si no se ha enlazado, lo que no ocurre en las imágenes
+    /// que entrega la apertura).
+    fn read_below(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        if self.parent_ref.is_none() {
+            buf.fill(0);
+            return Ok(());
+        }
+        match &self.parent {
+            Some(p) => p.read_at(offset, buf),
+            None => Err(IoError::ExternalReference {
+                format: FORMAT,
+                reference: self.parent_reference(),
+            }),
+        }
+    }
+
+    /// Tramos de asignación de los sectores `[lba, lba + n)` que esta capa no tiene: dispersos en un
+    /// disco dinámico y los del padre en uno diferencial (`Data`, conservador, si el padre no puede
+    /// informar).
+    fn push_below(&self, runs: &mut Vec<AllocationRun>, lba: u64, n: u64) {
+        if self.parent_ref.is_none() {
+            push_run(runs, lba, n, Allocation::Sparse);
+            return;
+        }
+        match self.parent.as_ref().map(|p| p.allocation(lba, n)) {
+            Some(Ok(v)) => {
+                for (l, c, k) in v {
+                    push_run(runs, l, c, k);
+                }
+            }
+            _ => push_run(runs, lba, n, Allocation::Data),
+        }
+    }
+
+    /// Texto con el que se nombra el padre (nombre, localizador o identificador).
+    fn parent_reference(&self) -> String {
+        let Some(r) = &self.parent_ref else {
+            return String::new();
+        };
+        let text = if !r.name.is_empty() {
+            r.name.clone()
+        } else if let Some((_, v)) = r
+            .locators
+            .iter()
+            .find(|(c, v)| matches!(c.as_str(), "W2ru" | "W2ku") && !v.starts_with('('))
+        {
+            v.clone()
+        } else {
+            format!("disco padre con id {}", format_uuid(&r.id))
+        };
+        crate::external::sanitize(&text)
+    }
+
     fn read_dynamic(&self, d: &Dynamic, offset: u64, buf: &mut [u8]) -> Result<()> {
         let bs = d.block_size;
         let mut done = 0usize;
@@ -662,7 +804,7 @@ impl VhdImage {
             // block < bat.len() porque voff < size ≤ bat.len() × bs.
             let entry = d.bat.get(block as usize).copied().unwrap_or(UNALLOCATED);
             if entry == UNALLOCATED {
-                chunk.fill(0);
+                self.read_below(voff, chunk)?;
             } else if entry == DISCARDED {
                 return Err(tolerant::discarded_read(FORMAT, "bloque", block, voff, n));
             } else {
@@ -681,8 +823,9 @@ impl VhdImage {
                     if set {
                         self.read_file(data + o, piece, voff + pos as u64)?;
                     } else {
-                        // Bit a 0: sector no escrito, ceros por definición del formato.
-                        piece.fill(0);
+                        // Bit a 0: sector no escrito en esta capa (ceros o, en un diferencial,
+                        // el contenido del padre).
+                        self.read_below(voff + pos as u64, piece)?;
                     }
                     pos = piece_end;
                 }
@@ -690,6 +833,127 @@ impl VhdImage {
             done += n;
         }
         Ok(())
+    }
+}
+
+/// Lee y decodifica los datos de un localizador de padre (solo como indicación). Nunca falla: si
+/// los datos no se pueden leer, el texto explica el motivo entre paréntesis.
+fn read_locator(file: &File, l: &RawLocator, data_end: u64) -> (String, String) {
+    let code = String::from_utf8_lossy(&l.code).into_owned();
+    let end = l.data_offset.checked_add(u64::from(l.data_len));
+    let text = if l.data_len == 0 || l.data_len > MAX_LOCATOR_BYTES {
+        format!("(longitud de datos no válida: {} bytes)", l.data_len)
+    } else if l.data_offset < FOOTER_LEN as u64 || end.is_none_or(|e| e > data_end) {
+        format!(
+            "(datos fuera del fichero: desplazamiento {:#x}, {} bytes)",
+            l.data_offset, l.data_len
+        )
+    } else {
+        let mut b = vec![0u8; l.data_len as usize];
+        match mr_io::read_exact_at(file, l.data_offset, &mut b) {
+            Err(e) => format!("(no legible: {e})"),
+            Ok(()) => match &l.code {
+                b"W2ru" | b"W2ku" => {
+                    let u: Vec<u16> = b
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|&c| u16::from_le_bytes(c))
+                        .take_while(|&u| u != 0)
+                        .collect();
+                    String::from_utf16_lossy(&u)
+                }
+                b"Wi2r" | b"Wi2k" | b"MacX" => {
+                    let n = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+                    String::from_utf8_lossy(&b[..n]).into_owned()
+                }
+                b"Mac " => format!("(alias de Mac de {} bytes)", b.len()),
+                _ => format!("(plataforma desconocida, {} bytes)", b.len()),
+            },
+        }
+    };
+    (code, text)
+}
+
+impl Layer for VhdImage {
+    const FORMAT: &'static str = FORMAT;
+    const IMAGE_FORMAT: ImageFormat = ImageFormat::Vhd;
+
+    fn open_layer(file: File, tolerant: bool) -> Result<Self> {
+        Self::open_inner(file, tolerant, true)
+    }
+
+    fn is_differencing(&self) -> bool {
+        self.parent_ref.is_some()
+    }
+
+    fn identity(&self) -> [u8; 16] {
+        self.unique_id
+    }
+
+    /// Especificación: el id único del pie del padre debe ser el «Parent Unique ID» del hijo. La
+    /// «Parent Time Stamp» es la fecha de modificación del fichero del padre: copiar el fichero
+    /// (adquisiciones, traslados) la cambia, así que una diferencia solo se informa.
+    fn link(&self, parent: &Self, parent_mtime: Option<SystemTime>) -> Link {
+        let Some(r) = &self.parent_ref else {
+            return Link::Mismatch("la imagen no es un disco diferencial".into());
+        };
+        if r.id != parent.unique_id {
+            return Link::Mismatch(format!(
+                "el diferencial espera el id {} y el fichero tiene el id {}",
+                format_uuid(&r.id),
+                format_uuid(&parent.unique_id)
+            ));
+        }
+        let mut notes = Vec::new();
+        if let Some(t) = parent_mtime.and_then(differencing::vhd_time) {
+            if t != r.timestamp {
+                notes.push(format!(
+                    "la marca de tiempo del padre que guarda el diferencial ({}) no coincide con la fecha de modificación del fichero ({}); informativo, el vínculo se verifica por el id",
+                    differencing::format_vhd_time(r.timestamp),
+                    differencing::format_vhd_time(t)
+                ));
+            }
+        }
+        Link::Verified(notes)
+    }
+
+    fn hints(&self) -> Vec<ExternalHint> {
+        let Some(r) = &self.parent_ref else {
+            return Vec::new();
+        };
+        let mut v = Vec::new();
+        if !r.name.is_empty() {
+            v.push(ExternalHint::new("parent_name", &r.name));
+        }
+        v.push(ExternalHint::new("parent_unique_id", &format_uuid(&r.id)));
+        v.push(ExternalHint::new(
+            "parent_timestamp",
+            &differencing::format_vhd_time(r.timestamp),
+        ));
+        for (code, text) in &r.locators {
+            v.push(ExternalHint::new(
+                &format!("locator_{}", code.trim_end()),
+                text,
+            ));
+        }
+        v
+    }
+
+    fn reference(&self) -> String {
+        self.parent_reference()
+    }
+
+    fn attach_parent(&mut self, parent: Arc<dyn BlockDevice>) {
+        self.parent = Some(parent);
+    }
+
+    fn describe(&self) -> String {
+        VhdImage::describe(self)
+    }
+
+    fn discarded_blocks(&self) -> u64 {
+        VhdImage::discarded_blocks(self)
     }
 }
 
@@ -739,7 +1003,7 @@ impl BlockDevice for VhdImage {
             let stop = end.min(block_first + spb);
             let entry = d.bat.get(block as usize).copied().unwrap_or(UNALLOCATED);
             if entry == UNALLOCATED {
-                push_run(&mut runs, s, stop - s, Allocation::Sparse);
+                self.push_below(&mut runs, s, stop - s);
             } else if entry == DISCARDED {
                 // Hay que «leerlo» para descubrir que no es fiable: nunca se presenta como disperso.
                 push_run(&mut runs, s, stop - s, Allocation::Data);
@@ -759,12 +1023,11 @@ impl BlockDevice for VhdImage {
                 while rel < rel_stop {
                     let set = bit(&map, rel);
                     let e = run_end(&map, rel, rel_stop, set);
-                    let kind = if set {
-                        Allocation::Data
+                    if set {
+                        push_run(&mut runs, block_first + rel, e - rel, Allocation::Data);
                     } else {
-                        Allocation::Sparse
-                    };
-                    push_run(&mut runs, block_first + rel, e - rel, kind);
+                        self.push_below(&mut runs, block_first + rel, e - rel);
+                    }
                     rel = e;
                 }
             }

@@ -90,6 +90,15 @@ public sealed class TestImages : IDisposable
     /// <summary>VHD dinámico con la entrada de la BAT del bloque 1 fuera del fichero (modo tolerante).</summary>
     public string DamagedVhd => Path.Combine(Directory, "bat_danada.vhd");
 
+    /// <summary>VHD fijo de 16 sectores (sector s = 0x40 + s), padre de <see cref="ChildVhd"/>.</summary>
+    public string ParentVhd => Path.Combine(Directory, "padre.vhd");
+
+    /// <summary>VHD fijo con los mismos datos que <see cref="ParentVhd"/> y otro id único (padre equivocado).</summary>
+    public string OtherParentVhd => Path.Combine(Directory, "otro_padre.vhd");
+
+    /// <summary>VHD diferencial de <see cref="ParentVhd"/> con los sectores 1 (0xC1) y 9 (0xC9) escritos.</summary>
+    public string ChildVhd => Path.Combine(Directory, "hijo.vhd");
+
     public TestImages()
     {
         Directory = Path.Combine(Path.GetTempPath(), $"memrescue-uitests-{Environment.ProcessId}-{Guid.NewGuid():N}");
@@ -121,6 +130,15 @@ public sealed class TestImages : IDisposable
         }
         File.WriteAllBytes(GptBasicVhd, [.. File.ReadAllBytes(GptBasic), .. FixedVhdFooter(new FileInfo(GptBasic).Length)]);
         File.WriteAllBytes(DamagedVhd, DamagedDynamicVhd());
+        var parentData = new byte[16 * 512];
+        for (var s = 0; s < 16; s++)
+        {
+            parentData.AsSpan(s * 512, 512).Fill((byte)(0x40 + s));
+        }
+        File.WriteAllBytes(ParentVhd, MemRescue.TestSupport.SyntheticVhd.Fixed(parentData, 0xB0));
+        File.WriteAllBytes(OtherParentVhd, MemRescue.TestSupport.SyntheticVhd.Fixed(parentData, 0x77));
+        File.WriteAllBytes(ChildVhd, MemRescue.TestSupport.SyntheticVhd.Differencing(16 * 512, 0xC1, 0xB0, "padre.vhd",
+            new Dictionary<int, byte> { [1] = 0xC1, [9] = 0xC9 }));
     }
 
     /// <summary>Suma de control del VHD: complemento a uno de la suma de los bytes, sin el propio campo.</summary>

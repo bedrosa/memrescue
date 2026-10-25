@@ -1,0 +1,45 @@
+<Window x:Class="MemRescue.ParentChainDialog"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Disco diferencial" SizeToContent="Height" Width="620" ResizeMode="NoResize"
+        WindowStartupLocation="CenterOwner" ShowInTaskbar="False" FontSize="12"
+        AutomationProperties.AutomationId="ParentChainDialog"
+        FocusManager.FocusedElement="{Binding ElementName=ParentPathBox}">
+    <StackPanel Margin="14">
+        <TextBlock x:Name="IntroText" TextWrapping="Wrap" Margin="0,0,0,8" AutomationProperties.AutomationId="ParentIntroText" />
+        <TextBlock x:Name="HintsLabel" Text="Lo que el diferencial dice de su padre (solo orientativo; MemRescue no abre esa ruta):" TextWrapping="Wrap" Margin="0,0,0,4" />
+        <TextBox x:Name="HintsBox" IsReadOnly="True" FontFamily="Consolas" Height="96" TextWrapping="NoWrap"
+                 VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto"
+                 AutomationProperties.AutomationId="ParentHintsText"
+                 AutomationProperties.LabeledBy="{Binding ElementName=HintsLabel}" />
+        <TextBlock x:Name="ChainLabel" Text="Ficheros padre elegidos (del padre inmediato al disco base):" Margin="0,10,0,4" />
+        <ListBox x:Name="ChainList" Height="90" AutomationProperties.AutomationId="ParentChainList"
+                 AutomationProperties.LabeledBy="{Binding ElementName=ChainLabel}" />
+        <TextBlock x:Name="PathLabel" Text="_Fichero padre:" Margin="0,8,0,2" />
+        <DockPanel>
+            <Button Content="_Añadir" DockPanel.Dock="Right" MinWidth="70" Margin="6,0,0,0" Click="Add_Click"
+                    AutomationProperties.AutomationId="ParentAddButton" />
+            <Button Content="_Examinar…" DockPanel.Dock="Right" MinWidth="80" Margin="6,0,0,0" Click="Browse_Click"
+                    AutomationProperties.AutomationId="ParentBrowseButton" />
+            <TextBox x:Name="ParentPathBox" Padding="2" AutomationProperties.AutomationId="ParentPathBox"
+                     AutomationProperties.LabeledBy="{Binding ElementName=PathLabel}" />
+        </DockPanel>
+        <Button Content="_Quitar el último" HorizontalAlignment="Left" Margin="0,6,0,0" Click="Remove_Click"
+                AutomationProperties.AutomationId="ParentRemoveButton" />
+        <TextBlock x:Name="StatusText" Margin="0,8,0,0" TextWrapping="Wrap" FontWeight="SemiBold"
+                   AutomationProperties.AutomationId="ParentChainStatus" AutomationProperties.LiveSetting="Polite" />
+        <CheckBox x:Name="ConfirmCheck" Margin="0,10,0,0" Checked="Confirm_Changed" Unchecked="Confirm_Changed"
+                  AutomationProperties.AutomationId="ParentConfirmCheck">
+            <TextBlock TextWrapping="Wrap" Text="Confirmo que estos ficheros son los padres de este disco y autorizo a MemRescue a abrirlos en solo lectura." />
+        </CheckBox>
+        <CheckBox x:Name="IgnoreMismatchCheck" Margin="0,6,0,0" AutomationProperties.AutomationId="ParentIgnoreMismatchCheck">
+            <TextBlock TextWrapping="Wrap" Text="Abrir aunque el identificador del padre no coincida (NO recomendado: los datos podrían no corresponder al disco original; la descripción lo advertirá)." />
+        </CheckBox>
+        <DockPanel Margin="0,12,0,0" LastChildFill="False">
+            <Button Content="Cancelar" IsCancel="True" MinWidth="80" DockPanel.Dock="Right"
+                    AutomationProperties.AutomationId="ParentCancelButton" />
+            <Button x:Name="OpenButton" Content="_Abrir en solo lectura" IsDefault="True" MinWidth="80" DockPanel.Dock="Right" Margin="0,0,6,0"
+                    Click="Open_Click" IsEnabled="False" AutomationProperties.AutomationId="ParentOpenButton" />
+        </DockPanel>
+    </StackPanel>
+</Window>

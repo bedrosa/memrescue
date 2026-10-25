@@ -11,8 +11,12 @@
 //! - Los contenedores se abren en modo estricto salvo que se pida [`OpenOptions::tolerant`]
 //!   (ADR-020): entonces las entradas de asignación inválidas o ambiguas descartan solo su bloque o
 //!   grano y la descripción lo indica con el número de bloques descartados.
+//! - Los padres de un disco diferencial solo se usan si el llamador los pasa en [`ApprovedFiles`]
+//!   (papeles `parent:1`, `parent:2`…) con [`open_image_with_parents`] (ADR-018, addendum);
+//!   [`external_hints`] lista lo que el contenedor dice de ellos sin abrir nada más.
 
-use crate::external::ApprovedFiles;
+use crate::differencing::{self, Chain};
+use crate::external::{ApprovedFiles, ExternalHint};
 use crate::split::{discover, SplitImage};
 use crate::vhd::VhdImage;
 use crate::vhdx::VhdxImage;
@@ -60,10 +64,40 @@ pub struct OpenedImage {
     /// Bloques (o granos) descartados si el contenedor se abrió en modo tolerante; `None` si se
     /// abrió en modo estricto o el origen no es un contenedor.
     pub discarded_blocks: Option<u64>,
+    /// Padres de un disco diferencial usados (rutas canónicas, del inmediato al base). Vacío si no
+    /// se usó ninguno.
+    pub external_files: Vec<PathBuf>,
 }
 
-/// Abre un fichero de imagen identificando su formato.
+/// Abre un fichero de imagen identificando su formato. No usa ningún fichero externo: un disco
+/// diferencial devuelve `IoError::ExternalReference`.
 pub fn open_image(path: &Path, opts: OpenOptions) -> Result<OpenedImage> {
+    open_image_with_parents(path, opts, &ApprovedFiles::empty(), false)
+}
+
+/// Error de una apertura que recibió padres que la imagen no usa.
+fn unused_external(detected: ImageFormat, external: &ApprovedFiles) -> IoError {
+    IoError::ExternalMismatch {
+        format: detected.name(),
+        detail: format!(
+            "se indicaron {} ficheros padre y esta imagen no es un disco diferencial",
+            external.len()
+        ),
+    }
+}
+
+/// Como [`open_image`], con la cadena de padres de un disco diferencial VHD/VHDX que el usuario
+/// aprobó explícitamente: `parents` con los papeles `parent:1` (padre inmediato), `parent:2`… hasta
+/// el disco base (ver `crate::differencing`). Con `ignore_link_mismatch` (petición explícita) se
+/// acepta un padre cuyo identificador no coincide y la descripción lo advierte. Si la imagen no
+/// es diferencial y `parents` no está vacío, la apertura falla con `IoError::ExternalMismatch`
+/// (nunca se ignoran en silencio).
+pub fn open_image_with_parents(
+    path: &Path,
+    opts: OpenOptions,
+    external: &ApprovedFiles,
+    ignore_link_mismatch: bool,
+) -> Result<OpenedImage> {
     if opts.sector_size != 0 {
         validate_sector_size(opts.sector_size)?;
     }
@@ -71,6 +105,10 @@ pub fn open_image(path: &Path, opts: OpenOptions) -> Result<OpenedImage> {
     let file = open_regular_file(&canon)?;
     let size = file.metadata()?.len();
     let detected = probe_file(&file, size)?;
+    let uses_external = matches!(detected, ImageFormat::Vhd | ImageFormat::Vhdx) && !opts.force_raw;
+    if !external.is_empty() && !uses_external {
+        return Err(unused_external(detected, external));
+    }
     if opts.force_raw || detected == ImageFormat::Raw {
         drop(file);
         let ss = non_zero(opts.sector_size, DEFAULT_RAW_SECTOR_SIZE);
@@ -92,10 +130,24 @@ pub fn open_image(path: &Path, opts: OpenOptions) -> Result<OpenedImage> {
             segments: Vec::new(),
             native_sector_size: ss,
             discarded_blocks: None,
+            external_files: Vec::new(),
         });
     }
     let tolerant = opts.tolerant;
+    let mut external_files = Vec::new();
     let (device, description, discarded): (Arc<dyn BlockDevice>, String, u64) = match detected {
+        ImageFormat::Vhd if !external.is_empty() => {
+            let c: Chain<VhdImage> =
+                differencing::open_chain(file, &canon, tolerant, external, ignore_link_mismatch)?;
+            external_files = c.parents;
+            (Arc::new(c.top), c.description, c.discarded)
+        }
+        ImageFormat::Vhdx if !external.is_empty() => {
+            let c: Chain<VhdxImage> =
+                differencing::open_chain(file, &canon, tolerant, external, ignore_link_mismatch)?;
+            external_files = c.parents;
+            (Arc::new(c.top), c.description, c.discarded)
+        }
         ImageFormat::Vhd => {
             let d = VhdImage::open_with(file, tolerant)?;
             let (s, n) = (d.describe(), d.discarded_blocks());
@@ -125,7 +177,24 @@ pub fn open_image(path: &Path, opts: OpenOptions) -> Result<OpenedImage> {
         segments: Vec::new(),
         native_sector_size: native,
         discarded_blocks: tolerant.then_some(discarded),
+        external_files,
     })
+}
+
+/// Indicaciones que da el contenedor sobre los ficheros externos que necesita (padre de un disco
+/// diferencial VHD o VHDX), **sin abrir ningún otro fichero**. Vacío si no necesita ninguno. Los
+/// valores son texto saneado y acotado: solo para mostrarlos al usuario, que elige y confirma los
+/// ficheros. Las entradas de asignación dañadas no impiden leerlas (se interpreta en modo
+/// tolerante); las estructuras críticas dañadas sí (`Corrupt`).
+pub fn external_hints(path: &Path) -> Result<Vec<ExternalHint>> {
+    let canon = admit(path)?;
+    let file = open_regular_file(&canon)?;
+    let size = file.metadata()?.len();
+    match probe_file(&file, size)? {
+        ImageFormat::Vhd => differencing::hints_of::<VhdImage>(file),
+        ImageFormat::Vhdx => differencing::hints_of::<VhdxImage>(file),
+        _ => Ok(Vec::new()),
+    }
 }
 
 /// Abre una imagen dividida (`x.001`, `x.002`…) a partir de su primer segmento. El contenido se
@@ -156,6 +225,7 @@ pub fn open_split(first: &Path, opts: OpenOptions) -> Result<OpenedImage> {
         segments,
         native_sector_size: ss,
         discarded_blocks: None,
+        external_files: Vec::new(),
     })
 }
 
@@ -203,6 +273,8 @@ pub fn open_vmdk_extents(
         segments,
         native_sector_size: native,
         discarded_blocks: opts.tolerant.then_some(discarded),
+        // Las extensiones van en `segments` (también protegidas como origen).
+        external_files: Vec::new(),
     })
 }
 
