@@ -473,6 +473,8 @@ enum Entry {
     NtfsTree(Box<ntfs::TreeEntry>),
     /// Copia de un fichero NTFS en segundo plano.
     NtfsCopy(Box<ntfs::CopyEntry>),
+    /// Extensiones de un descriptor VMDK separado (#11); no abre ningún fichero.
+    VmdkExtents(Box<mr_api::VmdkExtentPlan>),
 }
 
 /// Tarea de búsqueda de particiones con su resultado y el origen en que se hizo.
@@ -2564,7 +2566,8 @@ pub unsafe extern "C" fn mr_task_status_get(task: u64, out: *mut MrTaskStatus) -
                 Entry::Source(_)
                 | Entry::Partitions { .. }
                 | Entry::Ntfs(_)
-                | Entry::NtfsListing(_) => return None,
+                | Entry::NtfsListing(_)
+                | Entry::VmdkExtents(_) => return None,
             };
             Some(MrTaskStatus {
                 state: state as u32,
@@ -2608,7 +2611,8 @@ pub extern "C" fn mr_task_cancel(task: u64) -> i32 {
             Entry::Source(_)
             | Entry::Partitions { .. }
             | Entry::Ntfs(_)
-            | Entry::NtfsListing(_) => false,
+            | Entry::NtfsListing(_)
+            | Entry::VmdkExtents(_) => false,
         });
         if cancelled == Some(true) {
             MR_OK
@@ -2650,5 +2654,8 @@ pub use ntfs::*;
 
 #[cfg(test)]
 mod ntfs_tests;
+mod vmdk_extents;
+pub use vmdk_extents::*;
+
 #[cfg(test)]
 mod tests;

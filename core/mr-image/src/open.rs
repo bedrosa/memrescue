@@ -12,10 +12,12 @@
 //!   (ADR-020): entonces las entradas de asignación inválidas o ambiguas descartan solo su bloque o
 //!   grano y la descripción lo indica con el número de bloques descartados.
 
+use crate::external::ApprovedFiles;
 use crate::split::{discover, SplitImage};
 use crate::vhd::VhdImage;
 use crate::vhdx::VhdxImage;
 use crate::vmdk::VmdkImage;
+use crate::vmdk_extents::{ExtentPlan, VmdkExtentImage};
 use mr_io::path_policy::{admit, open_regular_file};
 use mr_io::{
     probe_file, validate_sector_size, Allocation, AllocationRun, BlockDevice, ImageFile,
@@ -154,6 +156,53 @@ pub fn open_split(first: &Path, opts: OpenOptions) -> Result<OpenedImage> {
         segments,
         native_sector_size: ss,
         discarded_blocks: None,
+    })
+}
+
+/// Lista las extensiones que necesita un descriptor VMDK separado (nombres, tipos, tamaños y
+/// problemas) **sin abrir** ninguna (incidencia 11).
+pub fn list_vmdk_extents(descriptor: &Path) -> Result<ExtentPlan> {
+    let canon = admit(descriptor)?;
+    let file = open_regular_file(&canon)?;
+    crate::vmdk_extents::read_plan(&file)
+}
+
+/// Abre un VMDK descrito por un descriptor separado usando **solo** los ficheros de extensión
+/// que el usuario aprobó explícitamente (`approved`: nombre declarado → fichero elegido; ver
+/// [`crate::vmdk_extents`]). `force_raw` no se admite; `tolerant` se aplica a las extensiones
+/// SPARSE. `segments` del resultado lista los ficheros de extensión abiertos (para que nunca se
+/// usen como destino de una extracción).
+pub fn open_vmdk_extents(
+    descriptor: &Path,
+    approved: &ApprovedFiles,
+    opts: OpenOptions,
+) -> Result<OpenedImage> {
+    if opts.force_raw {
+        return Err(IoError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "un descriptor VMDK con extensiones no se puede forzar como RAW",
+        )));
+    }
+    if opts.sector_size != 0 {
+        validate_sector_size(opts.sector_size)?;
+    }
+    let canon = admit(descriptor)?;
+    let file = open_regular_file(&canon)?;
+    let img = VmdkExtentImage::open(&file, &canon, approved, opts.tolerant)?;
+    let (description, discarded) = (img.describe(), img.discarded_blocks());
+    let segments = img.extent_paths().to_vec();
+    let device: Arc<dyn BlockDevice> = Arc::new(img);
+    let native = device.sector_size();
+    let (device, description) = reblock(device, description, opts.sector_size)?;
+    Ok(OpenedImage {
+        device,
+        format: ImageFormat::VmdkDescriptor,
+        detected: ImageFormat::VmdkDescriptor,
+        description,
+        path: canon,
+        segments,
+        native_sector_size: native,
+        discarded_blocks: opts.tolerant.then_some(discarded),
     })
 }
 

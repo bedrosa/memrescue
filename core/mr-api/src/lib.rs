@@ -5,6 +5,8 @@
 //! - [`open_source`] / [`open_with`] / [`image_info`]: abre una imagen RAW o un contenedor
 //!   soportado (VHD, VHDX, VMDK monolithicSparse) y devuelve sus datos.
 //! - [`discover_split`] / [`open_split_source`]: imágenes divididas (apertura explícita).
+//! - [`vmdk_required_extents`] / [`open_vmdk_with_extents`]: VMDK con descriptor separado; las
+//!   extensiones solo se abren si el usuario aprueba cada fichero (#11).
 //! - [`open_range`]: un rango de sectores de otro origen como origen propio.
 //! - [`partitions`]: tabla de particiones del origen (MBR/EBR, MBR protector o híbrido) con la
 //!   confianza y las anomalías de cada partición; [`open_partition`]: una partición como origen.
@@ -49,6 +51,14 @@ use thiserror::Error;
 
 pub use mr_common::ENGINE_VERSION;
 pub use mr_fs_ntfs;
+pub use mr_image::vmdk::{ExtentAccess as VmdkExtentAccess, ExtentType as VmdkExtentType};
+pub use mr_image::vmdk_extents::{
+    extent_access_name, extent_type_name, ExtentPlan as VmdkExtentPlan, Issue as VmdkExtentIssue,
+    IssueKind as VmdkIssueKind, RequiredExtent as VmdkRequiredExtent,
+};
+use mr_image::ApprovedFiles;
+/// Máximo de ficheros aprobados en [`open_vmdk_with_extents`].
+pub const MAX_VMDK_APPROVED_FILES: usize = mr_image::external::MAX_APPROVED_FILES;
 pub use mr_image::OpenOptions;
 pub use mr_part;
 pub use mr_part::search::{SearchOptions, SearchResult};
@@ -223,6 +233,35 @@ pub fn discover_split(first: impl AsRef<Path>) -> Result<Vec<PathBuf>> {
 /// Abre una imagen dividida (petición explícita del usuario tras ver la lista de segmentos).
 pub fn open_split_source(first: impl AsRef<Path>, opts: OpenOptions) -> Result<Source> {
     Ok(Arc::new(mr_image::open_split(first.as_ref(), opts)?.into()))
+}
+
+/// Lista las extensiones que necesita un descriptor VMDK separado (nombre declarado, tipo,
+/// acceso, tamaño y problemas) sin abrir ninguna (incidencia 11).
+pub fn vmdk_required_extents(descriptor: impl AsRef<Path>) -> Result<VmdkExtentPlan> {
+    Ok(mr_image::list_vmdk_extents(descriptor.as_ref())?)
+}
+
+/// Abre un VMDK con descriptor separado usando **solo** los ficheros aprobados por el usuario:
+/// `extents` asigna a cada nombre declarado en el descriptor (coincidencia exacta) el fichero
+/// elegido. El motor no busca ni abre ningún otro fichero (ADR-018). Una lista mal formada
+/// (nombre repetido, dos nombres con el mismo fichero, nombre que no corresponde a ninguna
+/// extensión necesaria, el propio descriptor) es `InvalidArgument`.
+pub fn open_vmdk_with_extents(
+    descriptor: impl AsRef<Path>,
+    extents: &[(String, PathBuf)],
+    opts: OpenOptions,
+) -> Result<Source> {
+    let invalid = |e: mr_io::IoError| match e {
+        mr_io::IoError::Io(io) if io.kind() == std::io::ErrorKind::InvalidInput => {
+            ApiError::InvalidArgument(io.to_string())
+        }
+        other => ApiError::Io(other),
+    };
+    let approved =
+        ApprovedFiles::new(extents.iter().map(|(n, p)| (n.as_str(), p))).map_err(invalid)?;
+    let opened =
+        mr_image::open_vmdk_extents(descriptor.as_ref(), &approved, opts).map_err(invalid)?;
+    Ok(Arc::new(opened.into()))
 }
 
 /// Presenta `count` sectores de `parent` desde `start_lba` como un origen independiente

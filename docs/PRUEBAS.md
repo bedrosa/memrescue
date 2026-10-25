@@ -255,6 +255,35 @@ verificación termina con el bloque `Unreadable` y los demás estados correctos,
 aborta con la posición exacta. VHDX y VMDK no necesitan prueba equivalente: su `allocation` no lee del
 fichero (mapas cargados al abrir).
 
+VMDK con descriptor separado (issue #11, `formatos/vmdk.md`, ADR-018 addendum): unitarias en
+`core/mr-image/src/external.rs` (2: búsqueda solo por coincidencia exacta, listas mal formadas, rutas de
+dispositivo y directorios) y `core/mr-image/src/vmdk_extents.rs` (9: lista sin abrir nada, 20 nombres
+maliciosos (`..\`, `../`, absolutos, `C:x`, UNC, `\\?\GLOBALROOT`, `\\.\PhysicalDrive0`, flujos
+alternativos, `NUL`/`COM1`/`con.vmdk`, espacios y punto final, comodines, texto no UTF-8), problemas
+semánticos (nombres repetidos sin distinguir mayúsculas, 0 sectores, sin extensiones, VMFS/SESPARSE,
+desplazamiento en SPARSE, desbordamientos, padre, sin createType), lectura de FLAT con desplazamiento,
+ZERO, NOACCESS y SPARSE con `allocation` y lector tolerante (NOACCESS `Unreadable`, resto exacto),
+**solo se abren los ficheros aprobados** (sin aprobar, con una falta, nombre en mayúsculas, aprobación
+sobrante, el propio descriptor, otro fichero asignado por el usuario), nombre con ruta rechazado aunque
+se apruebe, tamaños (FLAT corto, desplazamiento, capacidad SPARSE distinta, SPARSE que no es `KDMV`,
+fichero acortado tras abrir), descriptor que no es de texto o de más de 1 MiB y **fuzz** de 1500
+descriptores alterados (sin pánicos y sin abrir nunca el fichero NOACCESS)). Contra qemu-img
+(`core/mr-image/tests/vmdk_extents_qemu.rs`, 4 ignoradas): monolithicFlat, twoGbMaxExtentFlat y
+twoGbMaxExtentSparse de 16 MiB, twoGbMaxExtentFlat con 2 extensiones (2 GiB + 3 MiB), twoGbMaxExtentSparse
+con 3 extensiones (4 GiB + 3 MiB, RAW de origen disperso con `fsutil sparse setflag`) y descriptores a
+mano con un monolithicSparse o un streamOptimized como extensión: `qemu-img compare`, SHA-256 completo y
+rangos aleatorios contra el RAW, `qemu-img map`, inmutabilidad (unos 30 s en Release). qemu-img parte
+las variantes twoGb* en trozos de 2 GiB exactos y no tiene opción para cambiarlo, por eso las imágenes
+de varias extensiones superan los 2 GiB virtuales (las FLAT ocupan su tamaño real mientras dura la
+prueba). Extremo a extremo (`core/mr-api/tests/containers_qemu.rs`): el corpus GPT de 512 y 4096 B
+convertido a monolithicFlat y twoGbMaxExtentSparse da el mismo SHA-256 que el RAW y los ficheros de
+extensión no se admiten como destino de una extracción. FFI (`core/mr-ffi/src/vmdk_extents.rs`, 2:
+tamaños de las estructuras, lista por índice, `struct_size`, búfer pequeño, handles, apertura con y sin
+aprobación, opciones, nombre repetido, ruta de dispositivo, puntero nulo, NOACCESS en lectura estricta),
+CLI (`cli/tests/vmdk_extents.rs`: `vmdk-extents` en texto y JSON, `--extent` con hash igual al RAW
+equivalente, valores mal formados y `--extents-from-dir` rechazados con código 2), C#
+(`VmdkExtentTests`, 3) e interfaz (`VmdkExtentsUiTests`, 2).
+
 Endurecimiento de la capa de bloques (issue #40): `core/mr-image/tests/corruption.rs` (8 pruebas, ≈20 s
 en perfil de depuración) con contenedores sintéticos construidos en la propia prueba según las
 especificaciones públicas: **inversión aleatoria determinista** de 1 a 4 bytes (semillas fijas; 300

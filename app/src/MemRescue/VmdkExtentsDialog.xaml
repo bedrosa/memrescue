@@ -1,0 +1,26 @@
+<Window x:Class="MemRescue.VmdkExtentsDialog"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Extensiones VMDK" SizeToContent="WidthAndHeight" ResizeMode="NoResize"
+        WindowStartupLocation="CenterOwner" ShowInTaskbar="False" FontSize="12"
+        AutomationProperties.AutomationId="VmdkExtentsDialog">
+    <StackPanel Margin="14" MaxWidth="960">
+        <TextBlock x:Name="SummaryText" AutomationProperties.AutomationId="ExtentsSummaryText"
+                   FontWeight="SemiBold" TextWrapping="Wrap" Margin="0,0,0,6" />
+        <TextBlock TextWrapping="Wrap" Margin="0,0,0,8" Foreground="{StaticResource MutedBrush}"
+                   AutomationProperties.AutomationId="ExtentsExplanationText"
+                   Text="Este descriptor describe un disco formado por otros ficheros. Por seguridad MemRescue no abre ningún fichero que usted no apruebe: indique el fichero de cada extensión (se sugiere, sin abrirlo, el del mismo directorio con el nombre exacto del descriptor) y confírmelo uno a uno. Los ficheros se abren en solo lectura." />
+        <TextBlock x:Name="IssueText" AutomationProperties.AutomationId="ExtentsIssueText"
+                   Foreground="#B3261E" TextWrapping="Wrap" Margin="0,0,0,8" Visibility="Collapsed" />
+        <ScrollViewer MaxHeight="420" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+            <Grid x:Name="RowsGrid" AutomationProperties.AutomationId="ExtentsGrid" />
+        </ScrollViewer>
+        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
+            <Button x:Name="OpenButton" AutomationProperties.AutomationId="ExtentsOpenButton"
+                    Content="Abrir con estas extensiones" IsDefault="True" MinWidth="80" Padding="8,2"
+                    IsEnabled="False" Click="Open_Click" />
+            <Button AutomationProperties.AutomationId="ExtentsCancelButton" Content="Cancelar"
+                    IsCancel="True" MinWidth="80" Margin="8,0,0,0" />
+        </StackPanel>
+    </StackPanel>
+</Window>

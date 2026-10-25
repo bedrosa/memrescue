@@ -264,6 +264,33 @@ lista los segmentos del **mismo directorio** y la apertura exige una petición e
 confirmación en la interfaz). Abrir padres/extensiones será una operación explícita futura con la misma
 política de rutas.
 
+**Addendum (incidencia 11): extensiones VMDK aprobadas por el usuario.** Un VMDK con descriptor separado
+(monolithicFlat, twoGbMaxExtentFlat, twoGbMaxExtentSparse, descriptor con un único SPARSE) se abre solo
+con una **lista explícita de ficheros aprobados**, nunca buscándolos:
+
+- **Listar antes de abrir**: el motor interpreta el descriptor y devuelve cada extensión (nombre exacto
+  declarado, tipo, acceso, tamaño, problema) sin abrir ninguna (`list_vmdk_extents`,
+  `mr_vmdk_extents_list`, `vmdk-extents`).
+- **Aprobación por nombre**: el llamador pasa pares «nombre declarado → fichero elegido»
+  (`mr_image::external::ApprovedFiles`, `mr_approved_file`, `--extent NOMBRE=RUTA`). Cada ruta pasa la
+  política de ADR-014 y se abre en solo lectura; la búsqueda es por coincidencia **exacta** del nombre y
+  no toca el sistema de archivos (no recorre directorios ni resuelve `..`). Extensión necesaria sin
+  aprobar → `ExternalReference`; aprobación que no corresponde a ninguna extensión necesaria o que es el
+  propio descriptor → error del llamador.
+- **Nombres del descriptor**: solo nombres de fichero simples; rutas absolutas, UNC, de dispositivo, con
+  separadores o con `..` se rechazan (`UnsupportedFeature`) **aunque se aprueben**, porque un descriptor
+  así no es el que genera VMware ni qemu-img para estas variantes y confirmar «la ruta del descriptor»
+  sería confirmar lo que decide el fichero, no el usuario.
+- **Sin «todo el directorio»**: la CLI rechaza `--extents-from-dir` y la interfaz no tiene «aceptar
+  todo»; sugiere, sin abrirlo, el fichero del mismo directorio con el nombre exacto y exige confirmar
+  cada uno (o elegirlo con el selector de ficheros). Desviación consciente del criterio de la incidencia
+  («solo en el mismo directorio»): el usuario puede elegir un fichero de otro directorio, porque la
+  garantía la da su confirmación explícita y la política de rutas, no la ubicación.
+- **NOACCESS** se lee como ilegible (sin abrir su fichero); **ZERO**, como disperso.
+- Los padres VMDK siguen siendo `ExternalReference` (fuera del alcance). El tipo `ApprovedFiles` es común
+  a los demás contenedores con ficheros externos (#8, discos diferenciales VHD/VHDX): lista ordenada de
+  (papel, ruta canónica) aprobados por el usuario.
+
 ---
 
 ## ADR-019 · Mapa de validez por sector obligatorio (Aceptada, 2026-10-17)

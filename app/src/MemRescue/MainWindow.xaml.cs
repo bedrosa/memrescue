@@ -242,6 +242,10 @@ public partial class MainWindow : Window
             var format = await Task.Run(() => Engine.Probe(path));
             var forceRaw = false;
             var split = false;
+            if (format == ImageFormat.VmdkDescriptor)
+            {
+                return await OpenVmdkDescriptorAsync(path, sectorSize, interactive);
+            }
             if (format == ImageFormat.Raw && interactive && LooksLikeFirstSegment(path))
             {
                 IReadOnlyList<string> segments = [];
@@ -329,6 +333,39 @@ public partial class MainWindow : Window
         {
             StatusText.Text = "Listo";
         }
+    }
+
+    /// <summary>
+    /// Descriptor VMDK separado (incidencia 11, ADR-018): se listan sus extensiones sin abrir ninguna y
+    /// el usuario elige o confirma uno a uno el fichero de cada una en <see cref="VmdkExtentsDialog"/>.
+    /// Solo entonces se abre el disco con esos ficheros (el motor no abre ningún otro). Sin interacción
+    /// (restauración de sesión) no se abre: las aprobaciones no se guardan.
+    /// </summary>
+    private async Task<SourceEntry?> OpenVmdkDescriptorAsync(string path, uint sectorSize, bool interactive)
+    {
+        var list = await Task.Run(() => Engine.ListVmdkExtents(path));
+        Log($"Descriptor VMDK {Path.GetFileName(path)}: {list.Summary}; no se ha abierto ninguna extensión.");
+        if (!interactive)
+        {
+            Log($"No se abre {path}: sus extensiones requieren la confirmación explícita del usuario.");
+            return null;
+        }
+        var dlg = new VmdkExtentsDialog(path, list) { Owner = this };
+        if (dlg.ShowDialog() != true)
+        {
+            Log($"No se abrió {path}: extensiones no confirmadas.");
+            return null;
+        }
+        var approved = dlg.Approved;
+        foreach (var a in approved)
+        {
+            Log($"Extensión aprobada por el usuario: «{a.Name}» → {a.Path}");
+        }
+        var source = await Task.Run(() => Engine.OpenVmdk(path, approved, sectorSize));
+        var entry = new SourceEntry(source, ImageFormat.VmdkDescriptor, false);
+        AddSource(entry);
+        Log($"Origen abierto en solo lectura: {path}, {source.Description} ({entry.Info.SizeBytes:N0} bytes, {entry.Info.SectorCount:N0} sectores de {entry.Info.SectorSize} B).");
+        return entry;
     }
 
     /// <summary>

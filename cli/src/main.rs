@@ -34,6 +34,7 @@ USO:
   memrescue-cli probe <fichero>
   memrescue-cli image-info <imagen> [ORIGEN] [--json]
   memrescue-cli split-list <imagen.001>
+  memrescue-cli vmdk-extents <descriptor.vmdk> [--json]
   memrescue-cli partitions <imagen> [ORIGEN] [--json] [--save-backup F [--overwrite]]
   memrescue-cli find-partitions <imagen> [ORIGEN] [--json] [--max-reads N]
                                 [--save-backup F [--overwrite]]
@@ -60,6 +61,11 @@ ORIGEN (opcional):
                      bloques con entradas inválidas o ambiguas se descartan y se tratan como
                      ilegibles (patrón de relleno, nunca datos); sin esta opción se rechazan
   --split            abrir la imagen dividida que empieza en <imagen.001> (ver split-list)
+  --extent NOMBRE=RUTA
+                     VMDK con descriptor separado: usar RUTA como el fichero que el descriptor
+                     declara con NOMBRE (exactamente, ver vmdk-extents). Repetible: hay que
+                     indicar cada extensión necesaria; el motor nunca abre otros ficheros
+                     (--extents-from-dir no existe: ver VMDK CON DESCRIPTOR SEPARADO)
   --range INI:NUM    trabajar solo con NUM sectores desde el LBA INI (partición o rango)
   --partition N      trabajar solo con la partición N (numeración de «partitions», desde 1);
                      no se combina con --range
@@ -164,8 +170,20 @@ FICHEROS NTFS BORRADOS (ntfs-deleted, ntfs-recover):
   se listan como POSIBLEMENTE SOBRESCRITOS con su dueño actual; los ilegibles llevan el patrón
   BAD!. Código de salida 3 si algún byte no es fiable.
 
-Formatos: RAW, VHD (fijo/dinámico), VHDX (fijo/dinámico), VMDK monolithicSparse e imágenes
-divididas. Tamaños de sector habituales: 512, 1024, 2048, 4096.
+VMDK CON DESCRIPTOR SEPARADO (vmdk-extents, --extent):
+  vmdk-extents lista las extensiones que declara el descriptor (monolithicFlat,
+  twoGbMaxExtentFlat, twoGbMaxExtentSparse o un descriptor con un único SPARSE): acceso, tipo,
+  sectores, desplazamiento, nombre declarado y si hace falta un fichero, sin abrir ninguna.
+  Para abrir el disco, indique cada extensión necesaria con --extent NOMBRE=RUTA. Los nombres
+  con ruta (absoluta, UNC, «..», separadores o de dispositivo) se rechazan aunque se indiquen.
+  Las extensiones NOACCESS se leen como ilegibles y las ZERO como dispersas. No existe una
+  opción para tomar todas las extensiones de un directorio: el descriptor podría nombrar
+  ficheros que el usuario no ha revisado, así que cada fichero debe nombrarse explícitamente
+  (ADR-018). Un disco con padre (parentFileNameHint) no se admite.
+
+Formatos: RAW, VHD (fijo/dinámico), VHDX (fijo/dinámico), VMDK monolithicSparse,
+streamOptimized y con descriptor separado (--extent), e imágenes divididas.
+Tamaños de sector habituales: 512, 1024, 2048, 4096.
 Códigos de salida: 0 correcto, 1 error de operación, 2 uso incorrecto,
 3 hay sectores no fiables (ilegibles o saltados; su contenido es un patrón de relleno),
 4 el origen no coincide con la copia del particionado (partition-backup-check).
@@ -212,6 +230,8 @@ struct Args {
     save_backup: Option<PathBuf>,
     /// Subárbol completo (`ntfs-ls -r`).
     recursive: bool,
+    /// Extensiones VMDK aprobadas (`--extent NOMBRE=RUTA`).
+    extents: Vec<(String, PathBuf)>,
 }
 
 /// Analiza `--skip-codes`: códigos positivos separados por comas (decimal o `0x…`), sin
@@ -282,6 +302,7 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
         overwrite: false,
         save_backup: None,
         recursive: false,
+        extents: Vec::new(),
     };
     while let Some(s) = it.next() {
         match s.as_str() {
@@ -309,6 +330,23 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
             "--force-raw" => a.force_raw = true,
             "--tolerant" => a.tolerant = true,
             "--split" => a.split = true,
+            "--extent" => {
+                let v = it.next().ok_or("falta el valor de --extent")?;
+                let (name, path) = v
+                    .split_once('=')
+                    .filter(|(n, p)| !n.is_empty() && !p.is_empty())
+                    .ok_or(format!("--extent debe ser NOMBRE=RUTA, no {v}"))?;
+                a.extents.push((name.to_string(), PathBuf::from(path)));
+            }
+            "--extents-from-dir" => {
+                return Err(
+                    "--extents-from-dir no está disponible a propósito: el motor nunca \
+                            abre los ficheros que nombra un descriptor sin que el usuario los \
+                            indique uno a uno (ADR-018). Liste las extensiones con vmdk-extents \
+                            e indique cada una con --extent NOMBRE=RUTA"
+                        .into(),
+                );
+            }
             "--range" => {
                 let v = it.next().ok_or("falta el valor de --range")?;
                 let (s, c) = v
@@ -393,7 +431,14 @@ fn open_src(a: &Args, p: &str) -> Result<Source, mr_api::ApiError> {
         force_raw: a.force_raw,
         tolerant: a.tolerant,
     };
-    let src = if a.split {
+    let src = if !a.extents.is_empty() {
+        if a.split || a.force_raw {
+            return Err(mr_api::ApiError::InvalidArgument(
+                "--extent no se combina con --split ni con --force-raw".into(),
+            ));
+        }
+        mr_api::open_vmdk_with_extents(p, &a.extents, opts)?
+    } else if a.split {
         mr_api::open_split_source(p, opts)?
     } else {
         mr_api::open_with(p, opts)?
@@ -434,6 +479,89 @@ fn open_src(a: &Args, p: &str) -> Result<Source, mr_api::ApiError> {
     match a.range {
         Some((start, count)) => mr_api::open_range(&src, start, count),
         None => Ok(src),
+    }
+}
+
+/// Lista de extensiones de un descriptor VMDK separado (no se abre ninguna).
+fn print_vmdk_extents(p: &mr_api::VmdkExtentPlan, json: bool) {
+    let issue_kind = |k: mr_api::VmdkIssueKind| match k {
+        mr_api::VmdkIssueKind::Corrupt => "corrupt",
+        mr_api::VmdkIssueKind::Unsupported => "unsupported",
+        mr_api::VmdkIssueKind::Parent => "parent",
+    };
+    let issue_json = |i: Option<&mr_api::VmdkExtentIssue>| match i {
+        Some(i) => format!(
+            "{{\"kind\":{},\"text\":{}}}",
+            json_str(issue_kind(i.kind)),
+            json_str(&i.text)
+        ),
+        None => "null".into(),
+    };
+    if json {
+        let ext: Vec<String> = p
+            .extents
+            .iter()
+            .map(|e| {
+                format!(
+                    "{{\"index\":{},\"access\":{},\"type\":{},\"sectors\":{},\"offset\":{},\"start_sector\":{},\"file_name\":{},\"needs_file\":{},\"issue\":{}}}",
+                    e.index + 1,
+                    json_str(mr_api::extent_access_name(e.access)),
+                    json_str(mr_api::extent_type_name(e.kind)),
+                    e.sectors,
+                    e.offset,
+                    e.start_sector,
+                    e.file_name.as_deref().map_or("null".into(), json_str),
+                    e.needs_file,
+                    issue_json(e.issue.as_ref())
+                )
+            })
+            .collect();
+        println!(
+            "{{\"create_type\":{},\"parent\":{},\"virtual_size\":{},\"openable\":{},\"issue\":{},\"extents\":[{}]}}",
+            p.create_type.as_deref().map_or("null".into(), json_str),
+            p.parent.as_deref().map_or("null".into(), json_str),
+            p.size,
+            p.is_openable(),
+            issue_json(p.first_issue()),
+            ext.join(",")
+        );
+        return;
+    }
+    println!("{} ({} bytes)", p.summary(), p.size);
+    for e in &p.extents {
+        let need = if e.needs_file {
+            "requiere fichero"
+        } else if e.access == mr_api::VmdkExtentAccess::NoAccess {
+            "no se abre (ilegible)"
+        } else {
+            "sin fichero"
+        };
+        println!(
+            "{:>4}  {:<8} {:<10} {:>14} sectores  desde {:>14}  desplazamiento {:>10}  {}  {}",
+            e.index + 1,
+            mr_api::extent_access_name(e.access),
+            mr_api::extent_type_name(e.kind),
+            e.sectors,
+            e.start_sector,
+            e.offset,
+            e.file_name
+                .as_deref()
+                .map_or("-".to_string(), |n| format!("\"{n}\"")),
+            need
+        );
+        if let Some(i) = &e.issue {
+            println!("      PROBLEMA: {}", i.text);
+        }
+    }
+    for i in &p.issues {
+        println!("PROBLEMA: {}", i.text);
+    }
+    if p.is_openable() {
+        eprintln!(
+            "No se ha abierto ninguna extensión. Para abrir el disco indique cada una con --extent NOMBRE=RUTA."
+        );
+    } else {
+        eprintln!("El descriptor no se puede abrir (ver PROBLEMA).");
     }
 }
 
@@ -855,6 +983,11 @@ fn run(args: Vec<String>) -> Result<(), (u8, String)> {
                 "todavía no soportado"
             };
             println!("{} ({soporte})", f.name());
+        }
+        "vmdk-extents" => {
+            let p = one(&a)?;
+            let plan = mr_api::vmdk_required_extents(&p).map_err(|e| op(&e))?;
+            print_vmdk_extents(&plan, a.json);
         }
         "split-list" => {
             let p = one(&a)?;

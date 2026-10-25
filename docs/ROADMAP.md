@@ -89,7 +89,9 @@ confirmación explícita del usuario o descomprimir; hoy se rechazan con errores
   descompresión acotada y granos dañados como ilegibles (`formatos/vmdk.md`, ADR-017, addendum).
 - ✔ Reproducción en memoria del registro pendiente de VHDX (#10): validación de entradas y descriptores,
   secuencia activa, superposición sin escribir el fichero, contrastada con qemu-img (`formatos/vhdx.md`).
-- VMDK multiextensión y flat con confirmación explícita (#11).
+- ✔ VMDK multiextensión y flat con confirmación explícita (#11): descriptor separado listado sin abrir
+  nada, cada extensión aprobada por el usuario (`ApprovedFiles`), nombres con ruta rechazados, NOACCESS
+  ilegible y ZERO disperso, contrastado con qemu-img (`formatos/vmdk.md`, ADR-018, addendum).
 
 ## M2 · Particiones: **TERMINADO 2026-10-18** (plan técnico en `PLAN_M2.md`)
 

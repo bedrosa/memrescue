@@ -158,3 +158,67 @@ fn corpus_images_read_identically_through_every_container() {
         );
     }
 }
+
+/// Incidencia 11: el corpus convertido a VMDK con descriptor separado (monolithicFlat y
+/// twoGbMaxExtentSparse) se lista sin abrir nada, no se abre sin aprobar las extensiones y, con
+/// cada fichero aprobado por su nombre, da los mismos bytes que el RAW. Los ficheros de
+/// extensión no se admiten como destino de una extracción.
+#[test]
+#[ignore = "requiere qemu-img y el corpus; lo ejecuta scripts/test.ps1"]
+fn corpus_images_through_separate_vmdk_descriptors() {
+    let dir = tempfile::tempdir().unwrap();
+    for (name, ss) in [("gpt_basic.img", 512u32), ("gpt_4kn.img", 4096)] {
+        let raw = corpus(name);
+        let raw_hash_before = file_sha256(&raw);
+        for sub in ["monolithicFlat", "twoGbMaxExtentSparse"] {
+            let out = dir.path().join(format!("{name}.{sub}.vmdk"));
+            convert(&raw, &out, "vmdk", &format!("subformat={sub}"));
+            assert!(matches!(
+                open_source(&out, ss),
+                Err(mr_api::ApiError::Io(
+                    mr_io::IoError::ExternalReference { .. }
+                ))
+            ));
+            let plan = mr_api::vmdk_required_extents(&out).unwrap();
+            assert!(plan.is_openable());
+            let extents: Vec<(String, PathBuf)> = plan
+                .required_names()
+                .map(|n| (n.to_string(), dir.path().join(n)))
+                .collect();
+            assert_eq!(extents.len(), 1);
+            let before: Vec<String> = extents.iter().map(|(_, p)| file_sha256(p)).collect();
+            assert!(matches!(
+                mr_api::open_vmdk_with_extents(&out, &[], mr_api::OpenOptions::default()),
+                Err(mr_api::ApiError::Io(
+                    mr_io::IoError::ExternalReference { .. }
+                ))
+            ));
+            // Nombre que no está en el descriptor: error del llamador.
+            let wrong = vec![("otro.vmdk".to_string(), extents[0].1.clone())];
+            assert!(matches!(
+                mr_api::open_vmdk_with_extents(&out, &wrong, mr_api::OpenOptions::default()),
+                Err(mr_api::ApiError::InvalidArgument(_))
+            ));
+            let src = mr_api::open_vmdk_with_extents(
+                &out,
+                &extents,
+                mr_api::OpenOptions {
+                    sector_size: ss,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(src.info().format, ImageFormat::VmdkDescriptor);
+            assert_eq!(src.info().sector_size, ss);
+            assert_eq!(sha256_of(src.as_ref()), raw_hash_before, "{name} {sub}");
+            assert_eq!(&read_sectors(src.as_ref(), 1, 1).unwrap()[..8], b"EFI PART");
+            assert!(mr_api::check_output_path(&src, &extents[0].1).is_err());
+            assert!(mr_api::check_output_path(&src, &out).is_err());
+            drop(src);
+            for ((_, p), b) in extents.iter().zip(before) {
+                assert_eq!(file_sha256(p), b, "extensión modificada");
+            }
+        }
+        assert_eq!(file_sha256(&raw), raw_hash_before);
+    }
+}

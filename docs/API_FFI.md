@@ -208,6 +208,36 @@ En C#: `Source.OpenNtfs()` devuelve `NtfsVolume` (`EngineHandle`: `Info`, `ListD
 `Resolve(path)`, `PathOf(record)`, `StartTree(orphans)` → `NtfsTreeTask.GetResult()`,
 `OpenStream(record, stream)` → `Source`, `StartCopy(record, path, stream, overwrite)` →
 `NtfsCopyTask.GetReport()`); `EngineStatus.NotFound` y `AlreadyExists`.
+## VMDK con descriptor separado (ampliación compatible de la ABI 3, issue #11, ADR-018)
+
+Funciones nuevas; ninguna firma, estructura ni significado existente cambia (`mr_source_open` sigue
+devolviendo `MR_ERR_EXTERNAL_REFERENCE` para un descriptor separado). Las extensiones solo se abren con
+una lista **explícita** de ficheros aprobados por el usuario; el motor nunca busca ni abre otros. Detalle
+en `formatos/vmdk.md` («Descriptor separado»).
+
+| Función | Descripción |
+|---|---|
+| `mr_vmdk_extents_list(path, path_len, out_list)` | Interpreta el descriptor **sin abrir ninguna extensión** y devuelve un handle de lista. Un fichero que no es un descriptor de texto → `MR_ERR_UNSUPPORTED_FEATURE`; texto que no se puede interpretar → `MR_ERR_CORRUPT`. Los problemas semánticos no fallan: se informan por `issue_kind` |
+| `mr_vmdk_extents_info(list, out)` | `mr_vmdk_extents_info` (32 B, versionada): nº de extensiones, nº que necesitan fichero, `flags` (`MR_VMDK_HAS_PARENT` 1, `MR_VMDK_OPENABLE` 2), tamaño virtual en bytes y clase del primer problema (`MR_VMDK_ISSUE_NONE` 0, `CORRUPT` 1, `UNSUPPORTED` 2, `PARENT` 3) |
+| `mr_vmdk_extents_describe(list, buf, cap, out_len)` | Tipo de disco y extensiones por tipo (texto) |
+| `mr_vmdk_extents_issue(list, buf, cap, out_len)` | Primer problema (cadena vacía si no hay) |
+| `mr_vmdk_extent_get(list, index, out)` | `mr_vmdk_extent` (48 B, versionada): `access` (`MR_VMDK_ACCESS_RW` 1, `RDONLY` 2, `NOACCESS` 3), `kind` (`MR_VMDK_EXTENT_SPARSE` 1, `FLAT` 2, `ZERO` 3, `VMFS` 4, `VMFSSPARSE` 5, `VMFSRDM` 6, `VMFSRAW` 7, `SESPARSE` 8), `flags` (`MR_VMDK_EXTENT_NEEDS_FILE` 1, `MR_VMDK_EXTENT_HAS_FILE_NAME` 2), sectores, desplazamiento (FLAT), primer sector virtual e `issue_kind` |
+| `mr_vmdk_extent_name(list, index, buf, cap, out_len)` | Nombre **exactamente** como lo declara el descriptor (vacío en ZERO): es el que se pasa en `mr_approved_file.name` |
+| `mr_vmdk_extent_issue(list, index, buf, cap, out_len)` | Problema de la extensión (vacío si no hay) |
+| `mr_vmdk_extents_free(list)` | Libera la lista |
+| `mr_source_open_vmdk(path, path_len, sector_size, flags, files, count, out_source)` | Abre el disco con **solo** los `count` ficheros de `files` (`mr_approved_file`, 40 B en 64 bits, versionada: `struct_size`, `reserved` = 0, `name`/`name_len` y `path`/`path_len` en UTF-8; `files` puede ser `NULL` con `count` = 0; como mucho `MR_MAX_APPROVED_FILES` = 32 768). `flags`: 0 o `MR_OPEN_TOLERANT` (para las extensiones SPARSE); `MR_OPEN_FORCE_RAW` y `MR_OPEN_SPLIT` → `MR_ERR_INVALID_ARGUMENT`. Se cierra con `mr_source_close` |
+
+Errores de `mr_source_open_vmdk`: extensión necesaria sin fichero aprobado → `MR_ERR_EXTERNAL_REFERENCE`
+(con los nombres que faltan); nombre del descriptor que no es un nombre de fichero simple (ruta absoluta,
+UNC, `..`, separadores, dispositivo) → `MR_ERR_UNSUPPORTED_FEATURE` aunque se apruebe; lista mal formada
+(`struct_size` o `reserved` incorrectos, nombre vacío o repetido, dos nombres con el mismo fichero,
+nombre que no corresponde a una extensión necesaria, el propio descriptor) → `MR_ERR_INVALID_ARGUMENT`;
+ruta de dispositivo → `MR_ERR_PATH_REJECTED`; fichero FLAT que no cubre su extensión o extensión SPARSE
+no válida → `MR_ERR_CORRUPT`; disco con padre → `MR_ERR_EXTERNAL_REFERENCE`. Las extensiones NOACCESS se
+leen como `MR_SECTOR_UNREADABLE` (estricto: error) y las ZERO como `MR_SECTOR_SPARSE`. En C#:
+`Engine.ListVmdkExtents(path)` (`VmdkExtentList` con `VmdkExtent`, `RequiredNames`, `Openable`, `Issue`;
+el handle se libera dentro) y `Engine.OpenVmdk(path, [new ApprovedExtent(nombre, ruta), …], sectorSize,
+tolerant)` (las cadenas se fijan en memoria durante la llamada, sin `unsafe`).
 
 ## Modo tolerante de contenedores (`MR_OPEN_TOLERANT`, ADR-020)
 
