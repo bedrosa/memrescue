@@ -42,6 +42,8 @@ pub const MR_ERR_UNSUPPORTED_FEATURE: i32 = 14;
 pub const MR_ERR_NOT_FOUND: i32 = 15;
 /// La salida ya existe y no se pidió sustituirla (#22).
 pub const MR_ERR_ALREADY_EXISTS: i32 = 16;
+/// Un fichero externo aprobado por el usuario no corresponde al contenedor (ADR-018, addendum).
+pub const MR_ERR_EXTERNAL_MISMATCH: i32 = 17;
 
 /// `mr_source_open`: leer como RAW aunque parezca un contenedor.
 pub const MR_OPEN_FORCE_RAW: u32 = 1;
@@ -50,6 +52,11 @@ pub const MR_OPEN_SPLIT: u32 = 2;
 /// `mr_source_open`: modo tolerante para contenedores con estructuras de asignación parcialmente
 /// dañadas (ADR-020). Compatible con la ABI 3: es un bit nuevo de `flags`.
 pub const MR_OPEN_TOLERANT: u32 = 4;
+/// `mr_source_open_ex`: aceptar ficheros externos cuyo vínculo de identidad con el contenedor no
+/// coincide (petición explícita del usuario; la descripción del origen lo advierte).
+pub const MR_OPEN_IGNORE_LINK_MISMATCH: u32 = 8;
+/// Máximo de elementos de `MrOpenOptions::externals`.
+pub const MR_MAX_EXTERNAL_FILES: u32 = 64;
 /// `mr_source_verify_start`: leer hacia atrás tras un salto.
 pub const MR_VERIFY_READ_BACK: u32 = 1;
 /// Máximo de reintentos por sector aceptado en la frontera C.
@@ -380,6 +387,33 @@ pub struct MrReadOptions {
     pub reserved: u32,
 }
 
+/// Cadena UTF-8 de entrada (puntero y longitud en bytes, sin terminador), 16 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct MrStr {
+    pub ptr: *const u8,
+    pub len: usize,
+}
+
+/// Opciones de `mr_source_open_ex` (32 bytes). Mismo esquema de versión que `MrVerifyOptions`:
+/// `struct_size` = `sizeof(mr_open_options)` de la cabecera del llamador.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct MrOpenOptions {
+    pub struct_size: u32,
+    /// `MR_OPEN_FORCE_RAW | MR_OPEN_SPLIT | MR_OPEN_TOLERANT | MR_OPEN_IGNORE_LINK_MISMATCH`.
+    pub flags: u32,
+    /// Tamaño de sector lógico (0 = nativo).
+    pub sector_size: u32,
+    /// Número de elementos de `externals` (≤ 64).
+    pub external_count: u32,
+    /// Ficheros externos aprobados por el usuario, en orden (padre inmediato primero); nulo si
+    /// `external_count` = 0.
+    pub externals: *const MrStr,
+    /// Reservado: debe ser 0.
+    pub reserved: u64,
+}
+
 thread_local! {
     static LAST_ERROR: RefCell<String> = const { RefCell::new(String::new()) };
 }
@@ -399,6 +433,7 @@ fn io_error_code(e: &IoError) -> i32 {
         IoError::UnsupportedFormat(_) => MR_ERR_UNSUPPORTED_FORMAT,
         IoError::UnsupportedFeature { .. } => MR_ERR_UNSUPPORTED_FEATURE,
         IoError::ExternalReference { .. } => MR_ERR_EXTERNAL_REFERENCE,
+        IoError::ExternalMismatch { .. } => MR_ERR_EXTERNAL_MISMATCH,
         IoError::Corrupt { .. } => MR_ERR_CORRUPT,
         IoError::InvalidRange { .. }
         | IoError::OutOfBounds { .. }
@@ -781,6 +816,133 @@ pub unsafe extern "C" fn mr_source_open(
             Ok(src) => unsafe { write_out(out_source, insert(Entry::Source(src))) },
             Err(e) => api_fail(&e),
         }
+    })
+}
+
+/// Abre un origen con opciones versionadas y la lista de **ficheros externos aprobados** por el
+/// usuario (hoy, la cadena de padres de un disco diferencial VHD/VHDX, del inmediato al base).
+/// `flags` admite los de `mr_source_open` más `MR_OPEN_IGNORE_LINK_MISMATCH`; con
+/// `MR_OPEN_SPLIT` no se admiten ficheros externos. Ampliación compatible de la ABI 3.
+///
+/// # Safety
+/// `path` UTF-8 de `path_len` bytes; `options` apunta a un `MrOpenOptions` con `struct_size`
+/// escrito; `externals` con `external_count` elementos válidos (o nulo si es 0), cada uno con una
+/// cadena UTF-8 legible; `out_source` puntero válido.
+#[no_mangle]
+pub unsafe extern "C" fn mr_source_open_ex(
+    path: *const u8,
+    path_len: usize,
+    options: *const MrOpenOptions,
+    out_source: *mut u64,
+) -> i32 {
+    guard(|| {
+        if out_source.is_null() || options.is_null() {
+            return fail(MR_ERR_INVALID_ARGUMENT, "puntero nulo");
+        }
+        // Se lee primero solo `struct_size`, para no leer más allá de una estructura más pequeña.
+        // SAFETY: `options` no es nulo y contiene al menos su primer campo.
+        let size = unsafe { options.cast::<u32>().read_unaligned() };
+        let expected = std::mem::size_of::<MrOpenOptions>();
+        if size as usize != expected {
+            return fail(
+                MR_ERR_INVALID_ARGUMENT,
+                format!("tamaño de mr_open_options no válido: {size} (se esperaba {expected})"),
+            );
+        }
+        // SAFETY: el tamaño declarado coincide con el de la estructura.
+        let o = unsafe { options.read_unaligned() };
+        let known =
+            MR_OPEN_FORCE_RAW | MR_OPEN_SPLIT | MR_OPEN_TOLERANT | MR_OPEN_IGNORE_LINK_MISMATCH;
+        if o.flags & !known != 0 || o.reserved != 0 {
+            return fail(MR_ERR_INVALID_ARGUMENT, "opciones de apertura no válidas");
+        }
+        let count = o.external_count as usize;
+        if count > MR_MAX_EXTERNAL_FILES as usize {
+            return fail(
+                MR_ERR_INVALID_ARGUMENT,
+                format!("demasiados ficheros externos ({count})"),
+            );
+        }
+        if count > 0 && o.externals.is_null() {
+            return fail(MR_ERR_INVALID_ARGUMENT, "lista de ficheros externos nula");
+        }
+        if count > 0 && o.flags & MR_OPEN_SPLIT != 0 {
+            return fail(
+                MR_ERR_INVALID_ARGUMENT,
+                "una imagen dividida no admite ficheros externos",
+            );
+        }
+        let mut paths: Vec<&str> = Vec::with_capacity(count);
+        for i in 0..count {
+            // SAFETY: `externals` tiene `count` elementos por contrato.
+            let s = unsafe { o.externals.add(i).read_unaligned() };
+            // SAFETY: contrato del llamador sobre cada cadena.
+            match unsafe { read_utf8(s.ptr, s.len) } {
+                Ok(p) if !p.is_empty() => paths.push(p),
+                Ok(_) => return fail(MR_ERR_INVALID_ARGUMENT, "ruta de fichero externo vacía"),
+                Err(c) => return c,
+            }
+        }
+        // SAFETY: contrato del llamador.
+        let p = match unsafe { read_utf8(path, path_len) } {
+            Ok(p) => p,
+            Err(c) => return c,
+        };
+        let opts = OpenOptions {
+            sector_size: o.sector_size,
+            force_raw: o.flags & MR_OPEN_FORCE_RAW != 0,
+            tolerant: o.flags & MR_OPEN_TOLERANT != 0,
+        };
+        let r = if o.flags & MR_OPEN_SPLIT != 0 {
+            mr_api::open_split_source(p, opts)
+        } else {
+            mr_api::open_with_parents(p, opts, &paths, o.flags & MR_OPEN_IGNORE_LINK_MISMATCH != 0)
+        };
+        match r {
+            // SAFETY: `out_source` no es nulo.
+            Ok(src) => unsafe { write_out(out_source, insert(Entry::Source(src))) },
+            Err(e) => api_fail(&e),
+        }
+    })
+}
+
+/// Indicaciones del contenedor sobre los ficheros externos que necesita (padre de un disco
+/// diferencial VHD/VHDX), **sin abrir ningún otro fichero**: una línea `clave\tvalor` por
+/// indicación (valores saneados: sin caracteres de control). Cadena vacía y `out_count` = 0 si
+/// la imagen no necesita ficheros externos.
+///
+/// # Safety
+/// `path` UTF-8 de `path_len` bytes; contrato de cadenas de salida; `out_count` válido o nulo.
+#[no_mangle]
+pub unsafe extern "C" fn mr_image_external_hints(
+    path: *const u8,
+    path_len: usize,
+    buf: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+    out_count: *mut u32,
+) -> i32 {
+    guard(|| {
+        // SAFETY: contrato del llamador.
+        let p = match unsafe { read_utf8(path, path_len) } {
+            Ok(p) => p,
+            Err(c) => return c,
+        };
+        let hints = match mr_api::external_hints(p) {
+            Ok(h) => h,
+            Err(e) => return api_fail(&e),
+        };
+        if !out_count.is_null() {
+            // SAFETY: puntero válido por contrato.
+            unsafe { *out_count = u32::try_from(hints.len()).unwrap_or(u32::MAX) };
+        }
+        let text = hints
+            .iter()
+            .map(|h| format!("{}\t{}", h.key, h.value))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // SAFETY: contrato del llamador.
+        unsafe { write_str(&text, buf, cap, out_len) }
     })
 }
 

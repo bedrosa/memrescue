@@ -123,6 +123,13 @@ pub enum IoError {
         format: &'static str,
         reference: String,
     },
+    /// Un fichero externo que indicó el usuario no corresponde al que necesita el contenedor
+    /// (identificador del padre, tamaño virtual, sector, ciclo o cadena demasiado larga…).
+    #[error("{format}: el fichero externo indicado no corresponde: {detail}")]
+    ExternalMismatch {
+        format: &'static str,
+        detail: String,
+    },
 }
 
 impl IoError {

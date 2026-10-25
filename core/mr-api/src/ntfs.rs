@@ -192,6 +192,7 @@ pub fn ntfs_stream_source(
             description,
             segments: p.segments.clone(),
             range: None,
+            external_files: p.external_files.clone(),
         },
     )))
 }

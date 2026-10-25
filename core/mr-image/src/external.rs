@@ -20,6 +20,12 @@
 //!
 //! Cada formato decide además qué nombres declarados acepta (el VMDK rechaza rutas absolutas,
 //! UNC, de dispositivo o con separadores antes de consultar la lista).
+//!
+//! Lo que el contenedor dice de esos ficheros (nombres, rutas, identificadores) es un
+//! [`ExternalHint`]: texto saneado y acotado solo para mostrarlo al usuario; nunca se interpreta
+//! como ruta ni se usa para abrir nada. Discos diferenciales VHD/VHDX (incidencia 8): los padres se
+//! aprueban con los papeles `parent:1` (padre inmediato), `parent:2`… (ver
+//! `crate::differencing::parent_role`).
 
 use mr_io::path_policy::{admit, open_regular_file};
 use mr_io::{IoError, Result};
@@ -36,6 +42,46 @@ fn invalid(detail: String) -> IoError {
         std::io::ErrorKind::InvalidInput,
         detail,
     ))
+}
+
+/// Longitud máxima (en caracteres) del texto de una indicación.
+pub const MAX_HINT_CHARS: usize = 512;
+
+/// Indicación, tomada del contenedor, sobre un fichero externo que necesita. Solo informativa.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalHint {
+    /// Clave estable que dice qué es el valor (p. ej. `parent_unique_id`, `relative_path`).
+    pub key: String,
+    /// Valor saneado (sin caracteres de control) y truncado a [`MAX_HINT_CHARS`].
+    pub value: String,
+}
+
+impl ExternalHint {
+    /// Indicación con clave y valor saneados.
+    pub fn new(key: &str, value: &str) -> Self {
+        Self {
+            key: sanitize(key),
+            value: sanitize(value),
+        }
+    }
+}
+
+/// Texto del fichero convertido en algo seguro para mostrarlo: caracteres de control escapados y
+/// longitud acotada a [`MAX_HINT_CHARS`]. Nunca se interpreta como ruta.
+pub fn sanitize(s: &str) -> String {
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i >= MAX_HINT_CHARS {
+            out.push('…');
+            break;
+        }
+        if c.is_control() || c == '\u{feff}' {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Un fichero aprobado: papel (nombre declarado), ruta canónica y fichero abierto en solo lectura.
@@ -212,5 +258,15 @@ mod tests {
         assert!(ApprovedFiles::new([("x", dir.path().join("no-existe.vmdk"))]).is_err());
         // Los ficheros no cambian.
         assert_eq!(std::fs::read(&a).unwrap(), vec![1u8; 512]);
+    }
+
+    #[test]
+    fn hints_are_sanitized_and_bounded() {
+        let h = ExternalHint::new("relative_path", "..\\a\u{0}b\nc\u{feff}");
+        assert_eq!(h.value, "..\\a\\u{0}b\\nc\\u{feff}");
+        let long = "x".repeat(MAX_HINT_CHARS + 10);
+        let h = ExternalHint::new("k", &long);
+        assert_eq!(h.value.chars().count(), MAX_HINT_CHARS + 1);
+        assert!(h.value.ends_with('…'));
     }
 }

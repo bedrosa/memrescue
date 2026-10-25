@@ -7,6 +7,9 @@
 //! - [`discover_split`] / [`open_split_source`]: imágenes divididas (apertura explícita).
 //! - [`vmdk_required_extents`] / [`open_vmdk_with_extents`]: VMDK con descriptor separado; las
 //!   extensiones solo se abren si el usuario aprueba cada fichero (#11).
+//! - [`external_hints`] / [`open_with_parents`]: discos diferenciales
+//!   VHD/VHDX; el contenedor solo da indicaciones sobre su padre y la cadena se abre con los
+//!   ficheros que el usuario eligió y confirmó (ADR-018, addendum).
 //! - [`open_range`]: un rango de sectores de otro origen como origen propio.
 //! - [`partitions`]: tabla de particiones del origen (MBR/EBR, MBR protector o híbrido) con la
 //!   confianza y las anomalías de cada partición; [`open_partition`]: una partición como origen.
@@ -59,6 +62,7 @@ pub use mr_image::vmdk_extents::{
 use mr_image::ApprovedFiles;
 /// Máximo de ficheros aprobados en [`open_vmdk_with_extents`].
 pub const MAX_VMDK_APPROVED_FILES: usize = mr_image::external::MAX_APPROVED_FILES;
+pub use mr_image::ExternalHint;
 pub use mr_image::OpenOptions;
 pub use mr_part;
 pub use mr_part::search::{SearchOptions, SearchResult};
@@ -112,6 +116,7 @@ impl OpenSource {
             description: meta.description,
             segments: meta.segments,
             range: meta.range,
+            external_files: meta.external_files,
         };
         Self { dev, info }
     }
@@ -147,6 +152,7 @@ struct Meta {
     description: String,
     segments: Vec<PathBuf>,
     range: Option<(u64, u64)>,
+    external_files: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -169,6 +175,9 @@ pub struct ImageInfo {
     /// Si el origen es un rango de otro: `(LBA inicial, nº de sectores)` relativos al origen padre
     /// (en sectores del padre).
     pub range: Option<(u64, u64)>,
+    /// Ficheros externos que usa el origen (rutas canónicas): la cadena de padres de un disco
+    /// diferencial, del inmediato al base. Vacío en los demás casos.
+    pub external_files: Vec<PathBuf>,
 }
 
 impl From<OpenedImage> for OpenSource {
@@ -182,6 +191,7 @@ impl From<OpenedImage> for OpenSource {
                 description: o.description,
                 segments: o.segments,
                 range: None,
+                external_files: o.external_files,
             },
         )
     }
@@ -209,6 +219,44 @@ pub fn open_with(path: impl AsRef<Path>, opts: OpenOptions) -> Result<Source> {
     Ok(Arc::new(mr_image::open_image(path.as_ref(), opts)?.into()))
 }
 
+/// Abre un disco diferencial VHD/VHDX con la cadena de padres que el usuario aprobó
+/// explícitamente: `parents` en orden (padre inmediato primero, hasta el disco base). Cada ruta
+/// pasa la política de rutas y se abre en solo lectura (`mr_image::ApprovedFiles`, papeles
+/// `parent:1`, `parent:2`…); el motor valida cada padre (formato, tamaño, sector, vínculo de
+/// identidad, ciclos, profundidad ≤ 16) y nunca abre otro fichero. Con `ignore_link_mismatch`
+/// (petición explícita del usuario; por defecto no) se acepta un padre cuyo identificador no
+/// coincide y la descripción del origen lo advierte. Una lista mal formada (el mismo fichero dos
+/// veces) es `InvalidArgument`; si la imagen no es diferencial y la lista no está vacía, falla.
+pub fn open_with_parents<P: AsRef<Path>>(
+    path: impl AsRef<Path>,
+    opts: OpenOptions,
+    parents: &[P],
+    ignore_link_mismatch: bool,
+) -> Result<Source> {
+    let invalid = |e: mr_io::IoError| match e {
+        mr_io::IoError::Io(io) if io.kind() == std::io::ErrorKind::InvalidInput => {
+            ApiError::InvalidArgument(io.to_string())
+        }
+        other => ApiError::Io(other),
+    };
+    let approved = mr_image::ApprovedFiles::new(
+        parents
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (mr_image::parent_role(i + 1), p.as_ref())),
+    )
+    .map_err(invalid)?;
+    let opened =
+        mr_image::open_image_with_parents(path.as_ref(), opts, &approved, ignore_link_mismatch)?;
+    Ok(Arc::new(opened.into()))
+}
+
+/// Indicaciones del contenedor sobre los ficheros externos que necesita (padre de un disco
+/// diferencial), sin abrir ningún otro fichero. Vacío si no necesita ninguno.
+pub fn external_hints(path: impl AsRef<Path>) -> Result<Vec<ExternalHint>> {
+    Ok(mr_image::external_hints(path.as_ref())?)
+}
+
 /// Presenta un dispositivo ya construido (en memoria, virtual o con fallos simulados) como origen,
 /// con `description` como descripción legible. Se interpreta como RAW y no tiene ruta.
 pub fn source_from_device(dev: Arc<dyn BlockDevice>, description: impl Into<String>) -> Source {
@@ -221,6 +269,7 @@ pub fn source_from_device(dev: Arc<dyn BlockDevice>, description: impl Into<Stri
             description: description.into(),
             segments: Vec::new(),
             range: None,
+            external_files: Vec::new(),
         },
     ))
 }
@@ -296,6 +345,7 @@ fn open_view(
             description,
             segments: p.segments.clone(),
             range: Some((start_lba, count)),
+            external_files: p.external_files.clone(),
         },
     )))
 }
@@ -523,7 +573,11 @@ pub fn check_output_path(src: &Source, out: &Path) -> Result<()> {
         let c = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
         c.to_string_lossy().to_lowercase() == canon.to_string_lossy().to_lowercase()
     };
-    if same(&info.path) || info.segments.iter().any(|s| same(s)) {
+    // Los padres de un disco diferencial también son el origen.
+    if same(&info.path)
+        || info.segments.iter().any(|s| same(s))
+        || info.external_files.iter().any(|s| same(s))
+    {
         return Err(ApiError::InvalidArgument(format!(
             "la salida {} es el propio origen: nunca se escribe sobre él",
             out.display()

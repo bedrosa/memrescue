@@ -26,7 +26,7 @@ La implementación es original y se basa solo en ese documento. Todos los entero
 |---|---|---|
 | Fijo | 2 | Datos en `fichero[0..current_size]`, pie a continuación. `describe()` → «VHD fijo». |
 | Dinámico | 3 | BAT + bloques. `describe()` → «VHD dinámico, bloques de 2 MiB». |
-| Diferencial | 4 | `IoError::ExternalReference` con el nombre del padre (o su id). **Nunca se abre el padre.** |
+| Diferencial | 4 | Sin padres indicados: `IoError::ExternalReference` con el nombre del padre (o su id); **nunca se abre el padre por su cuenta**. Con la cadena de padres que indica el usuario (`open_image_with_parents` + `ApprovedFiles` con papeles `parent:N`, #8): «VHD diferencial, bloques de 4 KiB; padre 1: … (VHD dinámico, …)». |
 | Ninguno / reservados | 0, 1, 5, 6 | `IoError::UnsupportedFeature`. |
 | Otros | - | `IoError::Corrupt`. |
 
@@ -72,9 +72,27 @@ La implementación es original y se basa solo en ese documento. Todos los entero
   caso los bloques se validan contra el tamaño completo del fichero, ya que no se sabe si el pie final
   llegó a escribirse. `describe()` añade «pie final dañado: se usa la copia del byte 0».
 - **Último bloque**: solo se exige que quepa en el fichero la parte que cubre el tamaño virtual.
-- **Diferenciales**: el nombre del padre se lee de la cabecera dinámica (UTF-16BE, hasta el primer
-  nulo). Si está vacío se usa el id del padre; si la cabecera está dañada se devuelve igualmente
-  `ExternalReference` con el motivo. No se interpretan los localizadores ni se accede a otros ficheros.
+- **Diferenciales** (incidencia 8, ADR-018 con su addendum, módulo `differencing.rs`): sin padres
+  indicados, el nombre del padre se lee de la cabecera dinámica (UTF-16BE, hasta el primer nulo); si
+  está vacío se usa el id del padre; si la cabecera está dañada se devuelve igualmente
+  `ExternalReference` con el motivo. Con la cadena de padres que indica el usuario:
+  - **Indicaciones** (`external_hints`, nunca se usan como rutas): `parent_name`, `parent_unique_id`,
+    `parent_timestamp` (fecha UTC) y un `locator_<código>` por localizador de la cabecera dinámica
+    (8 entradas de 24 bytes desde el byte 576: código, espacio, longitud, desplazamiento). Se
+    decodifican `W2ru`/`W2ku` (UTF-16LE), `Wi2r`/`Wi2k` y `MacX` (bytes hasta el primer nulo) y `Mac `
+    se describe por su tamaño; datos fuera del fichero, vacíos o de más de 64 KiB se describen con el
+    motivo entre paréntesis (no impiden abrir).
+  - **Vínculo**: el id único del pie del padre (bytes 68–83) debe ser el «Parent Unique ID» del hijo
+    (bytes 40–55 de la cabecera dinámica); si no, `ExternalMismatch` salvo petición explícita. La
+    «Parent Time Stamp» (bytes 56–59) es, según la especificación, la fecha de modificación del fichero
+    del padre: se compara con la del fichero y una diferencia solo se anota en la descripción (copiar el
+    fichero la cambia).
+  - **Cadena**: el padre de un VHD es otro VHD (fijo, dinámico o diferencial); mismo tamaño virtual y
+    sector; sin ciclos (ruta canónica e id único) y como mucho 16 padres.
+  - **Lectura**: un bloque sin asignar y los sectores con su bit a 0 en el mapa de bits se leen del padre
+    (sector a sector, con el desplazamiento virtual, que es el mismo en toda la cadena); los de bit a 1,
+    del fichero. `allocation` da `Data` para lo escrito en la capa y lo que diga el padre para el resto.
+    Un bloque descartado en modo tolerante sigue leyéndose con error: nunca con los datos del padre.
 - Campos que no se usan: geometría CHS, marca de tiempo, creador, *saved state*, *features*.
 
 ## Modo tolerante (ADR-020)
@@ -126,6 +144,9 @@ e inmutabilidad (hash, tamaño y fecha); sin daños = estricto; estructuras crí
 en ambos modos. Con qemu-img: `qemu_dynamic_with_damaged_bat_entry_in_tolerant_mode` daña la entrada
 de un bloque con datos y compara el resto con la conversión de referencia.
 
+Discos diferenciales (#8): ver `vhdx.md`, «Discos diferenciales», que describe las pruebas comunes a
+VHD y VHDX (`differencing_tests.rs`, `differencing_qemu.rs`).
+
 Integración contra **qemu-img 11.1.2** como referencia independiente
 (`core/mr-image/tests/vhd_qemu.rs`, marcadas `#[ignore]`; se ejecutan con
 `cargo test -p mr-image --test vhd_qemu -- --ignored`). Ruta de qemu-img: `MR_QEMU_IMG` o
@@ -156,7 +177,10 @@ warnings` y `cargo fmt --all -- --check` sin avisos.
 
 ## Limitaciones conocidas
 
-- No se leen discos diferenciales (ni cadenas de padres); solo se informa del padre.
+- Los diferenciales solo se han probado con hijos sintéticos construidos según la especificación sobre
+  bases escritas por qemu-img: qemu-img 11.1.2 no crea diferenciales VHD («Backing file not supported
+  for file format 'vpc'») y abre uno de tipo 4 como si fuera dinámico, sin padre, así que no sirve de
+  referencia para la cadena. Falta probar con diferenciales escritos por Hyper-V o Virtual PC.
 - En modo estricto (por defecto) una sola entrada de BAT inválida impide abrir la imagen; el modo
   tolerante (explícito) descarta solo los bloques afectados.
 - No se usan los localizadores de padre ni el campo *saved state*.

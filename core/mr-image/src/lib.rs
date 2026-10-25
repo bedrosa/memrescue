@@ -18,6 +18,11 @@
 
 mod budget;
 pub mod crc32c;
+#[cfg(test)]
+mod diff_builder;
+pub mod differencing;
+#[cfg(test)]
+mod differencing_tests;
 pub mod external;
 pub mod open;
 pub mod split;
@@ -29,10 +34,11 @@ pub mod vmdk;
 pub mod vmdk_extents;
 mod vmdk_stream;
 
-pub use external::ApprovedFiles;
+pub use differencing::parent_role;
+pub use external::{ApprovedFiles, ExternalHint};
 pub use open::{
-    list_vmdk_extents, open_image, open_split, open_vmdk_extents, OpenOptions, OpenedImage,
-    Reblocked,
+    external_hints, list_vmdk_extents, open_image, open_image_with_parents, open_split,
+    open_vmdk_extents, OpenOptions, OpenedImage, Reblocked,
 };
 
 /// Límite de memoria para tablas de asignación (BAT, directorios de grano…).

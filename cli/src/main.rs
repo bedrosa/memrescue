@@ -14,8 +14,8 @@ use mr_api::mr_part::search::{Check, FoundTableKind, FoundVolume, SearchStatus};
 use mr_api::mr_part::{Anomaly, Confidence, Origin, PartitionKind, Scheme, Severity};
 use mr_api::task::TaskState;
 use mr_api::{
-    HashOptions, ImageInfo, OpenOptions, Partition, PartitionTable, SearchOptions, SearchResult,
-    Source, VerifyOptions,
+    ExternalHint, HashOptions, ImageInfo, OpenOptions, Partition, PartitionTable, SearchOptions,
+    SearchResult, Source, VerifyOptions,
 };
 use mr_common::HashAlgorithm;
 use mr_io::resilient::{OnError, ReadPolicy};
@@ -66,6 +66,14 @@ ORIGEN (opcional):
                      declara con NOMBRE (exactamente, ver vmdk-extents). Repetible: hay que
                      indicar cada extensión necesaria; el motor nunca abre otros ficheros
                      (--extents-from-dir no existe: ver VMDK CON DESCRIPTOR SEPARADO)
+  --parent RUTA      disco padre de un VHD/VHDX diferencial; se repite para cada nivel, del
+                     padre inmediato al disco base (image-info muestra lo que el diferencial dice
+                     de su padre). Nunca se abre un padre que no se indique aquí. Se comprueba
+                     que cada padre corresponde (identificador, tamaño y sector) y se rechazan
+                     ciclos y cadenas de más de 16 padres.
+  --ignore-parent-mismatch
+                     con --parent: aceptar un padre cuyo identificador no coincide con el que
+                     guarda el diferencial (NO recomendado; la descripción lo advierte)
   --range INI:NUM    trabajar solo con NUM sectores desde el LBA INI (partición o rango)
   --partition N      trabajar solo con la partición N (numeración de «partitions», desde 1);
                      no se combina con --range
@@ -201,6 +209,9 @@ struct Args {
     force_raw: bool,
     tolerant: bool,
     split: bool,
+    /// Cadena de padres de un disco diferencial (padre inmediato primero).
+    parents: Vec<PathBuf>,
+    ignore_parent_mismatch: bool,
     range: Option<(u64, u64)>,
     /// Partición (desde 1) con la que trabajar.
     partition: Option<usize>,
@@ -285,6 +296,8 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
         force_raw: false,
         tolerant: false,
         split: false,
+        parents: Vec::new(),
+        ignore_parent_mismatch: false,
         range: None,
         partition: None,
         apply_shift: false,
@@ -347,6 +360,10 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
                         .into(),
                 );
             }
+            "--parent" => a
+                .parents
+                .push(it.next().ok_or("falta el valor de --parent")?.into()),
+            "--ignore-parent-mismatch" => a.ignore_parent_mismatch = true,
             "--range" => {
                 let v = it.next().ok_or("falta el valor de --range")?;
                 let (s, c) = v
@@ -440,9 +457,20 @@ fn open_src(a: &Args, p: &str) -> Result<Source, mr_api::ApiError> {
         mr_api::open_vmdk_with_extents(p, &a.extents, opts)?
     } else if a.split {
         mr_api::open_split_source(p, opts)?
+    } else if !a.parents.is_empty() {
+        mr_api::open_with_parents(p, opts, &a.parents, a.ignore_parent_mismatch)?
     } else {
         mr_api::open_with(p, opts)?
     };
+    for (i, f) in src.info().external_files.iter().enumerate() {
+        eprintln!("Padre {}: {} (solo lectura)", i + 1, f.display());
+    }
+    if src.info().description.contains("NO verificado") {
+        eprintln!(
+            "AVISO: se aceptó un padre cuyo identificador no coincide (--ignore-parent-mismatch). \
+             Los datos pueden no corresponder al disco original."
+        );
+    }
     // Modo tolerante (petición explícita): aviso visible en la salida de errores.
     if a.tolerant && src.info().description.contains("modo tolerante") {
         eprintln!(
@@ -842,15 +870,43 @@ fn print_partitions(t: &PartitionTable, json: bool) {
     }
 }
 
-fn print_info(i: &ImageInfo, json: bool) {
+/// Indicaciones sobre ficheros externos en JSON: `[{"key":…,"value":…},…]`.
+fn hints_json(h: &[ExternalHint]) -> String {
+    let v: Vec<String> = h
+        .iter()
+        .map(|x| {
+            format!(
+                "{{\"key\":{},\"value\":{}}}",
+                json_str(&x.key),
+                json_str(&x.value)
+            )
+        })
+        .collect();
+    format!("[{}]", v.join(","))
+}
+
+/// Indicaciones sobre el padre de un disco diferencial, en texto.
+fn print_hints(h: &[ExternalHint]) {
+    println!("Disco diferencial: el padre referenciado (solo indicaciones; no se abre) es:");
+    for x in h {
+        println!("  {:<20} {}", x.key, x.value);
+    }
+}
+
+fn print_info(i: &ImageInfo, hints: &[ExternalHint], json: bool) {
     if json {
         let segs: Vec<String> = i
             .segments
             .iter()
             .map(|s| json_str(&s.display().to_string()))
             .collect();
+        let parents: Vec<String> = i
+            .external_files
+            .iter()
+            .map(|s| json_str(&s.display().to_string()))
+            .collect();
         println!(
-            "{{\"path\":{},\"format\":{},\"description\":{},\"size_bytes\":{},\"sector_size\":{},\"sector_count\":{},\"trailing_bytes\":{},\"segments\":[{}],\"range\":{}}}",
+            "{{\"path\":{},\"format\":{},\"description\":{},\"size_bytes\":{},\"sector_size\":{},\"sector_count\":{},\"trailing_bytes\":{},\"segments\":[{}],\"range\":{},\"parents\":[{}],\"external_hints\":{}}}",
             json_str(&i.path.display().to_string()),
             json_str(i.format.name()),
             json_str(&i.description),
@@ -862,13 +918,21 @@ fn print_info(i: &ImageInfo, json: bool) {
             match i.range {
                 Some((s, c)) => format!("[{s},{c}]"),
                 None => "null".into(),
-            }
+            },
+            parents.join(","),
+            hints_json(hints)
         );
     } else {
         println!("Imagen:          {}", i.path.display());
         println!("Formato:         {}", i.description);
         if !i.segments.is_empty() {
             println!("Segmentos:       {}", i.segments.len());
+        }
+        for (n, f) in i.external_files.iter().enumerate() {
+            println!("Padre {:<10}{}", format!("{}:", n + 1), f.display());
+        }
+        if !hints.is_empty() {
+            print_hints(hints);
         }
         println!("Tamaño:          {} bytes", i.size_bytes);
         println!("Tamaño sector:   {} bytes", i.sector_size);
@@ -925,6 +989,17 @@ fn run(args: Vec<String>) -> Result<(), (u8, String)> {
         return Err(usage(
             "--found no se puede combinar con --partition ni con --range",
         ));
+    }
+    if !a.parents.is_empty() && (a.split || a.force_raw) {
+        return Err(usage(
+            "--parent no se puede combinar con --split ni con --force-raw",
+        ));
+    }
+    if !a.parents.is_empty() && !a.extents.is_empty() {
+        return Err(usage("--parent no se puede combinar con --extent"));
+    }
+    if a.ignore_parent_mismatch && a.parents.is_empty() {
+        return Err(usage("--ignore-parent-mismatch requiere --parent"));
     }
     if a.found.is_some() && cmd == "find-partitions" {
         return Err(usage("--found no se aplica a find-partitions"));
@@ -1307,8 +1382,35 @@ fn run(args: Vec<String>) -> Result<(), (u8, String)> {
         }
         "image-info" => {
             let p = one(&a)?;
-            let src = open_src(&a, &p).map_err(|e| op(&e))?;
-            print_info(src.info(), a.json);
+            // Lo que el contenedor dice de sus ficheros externos (sin abrir ninguno).
+            let hints = if a.split || a.force_raw {
+                Vec::new()
+            } else {
+                mr_api::external_hints(&p).unwrap_or_default()
+            };
+            match open_src(&a, &p) {
+                Ok(src) => print_info(src.info(), &hints, a.json),
+                Err(e @ mr_api::ApiError::Io(mr_io::IoError::ExternalReference { .. }))
+                    if !hints.is_empty() =>
+                {
+                    if a.json {
+                        println!(
+                            "{{\"path\":{},\"differencing\":true,\"external_hints\":{},\"error\":{}}}",
+                            json_str(&p),
+                            hints_json(&hints),
+                            json_str(&e.to_string())
+                        );
+                    } else {
+                        print_hints(&hints);
+                        println!(
+                            "Para leerlo, indique los padres con --parent RUTA (el padre inmediato primero; \
+                             repita la opción para cada nivel hasta el disco base)."
+                        );
+                    }
+                    return Err(op(&e));
+                }
+                Err(e) => return Err(op(&e)),
+            }
         }
         "hash" => {
             let p = one(&a)?;

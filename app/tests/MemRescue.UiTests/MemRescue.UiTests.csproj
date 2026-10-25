@@ -19,6 +19,11 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- VHD sintéticos de los discos diferenciales (compartidos con las pruebas de interoperabilidad). -->
+    <Compile Include="..\MemRescue.Core.Interop.Tests\SyntheticVhd.cs" Link="SyntheticVhd.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
     <!-- Solo para garantizar que MemRescue.exe se compila antes; no se referencia su ensamblado. -->
     <ProjectReference Include="..\..\src\MemRescue\MemRescue.csproj" ReferenceOutputAssembly="false" Private="false" />
   </ItemGroup>

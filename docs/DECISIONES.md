@@ -291,6 +291,43 @@ con una **lista explícita de ficheros aprobados**, nunca buscándolos:
   a los demás contenedores con ficheros externos (#8, discos diferenciales VHD/VHDX): lista ordenada de
   (papel, ruta canónica) aprobados por el usuario.
 
+**Addendum (incidencia 8): padres de discos diferenciales con consentimiento explícito.** Se implementa
+esa operación explícita con el mecanismo común de `mr_image::external`, compartido con las extensiones
+VMDK (#11): `ApprovedFiles`, la lista de pares (papel, ruta) que el usuario aprobó, con cada ruta admitida
+por la política de rutas y abierta en solo lectura al construirla, y búsqueda por papel exacta.
+
+- **Indicaciones frente a ficheros aprobados.** Lo que el contenedor dice de otro fichero (nombre, rutas
+  relativa y absoluta, identificadores) es un `ExternalHint`: texto saneado (caracteres de control
+  escapados) y acotado a 512 caracteres, solo para mostrarlo; **nunca** se usa como ruta.
+  `external_hints(ruta)` (API, `mr_image_external_hints` en la ABI, `Engine.ExternalHints` en C#) lo
+  lee sin abrir nada más. Los padres que se usan son solo los de `ApprovedFiles` con los papeles
+  `parent:1` (padre inmediato), `parent:2`… hasta el disco base (`mr_image::parent_role`); cualquier
+  otro papel, o una numeración con huecos, se rechaza. La API, la ABI (`mr_source_open_ex`, como mucho
+  64 rutas en orden), la CLI (`--parent` repetido) y la interfaz construyen esa lista a partir del
+  orden que eligió el usuario. Si la imagen no es diferencial y la lista no está vacía, la apertura
+  falla: nunca se ignoran en silencio. Los padres usados quedan en `ImageInfo::external_files` y una
+  extracción nunca puede escribir sobre ellos (`check_output_path`).
+- **Validación de cada fichero.** El lector comprueba que el fichero es el que referencia el contenedor y
+  lo rechaza con el error tipado nuevo `IoError::ExternalMismatch` (`MR_ERR_EXTERNAL_MISMATCH` = 17,
+  `EngineStatus.ExternalMismatch`): en discos diferenciales, mismo formato, tamaño virtual y sector,
+  vínculo de identidad (VHD: id único del pie del padre = «Parent Unique ID» del hijo; VHDX:
+  DataWriteGuid de la cabecera activa del padre = `parent_linkage` o `parent_linkage2`), sin ciclos (por
+  ruta canónica y por identidad, que detecta copias) y como mucho 16 padres. Si falta un eslabón (el
+  último fichero también es diferencial) se mantiene `ExternalReference` con la referencia de ese
+  eslabón; si sobran ficheros, `ExternalMismatch`.
+- **Vínculo no verificado solo por petición explícita.** Se ofrece aceptar un padre cuyo identificador no
+  coincide (`ignore_link_mismatch` de `open_image_with_parents`, `MR_OPEN_IGNORE_LINK_MISMATCH`,
+  `--ignore-parent-mismatch`, casilla en la interfaz), desactivado por defecto, porque un padre
+  modificado o reconstruido puede seguir siendo la mejor fuente disponible para recuperar datos. La
+  descripción del origen lo registra («AVISO: vínculo con el padre N NO verificado (…); aceptado por
+  petición explícita del usuario») y la CLI y la interfaz muestran un aviso. Las demás comprobaciones
+  (formato, tamaño, sector, ciclos, profundidad) no se pueden omitir.
+- **Marca de tiempo del padre VHD: informativa.** La especificación la define como la fecha de
+  modificación del fichero del padre; copiarlo (adquisiciones, traslados) la cambia, así que una
+  diferencia solo se anota en la descripción y el vínculo se verifica por el id único.
+- **Modo tolerante en la cadena.** `OpenOptions::tolerant` se aplica a todas las capas; un bloque
+  descartado de una capa se lee con error (no fiable), **nunca** con los datos del padre.
+
 ---
 
 ## ADR-019 · Mapa de validez por sector obligatorio (Aceptada, 2026-10-17)

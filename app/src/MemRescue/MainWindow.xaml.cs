@@ -206,7 +206,8 @@ public partial class MainWindow : Window
         var hint = ex.Status switch
         {
             EngineStatus.Corrupt => "\n\nLa estructura del contenedor está dañada o es incoherente; no se interpreta para no mostrar datos erróneos.",
-            EngineStatus.ExternalReference => "\n\nEl contenedor depende de otro fichero (disco padre o extensión). Por seguridad MemRescue no abre ficheros referenciados automáticamente.",
+            EngineStatus.ExternalReference => "\n\nEl contenedor depende de otro fichero (disco padre o extensión). Por seguridad MemRescue no abre ficheros referenciados automáticamente: en un disco diferencial, elija usted la cadena de padres completa.",
+            EngineStatus.ExternalMismatch => "\n\nEl fichero elegido no corresponde a lo que espera el contenedor (otro disco, otro tamaño o una cadena incorrecta). Elija el padre correcto; solo si está seguro, marque la opción de abrir aunque el identificador no coincida.",
             EngineStatus.UnsupportedFeature => "\n\nEsta variante del formato todavía no está soportada.",
             _ => "",
         };
@@ -292,16 +293,48 @@ public partial class MainWindow : Window
                 }
                 forceRaw = true;
             }
+            // Disco diferencial: el usuario elige y confirma la cadena de padres (nunca se abre el padre por su cuenta).
+            IReadOnlyList<string>? parents = null;
+            var ignoreMismatch = false;
+            if (!forceRaw && format is ImageFormat.Vhd or ImageFormat.Vhdx)
+            {
+                IReadOnlyList<ExternalHint> hints = [];
+                try
+                {
+                    hints = await Task.Run(() => Engine.ExternalHints(path));
+                }
+                catch (EngineException ex)
+                {
+                    Log($"No se pudieron leer las indicaciones del padre de {path}: [{ex.Status}] {ex.Message}");
+                }
+                if (hints.Count > 0)
+                {
+                    Log($"{Path.GetFileName(path)} es un disco diferencial; su padre según el fichero (no se abre): {string.Join("; ", hints.Select(h => $"{h.Key}={h.Value}"))}.");
+                    if (interactive)
+                    {
+                        var dlg = new ParentChainDialog(path, hints) { Owner = this };
+                        if (dlg.ShowDialog() != true)
+                        {
+                            Log($"No se abrió {path}: no se eligió la cadena de padres.");
+                            return null;
+                        }
+                        parents = dlg.Parents;
+                        ignoreMismatch = dlg.IgnoreLinkMismatch;
+                    }
+                }
+            }
             Source source;
             var tolerant = false;
             try
             {
-                source = await Task.Run(() => Engine.OpenSource(path, sectorSize, forceRaw, split));
+                source = await Task.Run(() => parents is null
+                    ? Engine.OpenSource(path, sectorSize, forceRaw, split)
+                    : Engine.OpenSourceWithParents(path, parents, sectorSize, ignoreLinkMismatch: ignoreMismatch));
             }
             catch (EngineException ex) when (ex.Status == EngineStatus.Corrupt && !forceRaw && !split
                 && format is ImageFormat.Vhd or ImageFormat.Vhdx or ImageFormat.Vmdk)
             {
-                if (await OfferTolerantAsync(path, sectorSize, ex, interactive) is not { } t)
+                if (await OfferTolerantAsync(path, sectorSize, ex, interactive, parents, ignoreMismatch) is not { } t)
                 {
                     return null;
                 }
@@ -311,6 +344,14 @@ public partial class MainWindow : Window
             var entry = new SourceEntry(source, format, forceRaw, tolerant: tolerant);
             AddSource(entry);
             Log($"Origen abierto en solo lectura: {path}, {source.Description} ({entry.Info.SizeBytes:N0} bytes, {entry.Info.SectorCount:N0} sectores de {entry.Info.SectorSize} B).");
+            for (var i = 0; i < (parents?.Count ?? 0); i++)
+            {
+                Log($"Padre {i + 1} (elegido por el usuario, solo lectura): {parents![i]}");
+            }
+            if (ignoreMismatch && source.Description.Contains("NO verificado", StringComparison.Ordinal))
+            {
+                Log("AVISO: se aceptó un padre cuyo identificador no coincide; los datos pueden no corresponder al disco original.");
+            }
             if (entry.Info.TrailingBytes > 0)
             {
                 Log($"Aviso: {entry.Info.TrailingBytes} bytes finales no completan un sector de {entry.Info.SectorSize} B.");
@@ -375,12 +416,15 @@ public partial class MainWindow : Window
     /// es así, se pide confirmación explícita antes de abrirla en modo tolerante. Si el usuario no
     /// confirma, el origen evaluado se cierra sin añadirse a la sesión.
     /// </summary>
-    private async Task<Source?> OfferTolerantAsync(string path, uint sectorSize, EngineException strictError, bool interactive)
+    private async Task<Source?> OfferTolerantAsync(string path, uint sectorSize, EngineException strictError, bool interactive,
+        IReadOnlyList<string>? parents = null, bool ignoreMismatch = false)
     {
         Source candidate;
         try
         {
-            candidate = await Task.Run(() => Engine.OpenSource(path, sectorSize, tolerant: true));
+            candidate = await Task.Run(() => parents is null
+                ? Engine.OpenSource(path, sectorSize, tolerant: true)
+                : Engine.OpenSourceWithParents(path, parents, sectorSize, tolerant: true, ignoreLinkMismatch: ignoreMismatch));
         }
         catch (EngineException)
         {

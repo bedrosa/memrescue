@@ -14,6 +14,7 @@ internal static partial class NativeMethods
     internal const uint OpenForceRaw = 1;
     internal const uint OpenSplit = 2;
     internal const uint OpenTolerant = 4;
+    internal const uint OpenIgnoreLinkMismatch = 8;
     internal const uint VerifyReadBack = 1;
     internal const uint VerifyIgnoreAllErrors = 2;
     internal const int MaxSkipCodes = 256;
@@ -45,6 +46,12 @@ internal static partial class NativeMethods
 
     [LibraryImport(Dll)]
     internal static partial int mr_source_open(byte[] path, nuint pathLen, uint sectorSize, uint flags, out ulong source);
+
+    [LibraryImport(Dll)]
+    internal static partial int mr_source_open_ex(byte[] path, nuint pathLen, in MrOpenOptions options, out ulong source);
+
+    [LibraryImport(Dll)]
+    internal static partial int mr_image_external_hints(byte[] path, nuint pathLen, byte[]? buf, nuint cap, out nuint outLen, out uint count);
 
     [LibraryImport(Dll)]
     internal static partial int mr_source_info(ulong source, out MrImageInfo info);
@@ -185,6 +192,29 @@ public struct MrImageInfo
     public ulong TrailingBytes;
     public uint SectorSize;
     public uint Format;
+}
+
+/// <summary>Espejo de <c>mr_str</c> (16 bytes): cadena UTF-8 de entrada fijada en memoria durante la llamada.</summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct MrStr
+{
+    public nint Ptr;
+    public nuint Len;
+}
+
+/// <summary>
+/// Espejo de <c>mr_open_options</c> (32 bytes). <see cref="Externals"/> apunta a un <c>MrStr[]</c> fijado en
+/// memoria durante la llamada.
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct MrOpenOptions
+{
+    public uint StructSize;
+    public uint Flags;
+    public uint SectorSize;
+    public uint ExternalCount;
+    public nint Externals;
+    public ulong Reserved;
 }
 
 /// <summary>Espejo de <c>mr_task_status</c> (24 bytes).</summary>

@@ -1,6 +1,7 @@
 using System.Buffers.Binary;
 using System.Security.Cryptography;
 using MemRescue.Core.Interop;
+using MemRescue.TestSupport;
 using Xunit;
 
 namespace MemRescue.Core.Interop.Tests;
@@ -219,6 +220,60 @@ public sealed class ContainerTests : IDisposable
         }
         Assert.Equal(before, SHA256.HashData(File.ReadAllBytes(p)));
         Assert.Equal(modified, File.GetLastWriteTimeUtc(p));
+    }
+
+    [Fact]
+    public async Task DifferencingVhdOpensOnlyWithTheExplicitParentChain()
+    {
+        // Padre fijo de 16 sectores (sector s = 0x40 + s); hijo con los sectores 1 y 9 escritos.
+        var data = new byte[16 * 512];
+        for (var s = 0; s < 16; s++)
+        {
+            data.AsSpan(s * 512, 512).Fill((byte)(0x40 + s));
+        }
+        var parent = Write("padre.vhd", SyntheticVhd.Fixed(data, 0xB0));
+        var other = Write("otro.vhd", SyntheticVhd.Fixed(data, 0x77));
+        var child = Write("hijo.vhd", SyntheticVhd.Differencing(16 * 512, 0xC1, 0xB0, "padre.vhd",
+            new Dictionary<int, byte> { [1] = 0xC1, [9] = 0xC9 }));
+        var before = new[] { parent, child }.Select(f => SHA256.HashData(File.ReadAllBytes(f))).ToList();
+
+        // Indicaciones sin abrir el padre; ninguna en un disco que no es diferencial.
+        var hints = Engine.ExternalHints(child);
+        Assert.Contains(new ExternalHint("parent_name", "padre.vhd"), hints);
+        Assert.Contains(new ExternalHint("locator_W2ru", ".\\padre.vhd"), hints);
+        Assert.Contains(hints, h => h.Key == "parent_unique_id" && h.Value.StartsWith("b0b0b0b0-", StringComparison.Ordinal));
+        Assert.Empty(Engine.ExternalHints(parent));
+
+        // Sin padres: referencia externa; con la cadena: lectura sector a sector a través del padre.
+        Assert.Equal(EngineStatus.ExternalReference, Assert.Throws<EngineException>(() => Engine.OpenSource(child)).Status);
+        using (var src = Engine.OpenSourceWithParents(child, [parent]))
+        {
+            Assert.StartsWith("VHD diferencial", src.Description, StringComparison.Ordinal);
+            Assert.Equal(16ul, src.Info.SectorCount);
+            var all = src.ReadSectors(0, 16);
+            for (var s = 0; s < 16; s++)
+            {
+                var want = s switch { 1 => 0xC1, 9 => 0xC9, _ => 0x40 + s };
+                Assert.All(all.AsSpan(s * 512, 512).ToArray(), b => Assert.Equal(want, b));
+            }
+            using var v = src.StartVerify();
+            Assert.Equal(EngineTaskState.Completed, await v.WaitAsync());
+            Assert.True(v.GetReport().AllTrustworthy);
+        }
+
+        // Padre ajeno: error tipado; aceptarlo exige la petición explícita y queda advertido.
+        Assert.Equal(EngineStatus.ExternalMismatch,
+            Assert.Throws<EngineException>(() => Engine.OpenSourceWithParents(child, [other])).Status);
+        using (var forced = Engine.OpenSourceWithParents(child, [other], ignoreLinkMismatch: true))
+        {
+            Assert.Contains("NO verificado", forced.Description, StringComparison.Ordinal);
+        }
+        // Ficheros que sobran y rutas de dispositivo.
+        Assert.Equal(EngineStatus.ExternalMismatch,
+            Assert.Throws<EngineException>(() => Engine.OpenSourceWithParents(parent, [child])).Status);
+        Assert.Equal(EngineStatus.PathRejected,
+            Assert.Throws<EngineException>(() => Engine.OpenSourceWithParents(child, [@"\\.\PhysicalDrive0"])).Status);
+        Assert.Equal(before, new[] { parent, child }.Select(f => SHA256.HashData(File.ReadAllBytes(f))).ToList());
     }
 
     [Fact]

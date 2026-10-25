@@ -29,6 +29,8 @@ public enum EngineStatus
     NotFound = 15,
     /// <summary>La salida ya existe y no se pidió sustituirla.</summary>
     AlreadyExists = 16,
+    /// <summary>Un fichero externo indicado (p. ej. el padre de un disco diferencial) no corresponde.</summary>
+    ExternalMismatch = 17,
     Panic = 99,
 }
 
@@ -142,6 +144,9 @@ public sealed record MappedSectors(byte[] Data, SectorState[] States)
     public bool AllTrustworthy => States.All(s => s.IsTrustworthy());
 }
 
+/// <summary>Indicación (clave, valor) de un contenedor sobre un fichero externo que necesita. Solo informativa.</summary>
+public sealed record ExternalHint(string Key, string Value);
+
 /// <summary>Punto de entrada seguro al motor de MemRescue.</summary>
 public static partial class Engine
 {
@@ -201,6 +206,66 @@ public static partial class Engine
             | (tolerant ? NativeMethods.OpenTolerant : 0);
         Check(NativeMethods.mr_source_open(p, (nuint)p.Length, sectorSize, flags, out var h));
         return new Source(h, path);
+    }
+
+    /// <summary>
+    /// Indicaciones del contenedor sobre los ficheros externos que necesita (padre de un disco diferencial
+    /// VHD/VHDX), sin abrir ningún otro fichero. Lista vacía si no necesita ninguno. Los valores son texto
+    /// saneado solo para mostrarlo: nunca se usan como rutas.
+    /// </summary>
+    public static IReadOnlyList<ExternalHint> ExternalHints(string path)
+    {
+        var p = Utf8(path);
+        var text = ReadString((b, c) => (NativeMethods.mr_image_external_hints(p, (nuint)p.Length, b, c, out var n, out _), n));
+        return [.. text.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .Select(line => line.Split('\t', 2))
+            .Select(kv => new ExternalHint(kv[0], kv.Length > 1 ? kv[1] : ""))];
+    }
+
+    /// <summary>
+    /// Abre un disco diferencial VHD/VHDX con la cadena de padres que el usuario eligió y confirmó
+    /// (<paramref name="parents"/>: padre inmediato primero, hasta el disco base). El motor valida cada padre
+    /// (identificador, tamaño, sector, ciclos, como mucho 16) y nunca abre otro fichero: si falta un padre,
+    /// <see cref="EngineStatus.ExternalReference"/>; si no corresponde, <see cref="EngineStatus.ExternalMismatch"/>.
+    /// </summary>
+    /// <param name="path">Disco diferencial; las rutas de dispositivo se rechazan.</param>
+    /// <param name="parents">Padres elegidos por el usuario, del inmediato al disco base.</param>
+    /// <param name="sectorSize">Tamaño de sector lógico; 0 = nativo del formato.</param>
+    /// <param name="tolerant">Modo tolerante (ADR-020) en todas las capas, solo por petición explícita.</param>
+    /// <param name="ignoreLinkMismatch">
+    /// Aceptar un padre cuyo identificador no coincide (solo por petición explícita; la descripción lo advierte).
+    /// </param>
+    public static Source OpenSourceWithParents(string path, IReadOnlyList<string> parents, uint sectorSize = 0,
+        bool tolerant = false, bool ignoreLinkMismatch = false)
+    {
+        ArgumentNullException.ThrowIfNull(parents);
+        var p = Utf8(path);
+        var bytes = parents.Select(Utf8).ToArray();
+        var pins = bytes.Select(b => GCHandle.Alloc(b, GCHandleType.Pinned)).ToList();
+        var list = new MrStr[bytes.Length];
+        for (var i = 0; i < bytes.Length; i++)
+        {
+            list[i] = new MrStr { Ptr = pins[i].AddrOfPinnedObject(), Len = (nuint)bytes[i].Length };
+        }
+        var listPin = GCHandle.Alloc(list, GCHandleType.Pinned);
+        try
+        {
+            var o = new MrOpenOptions
+            {
+                StructSize = (uint)Marshal.SizeOf<MrOpenOptions>(),
+                Flags = (tolerant ? NativeMethods.OpenTolerant : 0) | (ignoreLinkMismatch ? NativeMethods.OpenIgnoreLinkMismatch : 0),
+                SectorSize = sectorSize,
+                ExternalCount = (uint)list.Length,
+                Externals = list.Length == 0 ? 0 : listPin.AddrOfPinnedObject(),
+            };
+            Check(NativeMethods.mr_source_open_ex(p, (nuint)p.Length, in o, out var h));
+            return new Source(h, path);
+        }
+        finally
+        {
+            listPin.Free();
+            pins.ForEach(h => h.Free());
+        }
     }
 
     /// <summary>Lista los segmentos de una imagen dividida (x.001, x.002…) sin abrirlos.</summary>

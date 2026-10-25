@@ -666,6 +666,23 @@ Ficheros borrados (issue #23, ADR-027, `formatos/ntfs.md` «Ficheros borrados»)
   con código 2 y sustituida con `--overwrite`; salida = origen rechazada; registro dañado sin
   salida; sin temporales).
 
+Discos diferenciales VHD/VHDX (issue #8, ADR-018 addendum, detalle en `formatos/vhdx.md`, «Discos
+diferenciales»):
+
+- `mr-image`: `src/differencing_tests.rs` (11) y `src/external.rs` (indicaciones) con imágenes sintéticas de
+  `src/diff_builder.rs` (constructor según las especificaciones, compartido con las pruebas de
+  integración por `#[path]`): cadenas de 1 y 2 niveles con mapas de bits por sector, estados de bloque
+  de VHDX, vínculo, ciclos, profundidad, tamaños, formato, ficheros que sobran o faltan, modo tolerante,
+  corrupción aleatoria de los localizadores sin pánicos e inmutabilidad.
+- `mr-image/tests/differencing_qemu.rs` (2, `--ignored`, `MR_QEMU_IMG`): base escrito y convertido
+  por qemu-img como referencia, diferenciales sintéticos encima; SHA-256 completo, 300 rangos y mapa de
+  asignación. qemu-img no sabe crear ni leer diferenciales VHD/VHDX, así que no se usa para la cadena;
+  solo `convert`, `info` y `map` sobre copias desechables, nunca `commit`, `rebase` ni reparación.
+- `mr-api/tests/differencing.rs`, FFI (`open_ex_layout_and_differencing_chain`), CLI
+  (`cli/tests/differencing.rs`: indicaciones en `image-info` texto y JSON, `--parent` repetido en
+  orden, orden equivocado, padre ajeno, cadena incompleta, `--ignore-parent-mismatch` con aviso,
+  combinaciones no válidas con código 2, ruta de dispositivo), C# e interfaz.
+
 Campos del manifiesto NTFS que no se comparan todavía: `[[files]]` `path` de los vivos (#22; el de
 los borrados se compara con la ruta por la cadena de padres de la MFT).
 

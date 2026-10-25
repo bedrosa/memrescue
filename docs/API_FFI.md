@@ -63,6 +63,7 @@ memrescue-cli.exe (Rust) ──────────────── llamad
 | 14 | `MR_ERR_UNSUPPORTED_FEATURE` | Variante del formato aún no soportada (VMDK COWD o comprimido sin marcadores, VHDX con registro pendiente…) |
 | 15 | `MR_ERR_NOT_FOUND` | Ruta NTFS que no existe (solo `mr_ntfs_resolve`, #22) |
 | 16 | `MR_ERR_ALREADY_EXISTS` | La salida de una copia ya existe y no se pidió sustituirla (solo `mr_ntfs_copy_start`, #22) |
+| 17 | `MR_ERR_EXTERNAL_MISMATCH` | Un fichero externo indicado no corresponde: padre de otro disco (identificador), tamaño o sector distintos, formato distinto, ciclo, más de 16 padres, ficheros que sobran o que la imagen no usa (#8) |
 | 99 | `MR_ERR_PANIC` | Error interno capturado; el proceso **no** se cae |
 
 - `mr_last_error` devuelve el mensaje del **último error del hilo que llama** (almacenamiento local de
@@ -238,6 +239,24 @@ leen como `MR_SECTOR_UNREADABLE` (estricto: error) y las ZERO como `MR_SECTOR_SP
 `Engine.ListVmdkExtents(path)` (`VmdkExtentList` con `VmdkExtent`, `RequiredNames`, `Openable`, `Issue`;
 el handle se libera dentro) y `Engine.OpenVmdk(path, [new ApprovedExtent(nombre, ruta), …], sectorSize,
 tolerant)` (las cadenas se fijan en memoria durante la llamada, sin `unsafe`).
+
+## Ficheros externos y discos diferenciales (ampliación compatible de la ABI 3, issue #8, ADR-018)
+
+El motor nunca abre por su cuenta un fichero referenciado por una imagen. La interfaz muestra lo que el
+contenedor dice de él y el usuario elige y confirma los ficheros, que se pasan en una lista versionada.
+
+| Función | Descripción |
+|---|---|
+| `mr_image_external_hints(path, len, buf, cap, out_len, out_count)` | Indicaciones del contenedor sobre los ficheros externos que necesita (hoy, el padre de un VHD/VHDX diferencial), **sin abrir ningún otro fichero**: una línea `clave\tvalor` por indicación (valores saneados, ≤ 512 caracteres; nunca son rutas que el motor use). Vacía y `out_count` = 0 si no necesita ninguno. VHD: `parent_name`, `parent_unique_id`, `parent_timestamp`, `locator_W2ru`… VHDX: `locator_type` y los pares del localizador (`parent_linkage`, `relative_path`…) |
+| `mr_source_open_ex(path, len, options, out_source)` | Como `mr_source_open` con `mr_open_options` (32 bytes; `struct_size` = `sizeof`, otro tamaño se rechaza; `reserved` = 0): `flags` (los de `mr_source_open` más `MR_OPEN_IGNORE_LINK_MISMATCH` = 8), `sector_size` y `externals` / `external_count` (≤ 64 `mr_str` de 16 bytes: puntero UTF-8 y longitud), los ficheros que el usuario aprobó en orden (diferencial: padre inmediato primero, hasta el base). Cada ruta pasa la política de rutas y se abre en solo lectura. Falta un padre → `MR_ERR_EXTERNAL_REFERENCE`; no corresponde → `MR_ERR_EXTERNAL_MISMATCH` (con `MR_OPEN_IGNORE_LINK_MISMATCH` se acepta un identificador que no coincide y `mr_source_describe` lo advierte con «NO verificado»); `MR_OPEN_SPLIT` con externos, ruta vacía, más de 64 o bits desconocidos → `MR_ERR_INVALID_ARGUMENT` |
+
+`mr_source_describe` de un diferencial: «VHD diferencial, bloques de …; padre 1: <ruta> (<variante>);
+padre 2: …» y las notas (marca de tiempo distinta, `parent_linkage2`, vínculo no verificado). En C#:
+`Engine.ExternalHints(path)` → `IReadOnlyList<ExternalHint(Key, Value)>`,
+`Engine.OpenSourceWithParents(path, parents, sectorSize, tolerant, ignoreLinkMismatch)` y
+`EngineStatus.ExternalMismatch`. Pruebas: `open_ex_layout_and_differencing_chain` (tamaños y
+desplazamientos, cadena, indicaciones, códigos, validación de la estructura) y
+`ContainerTests.DifferencingVhdOpensOnlyWithTheExplicitParentChain`.
 
 ## Modo tolerante de contenedores (`MR_OPEN_TOLERANT`, ADR-020)
 

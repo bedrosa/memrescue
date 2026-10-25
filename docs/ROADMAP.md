@@ -84,7 +84,10 @@ Completado en M1 por issues:
 Milestone propio para no retrasar particiones y sistemas de archivos. Exigen abrir otros ficheros con
 confirmación explícita del usuario o descomprimir; hoy se rechazan con errores tipados
 (`ExternalReference`, `UnsupportedFeature`).
-- VHD/VHDX diferenciales con selección explícita del padre (#8).
+- ✔ VHD/VHDX diferenciales con selección explícita del padre (#8): indicaciones sin abrir el padre,
+  cadena elegida y confirmada por el usuario (`ApprovedFiles` con papeles `parent:N`, ADR-018 addendum), vínculo, ciclos y
+  profundidad validados, lectura por sector a través de la cadena; API, FFI, CLI (`--parent`) e
+  interfaz (`formatos/vhdx.md`).
 - ✔ VMDK streamOptimized (#9): granos comprimidos con marcadores, GD en la cabecera o en el pie,
   descompresión acotada y granos dañados como ilegibles (`formatos/vmdk.md`, ADR-017, addendum).
 - ✔ Reproducción en memoria del registro pendiente de VHDX (#10): validación de entradas y descriptores,

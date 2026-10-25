@@ -13,8 +13,11 @@
 //!   las tablas de regiones, los metadatos y la BAT (módulo `vhdx_log`): todas las lecturas del
 //!   fichero pasan por la superposición resultante; el fichero nunca se escribe. Un registro
 //!   pendiente que no supera la validación es `Corrupt` en ambos modos.
-//! - Los discos diferenciales (HasParent) devuelven `ExternalReference` con la ruta del padre
-//!   según el localizador; el padre **nunca** se abre.
+//! - Los discos diferenciales (HasParent) abiertos con [`VhdxImage::open`] devuelven
+//!   `ExternalReference` con la ruta del padre según el localizador; el padre **nunca** se abre
+//!   por su cuenta. La cadena solo se abre con los ficheros que indica el usuario
+//!   (`crate::differencing`, incidencia 8): los bloques NOT_PRESENT y UNDEFINED y los sectores
+//!   de un bloque PARTIALLY_PRESENT con su bit a 0 se leen del padre.
 //! - Los bloques NOT_PRESENT, UNDEFINED, ZERO y UNMAPPED se leen como ceros y se informan como
 //!   `Allocation::Sparse`; FULLY_PRESENT se lee del fichero; PARTIALLY_PRESENT solo es válido en
 //!   discos diferenciales y aquí se considera corrupción.
@@ -28,11 +31,15 @@
 
 use crate::budget::Budget;
 use crate::crc32c::crc32c;
+use crate::differencing::{Layer, Link};
+use crate::external::ExternalHint;
 use crate::tolerant::{self, Damage, Hit, Zone};
 use crate::vhdx_log::{self, Registro};
 use crate::MAX_TABLE_BYTES;
-use mr_io::{Allocation, AllocationRun, BlockDevice, IoError, Result};
+use mr_io::{Allocation, AllocationRun, BlockDevice, ImageFormat, IoError, Result};
 use std::fs::File;
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 const FORMATO: &str = "VHDX";
 
@@ -63,6 +70,11 @@ const TROZO_BAT: usize = 1024 * 1024;
 /// Marca interna de un bloque descartado en modo tolerante (ningún desplazamiento válido, múltiplo
 /// de 1 MiB, puede valer `u64::MAX`).
 const DESCARTADO: u64 = u64::MAX;
+/// Marca interna de un bloque cuyo contenido es el del padre (diferenciales). Los desplazamientos
+/// válidos son múltiplos de 1 MiB, así que ninguno vale 1.
+const DEL_PADRE: u64 = 1;
+/// Bit interno de un bloque PARTIALLY_PRESENT (desplazamiento | `PARCIAL`).
+const PARCIAL: u64 = 2;
 
 // Estados de las entradas de bloque de datos de la BAT (bits 0–2).
 const PAYLOAD_NOT_PRESENT: u64 = 0;
@@ -244,6 +256,7 @@ fn crc_valido(buf: &[u8], firma: &[u8; 4]) -> bool {
 #[derive(Debug, Clone)]
 struct Cabecera {
     secuencia: u64,
+    guid_datos: Guid,
     guid_registro: Guid,
     version_registro: u16,
     version: u16,
@@ -257,6 +270,7 @@ fn analizar_cabecera(buf: &[u8]) -> Result<Option<Cabecera>> {
     }
     Ok(Some(Cabecera {
         secuencia: le64(buf, 8)?,
+        guid_datos: trozo::<16>(buf, 32)?,
         guid_registro: trozo::<16>(buf, 48)?,
         version_registro: le16(buf, 64)?,
         version: le16(buf, 66)?,
@@ -310,7 +324,22 @@ struct ElementoMetadatos {
     longitud: u32,
 }
 
-/// Disco VHDX fijo o dinámico abierto en solo lectura.
+/// Datos de un disco diferencial.
+struct Diferencial {
+    tipo_localizador: Guid,
+    /// Pares clave/valor del localizador del padre (tal como están en el fichero).
+    pares: Vec<(String, String)>,
+    vinculo: Option<Guid>,
+    vinculo2: Option<Guid>,
+    /// Desplazamiento del mapa de bits de sectores de cada grupo de `ratio` bloques (0 = no
+    /// presente; [`DESCARTADO`] = no válido en modo tolerante).
+    mapas: Vec<u64>,
+    ratio: u64,
+    /// Última porción de mapa de bits leída (bloque, bits de sus sectores).
+    cache: Mutex<Option<(u64, Arc<Vec<u8>>)>>,
+}
+
+/// Disco VHDX fijo, dinámico o diferencial abierto en solo lectura.
 pub struct VhdxImage {
     file: File,
     tam_virtual: u64,
@@ -328,6 +357,11 @@ pub struct VhdxImage {
     mapas_ignorados: u64,
     /// Registro pendiente reproducido en memoria, si lo había.
     registro: Option<Registro>,
+    /// DataWriteGuid de la cabecera activa (identidad del contenido para los diferenciales).
+    guid_datos: Guid,
+    diferencial: Option<Diferencial>,
+    /// Padre enlazado (solo en discos diferenciales abiertos con su cadena).
+    padre: Option<Arc<dyn BlockDevice>>,
 }
 
 impl std::fmt::Debug for VhdxImage {
@@ -352,6 +386,12 @@ impl VhdxImage {
     /// Como [`Self::open`]; con `tolerante`, las entradas de la BAT inválidas o ambiguas no impiden
     /// abrir la imagen: sus bloques se descartan (ver la documentación del módulo).
     pub fn open_with(file: File, tolerante: bool) -> Result<VhdxImage> {
+        Self::abrir(file, tolerante, false)
+    }
+
+    /// Como [`Self::open_with`]; con `capa`, un disco diferencial se abre sin padre (para
+    /// enlazarlo después con la cadena indicada por el usuario).
+    fn abrir(file: File, tolerante: bool, capa: bool) -> Result<VhdxImage> {
         let tam_fichero = file.metadata()?.len();
         if tam_fichero < ZONA_CABECERAS {
             return Err(corrupto(format!(
@@ -595,20 +635,34 @@ impl VhdxImage {
                 "tamaño de bloque {tam_bloque} no válido (potencia de 2 entre 1 MiB y 256 MiB)"
             )));
         }
-        if banderas & PARAM_TIENE_PADRE != 0 {
-            let referencia = match elementos[5] {
-                Some(e) if e.longitud > 0 => {
-                    let buf = leer_elemento(5, "Parent Locator", 20)?;
-                    describir_padre(&buf)
-                }
-                _ => None,
-            };
-            return Err(IoError::ExternalReference {
-                format: FORMATO,
-                reference: referencia
-                    .unwrap_or_else(|| "disco padre (sin localizador legible)".to_string()),
-            });
-        }
+        let diferencial = if banderas & PARAM_TIENE_PADRE != 0 {
+            if !capa {
+                let referencia = match elementos[5] {
+                    Some(e) if e.longitud > 0 => {
+                        let buf = leer_elemento(5, "Parent Locator", 20)?;
+                        describir_padre(&buf)
+                    }
+                    _ => None,
+                };
+                return Err(IoError::ExternalReference {
+                    format: FORMATO,
+                    reference: crate::external::sanitize(
+                        &referencia
+                            .unwrap_or_else(|| "disco padre (sin localizador legible)".to_string()),
+                    ),
+                });
+            }
+            if elementos[5].is_none_or(|e| e.longitud == 0) {
+                return Err(corrupto(
+                    "disco diferencial sin localizador del padre (Parent Locator)",
+                ));
+            }
+            let buf = leer_elemento(5, "Parent Locator", 20)?;
+            Some(analizar_localizador(&buf)?)
+        } else {
+            None
+        };
+        let es_diferencial = diferencial.is_some();
         let sector_logico = le32(&leer_elemento(3, "Logical Sector Size", 4)?, 0)?;
         if sector_logico != 512 && sector_logico != 4096 {
             return Err(corrupto(format!(
@@ -631,11 +685,17 @@ impl VhdxImage {
             )));
         }
 
-        // BAT.
+        // BAT. En un disco diferencial cada grupo de `ratio` bloques lleva su entrada de mapa de
+        // bits de sectores, también el último grupo incompleto.
         let tb = u64::from(tam_bloque);
         let n_bloques = tam_virtual.div_ceil(tb);
         let ratio = ((1u64 << 23) * u64::from(sector_logico)) / tb;
-        let entradas = n_bloques + (n_bloques - 1) / ratio;
+        let n_mapas = n_bloques.div_ceil(ratio);
+        let entradas = if es_diferencial {
+            n_mapas * (ratio + 1)
+        } else {
+            n_bloques + (n_bloques - 1) / ratio
+        };
         let bytes_bat = entradas
             .checked_mul(8)
             .ok_or_else(|| corrupto("BAT demasiado grande"))?;
@@ -655,6 +715,12 @@ impl VhdxImage {
         // falla en la primera entrada inválida.
         presupuesto.add_tables(bytes_bat);
         let mut bloques: Vec<u64> = presupuesto.vec(n_bloques, "BAT")?;
+        // Mapas de bits de sectores de un diferencial: desplazamiento (0 = no presente).
+        let mut mapas: Vec<u64> = if es_diferencial {
+            presupuesto.vec(n_mapas, "mapas de bits de sectores")?
+        } else {
+            Vec::new()
+        };
         let mut dano = Damage::new(FORMATO, n_bloques, tolerante, &mut presupuesto)?;
         let mut presentes = 0u64;
         let mut mapas_ignorados = 0u64;
@@ -668,20 +734,29 @@ impl VhdxImage {
             for e in trozo_bat.as_chunks::<8>().0 {
                 let entrada = u64::from_le_bytes(*e);
                 if (indice + 1).is_multiple_of(ratio + 1) {
-                    let estado = entrada & 7;
-                    if estado != BITMAP_NOT_PRESENT && estado != BITMAP_PRESENT {
-                        if !tolerante {
-                            return Err(corrupto(format!(
-                                "estado {estado} no válido en la entrada de mapa de bits {indice} de la BAT"
-                            )));
+                    if es_diferencial {
+                        let c = indice / (ratio + 1);
+                        match validar_mapa(entrada, c, tam_fichero) {
+                            Ok(off) => mapas.push(off),
+                            Err(motivo) if !tolerante => return Err(corrupto(motivo)),
+                            Err(_) => mapas.push(DESCARTADO),
                         }
-                        mapas_ignorados += 1;
+                    } else {
+                        let estado = entrada & 7;
+                        if estado != BITMAP_NOT_PRESENT && estado != BITMAP_PRESENT {
+                            if !tolerante {
+                                return Err(corrupto(format!(
+                                    "estado {estado} no válido en la entrada de mapa de bits {indice} de la BAT"
+                                )));
+                            }
+                            mapas_ignorados += 1;
+                        }
                     }
-                } else {
+                } else if (bloques.len() as u64) < n_bloques {
                     let b = bloques.len() as u64;
-                    match validar_bloque(entrada, b, tb, tam_virtual, tam_fichero) {
+                    match validar_bloque(entrada, b, tb, tam_virtual, tam_fichero, es_diferencial) {
                         Ok(destino) => {
-                            if destino != 0 {
+                            if es_fisico(destino) {
                                 presentes += 1;
                             }
                             bloques.push(destino);
@@ -696,16 +771,32 @@ impl VhdxImage {
             }
             pos += len as u64;
         }
-        if bloques.len() as u64 != n_bloques {
+        let mapas_esperados = if es_diferencial { n_mapas } else { 0 };
+        if bloques.len() as u64 != n_bloques || mapas.len() as u64 != mapas_esperados {
             return Err(corrupto(
                 "número de entradas de bloque incoherente en la BAT",
             ));
         }
+        // Un bloque PARTIALLY_PRESENT necesita el mapa de bits de su grupo.
+        for b in 0..n_bloques {
+            let v = bloques[b as usize];
+            if es_fisico(v) && v & PARCIAL != 0 {
+                let m = mapas[(b / ratio) as usize];
+                if m == 0 || m == DESCARTADO {
+                    dano.add(b, || {
+                        format!(
+                            "el bloque {b} es PARTIALLY_PRESENT y el mapa de bits de sectores de su grupo {} no es válido o no está presente",
+                            b / ratio
+                        )
+                    })?;
+                }
+            }
+        }
         // Correspondencia inequívoca: ningún bloque presente solapa las zonas del contenedor
-        // (cabeceras, registro, regiones) ni otro bloque.
+        // (cabeceras, registro, regiones, mapas de bits de sectores) ni otro bloque.
         let tramo = |b: u32| -> (u64, u64) {
             let b = u64::from(b);
-            let off = bloques[b as usize];
+            let off = bloques[b as usize] & !(MIB - 1);
             let util = tb.min(tam_virtual - b * tb);
             (off, off + util)
         };
@@ -713,30 +804,76 @@ impl VhdxImage {
         let mut candidatos: Vec<u32> = presupuesto.vec(presentes, "lista de bloques presentes")?;
         candidatos.extend(
             (0..n_bloques)
-                .filter(|&b| !matches!(bloques[b as usize], 0 | DESCARTADO))
+                .filter(|&b| es_fisico(bloques[b as usize]) && !dano.contains(b))
                 .map(|b| b as u32),
         );
         let mut zonas: Vec<Zone> = tramos
             .iter()
             .map(|t| Zone::fixed(t.inicio, t.fin - t.inicio))
             .collect();
-        tolerant::overlaps(&mut candidatos, tramo, &mut zonas, |solape| match solape {
+        for (c, &m) in mapas.iter().enumerate() {
+            if m != 0 && m != DESCARTADO {
+                zonas.push(Zone {
+                    start: m,
+                    end: m + MIB,
+                    tag: Some(c as u64),
+                });
+            }
+        }
+        let mut mapas_solapados: Vec<u64> = Vec::new();
+        tolerant::overlaps(&mut candidatos, tramo, &mut zonas, |solape| {
+            match solape {
             Hit::Entry(b) => {
-                let off = bloques[b as usize];
+                let off = bloques[b as usize] & !(MIB - 1);
                 dano.add(u64::from(b), || {
                     format!(
                         "el bloque {b} (desplazamiento {off}) se solapa con las estructuras del contenedor o con otro bloque"
                     )
                 })
             }
-            Hit::Tag(_) => Ok(()),
+            Hit::Tag(c) if tolerante => {
+                mapas_solapados.push(c);
+                Ok(())
+            }
+            Hit::Tag(c) => Err(corrupto(format!(
+                "el mapa de bits de sectores del grupo {c} se solapa con las estructuras del contenedor o con un bloque"
+            ))),
+        }
         })?;
         presupuesto.release(candidatos);
+        for c in mapas_solapados {
+            mapas[c as usize] = DESCARTADO;
+            let fin = ((c + 1) * ratio).min(n_bloques);
+            for b in c * ratio..fin {
+                let v = bloques[b as usize];
+                if es_fisico(v) && v & PARCIAL != 0 {
+                    dano.add(b, String::new)?;
+                }
+            }
+        }
         for b in dano.iter() {
             bloques[b as usize] = DESCARTADO;
         }
         let descartados = dano.count();
         dano.release(&mut presupuesto);
+
+        let diferencial = diferencial.map(|(tipo_localizador, pares)| {
+            let vinculo = |clave: &str| {
+                pares
+                    .iter()
+                    .find(|(k, _)| k == clave)
+                    .and_then(|(_, v)| analizar_guid_texto(v))
+            };
+            Diferencial {
+                tipo_localizador,
+                vinculo: vinculo("parent_linkage"),
+                vinculo2: vinculo("parent_linkage2"),
+                pares,
+                mapas,
+                ratio,
+                cache: Mutex::new(None),
+            }
+        });
 
         Ok(VhdxImage {
             file,
@@ -750,12 +887,17 @@ impl VhdxImage {
             descartados,
             mapas_ignorados,
             registro,
+            guid_datos: cab.guid_datos,
+            diferencial,
+            padre: None,
         })
     }
 
     /// Descripción legible de la variante.
     pub fn describe(&self) -> String {
-        let tipo = if self.dejar_asignados {
+        let tipo = if self.diferencial.is_some() {
+            "diferencial"
+        } else if self.dejar_asignados {
             "fijo"
         } else {
             "dinámico"
@@ -829,10 +971,16 @@ fn validar_bloque(
     tb: u64,
     tam_virtual: u64,
     tam_fichero: u64,
+    diferencial: bool,
 ) -> std::result::Result<u64, String> {
     match entrada & 7 {
+        // En un diferencial, NOT_PRESENT y UNDEFINED remiten al padre; ZERO y UNMAPPED (descartado
+        // en esta capa) son ceros.
+        PAYLOAD_NOT_PRESENT | PAYLOAD_UNDEFINED if diferencial => Ok(DEL_PADRE),
         PAYLOAD_NOT_PRESENT | PAYLOAD_UNDEFINED | PAYLOAD_ZERO | PAYLOAD_UNMAPPED => Ok(0),
-        PAYLOAD_FULLY_PRESENT => {
+        estado @ (PAYLOAD_FULLY_PRESENT | PAYLOAD_PARTIALLY_PRESENT)
+            if estado == PAYLOAD_FULLY_PRESENT || diferencial =>
+        {
             let off = (entrada >> 20)
                 .checked_mul(MIB)
                 .ok_or_else(|| format!("desplazamiento del bloque {b} desbordado"))?;
@@ -845,7 +993,11 @@ fn validar_bloque(
                     "el bloque {b} (desplazamiento {off}) queda fuera del fichero ({tam_fichero} bytes) o en la zona de cabeceras"
                 ));
             }
-            Ok(off)
+            Ok(if estado == PAYLOAD_PARTIALLY_PRESENT {
+                off | PARCIAL
+            } else {
+                off
+            })
         }
         PAYLOAD_PARTIALLY_PRESENT => Err(format!(
             "bloque {b} PARTIALLY_PRESENT en un disco sin padre"
@@ -898,6 +1050,311 @@ fn describir_padre(buf: &[u8]) -> Option<String> {
     None
 }
 
+/// `true` si el valor interno de un bloque es un desplazamiento en el fichero (FULLY o
+/// PARTIALLY_PRESENT).
+fn es_fisico(v: u64) -> bool {
+    !matches!(v, 0 | DEL_PADRE | DESCARTADO)
+}
+
+/// Valida la entrada de mapa de bits de sectores del grupo `c` de un diferencial: NOT_PRESENT
+/// (0) o PRESENT con su MiB entero dentro del fichero y fuera de la zona de cabeceras.
+fn validar_mapa(entrada: u64, c: u64, tam_fichero: u64) -> std::result::Result<u64, String> {
+    match entrada & 7 {
+        BITMAP_NOT_PRESENT => Ok(0),
+        BITMAP_PRESENT => {
+            let off = (entrada >> 20)
+                .checked_mul(MIB)
+                .ok_or_else(|| format!("desplazamiento del mapa de bits {c} desbordado"))?;
+            if off < ZONA_CABECERAS || off.checked_add(MIB).is_none_or(|f| f > tam_fichero) {
+                return Err(format!(
+                    "el mapa de bits de sectores {c} (desplazamiento {off}) queda fuera del fichero ({tam_fichero} bytes) o en la zona de cabeceras"
+                ));
+            }
+            Ok(off)
+        }
+        estado => Err(format!(
+            "estado {estado} no válido en la entrada del mapa de bits de sectores {c} de la BAT"
+        )),
+    }
+}
+
+/// Interpreta el localizador del padre ([MS-VHDX] «Parent Locator»): tipo (GUID), número de
+/// entradas y pares clave/valor en UTF-16LE con desplazamientos relativos al elemento. Toda
+/// entrada debe quedar dentro del elemento con longitudes pares y clave no vacía.
+fn analizar_localizador(buf: &[u8]) -> Result<(Guid, Vec<(String, String)>)> {
+    let tipo = trozo::<16>(buf, 0)?;
+    let n = usize::from(le16(buf, 18)?);
+    if 20 + n * 12 > buf.len() {
+        return Err(corrupto(format!(
+            "el localizador del padre declara {n} entradas y mide {} bytes",
+            buf.len()
+        )));
+    }
+    let texto = |o: u32, l: u16, que: &str| -> Result<String> {
+        let o = o as usize;
+        let s = o
+            .checked_add(usize::from(l))
+            .and_then(|f| buf.get(o..f))
+            .filter(|s| s.len() % 2 == 0)
+            .ok_or_else(|| {
+                corrupto(format!(
+                    "{que} del localizador del padre fuera del elemento o de longitud impar"
+                ))
+            })?;
+        let u: Vec<u16> = s
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
+            .collect();
+        Ok(String::from_utf16_lossy(&u))
+    };
+    let mut pares = Vec::with_capacity(n);
+    for i in 0..n {
+        let o = 20 + i * 12;
+        let (ko, vo, kl, vl) = (
+            le32(buf, o)?,
+            le32(buf, o + 4)?,
+            le16(buf, o + 8)?,
+            le16(buf, o + 10)?,
+        );
+        if kl == 0 {
+            return Err(corrupto("clave vacía en el localizador del padre"));
+        }
+        pares.push((texto(ko, kl, "clave")?, texto(vo, vl, "valor")?));
+    }
+    Ok((tipo, pares))
+}
+
+/// GUID escrito como texto `{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}` (con o sin llaves), en el
+/// orden de bytes de disco.
+fn analizar_guid_texto(s: &str) -> Option<Guid> {
+    let s = s.trim();
+    let s = s
+        .strip_prefix('{')
+        .and_then(|x| x.strip_suffix('}'))
+        .unwrap_or(s);
+    let partes: Vec<&str> = s.split('-').collect();
+    if partes.len() != 5
+        || partes
+            .iter()
+            .zip([8, 4, 4, 4, 12])
+            .any(|(p, l)| p.len() != l || !p.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        return None;
+    }
+    let d1 = u32::from_str_radix(partes[0], 16).ok()?;
+    let d2 = u16::from_str_radix(partes[1], 16).ok()?;
+    let d3 = u16::from_str_radix(partes[2], 16).ok()?;
+    let resto = format!("{}{}", partes[3], partes[4]);
+    let mut d4 = [0u8; 8];
+    for (i, d) in d4.iter_mut().enumerate() {
+        *d = u8::from_str_radix(&resto[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some(guid(d1, d2, d3, d4))
+}
+
+impl VhdxImage {
+    /// Contenido del padre (diferenciales). `ExternalReference` si no se ha enlazado, lo que no
+    /// ocurre en las imágenes que entrega la apertura.
+    fn leer_padre(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        match &self.padre {
+            Some(p) => p.read_at(offset, buf),
+            None => Err(IoError::ExternalReference {
+                format: FORMATO,
+                reference: self.referencia_padre(),
+            }),
+        }
+    }
+
+    /// Tramos de asignación de los sectores `[lba, lba + n)` que se leen del padre (`Data`,
+    /// conservador, si el padre no puede informar).
+    fn tramos_padre(&self, tramos: &mut Vec<AllocationRun>, lba: u64, n: u64) {
+        match self.padre.as_ref().map(|p| p.allocation(lba, n)) {
+            Some(Ok(v)) => {
+                for (l, c, t) in v {
+                    anadir_tramo(tramos, l, c, t);
+                }
+            }
+            _ => anadir_tramo(tramos, lba, n, Allocation::Data),
+        }
+    }
+
+    /// Texto con el que se nombra el padre (preferencia: relative_path, absolute_win32_path,
+    /// volume_path, parent_linkage).
+    fn referencia_padre(&self) -> String {
+        let Some(d) = &self.diferencial else {
+            return String::new();
+        };
+        let texto = [
+            "relative_path",
+            "absolute_win32_path",
+            "volume_path",
+            "parent_linkage",
+        ]
+        .iter()
+        .find_map(|c| {
+            d.pares
+                .iter()
+                .find(|(k, v)| k == c && !v.is_empty())
+                .map(|(_, v)| v.clone())
+        })
+        .unwrap_or_else(|| "disco padre (sin localizador legible)".to_string());
+        crate::external::sanitize(&texto)
+    }
+
+    /// Bits de los sectores del bloque PARTIALLY_PRESENT `b` (uno por sector lógico, el bit 0 del
+    /// byte 0 es el primer sector), con caché de una entrada. Un fallo de lectura se informa con
+    /// el rango virtual `(voff, len)` que lo necesitaba.
+    fn mapa_bloque(&self, d: &Diferencial, b: u64, voff: u64, len: usize) -> Result<Arc<Vec<u8>>> {
+        {
+            let g = d.cache.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((x, m)) = g.as_ref() {
+                if *x == b {
+                    return Ok(Arc::clone(m));
+                }
+            }
+        }
+        let spb = u64::from(self.tam_bloque) / u64::from(self.sector_logico);
+        let base = d.mapas[(b / d.ratio) as usize] + (b % d.ratio) * spb / 8;
+        // spb / 8 ≤ 256 MiB / 512 / 8 = 64 KiB.
+        let mut m = vec![0u8; (spb / 8) as usize];
+        leer_en(&self.file, self.registro.as_ref(), base, &mut m).map_err(|e| match e {
+            IoError::Read { source, .. } => IoError::Read {
+                offset: voff,
+                len,
+                source,
+            },
+            otro => otro,
+        })?;
+        let m = Arc::new(m);
+        *d.cache.lock().unwrap_or_else(|e| e.into_inner()) = Some((b, Arc::clone(&m)));
+        Ok(m)
+    }
+
+    /// Lee `parte` (bytes `dentro..` del bloque `b`, virtual `pos`) de un bloque PARTIALLY_PRESENT.
+    fn leer_parcial(
+        &self,
+        d: &Diferencial,
+        b: u64,
+        base: u64,
+        dentro: u64,
+        pos: u64,
+        parte: &mut [u8],
+    ) -> Result<()> {
+        let ss = u64::from(self.sector_logico);
+        let mapa = self.mapa_bloque(d, b, pos, parte.len())?;
+        let fin = dentro + parte.len() as u64;
+        let mut o = dentro;
+        while o < fin {
+            let s = o / ss;
+            let presente = bit_lsb(&mapa, s);
+            let mut t = s + 1;
+            while t * ss < fin && bit_lsb(&mapa, t) == presente {
+                t += 1;
+            }
+            let hasta = (t * ss).min(fin);
+            let trozo = &mut parte[(o - dentro) as usize..(hasta - dentro) as usize];
+            let v = pos + (o - dentro);
+            if presente {
+                leer_en(&self.file, self.registro.as_ref(), base + o, trozo)?;
+            } else {
+                self.leer_padre(v, trozo)?;
+            }
+            o = hasta;
+        }
+        Ok(())
+    }
+}
+
+/// Bit `s` de un mapa de bits de sectores de VHDX (el bit 0 de cada byte es el primer sector).
+fn bit_lsb(mapa: &[u8], s: u64) -> bool {
+    usize::try_from(s / 8)
+        .ok()
+        .and_then(|i| mapa.get(i))
+        .is_some_and(|&x| x & (1 << (s % 8)) != 0)
+}
+
+/// Añade un tramo fusionándolo con el anterior si es contiguo y del mismo tipo.
+fn anadir_tramo(tramos: &mut Vec<AllocationRun>, lba: u64, n: u64, tipo: Allocation) {
+    if n == 0 {
+        return;
+    }
+    match tramos.last_mut() {
+        Some((l, c, t)) if *t == tipo && *l + *c == lba => *c += n,
+        _ => tramos.push((lba, n, tipo)),
+    }
+}
+
+impl Layer for VhdxImage {
+    const FORMAT: &'static str = FORMATO;
+    const IMAGE_FORMAT: ImageFormat = ImageFormat::Vhdx;
+
+    fn open_layer(file: File, tolerant: bool) -> Result<Self> {
+        Self::abrir(file, tolerant, true)
+    }
+
+    fn is_differencing(&self) -> bool {
+        self.diferencial.is_some()
+    }
+
+    fn identity(&self) -> [u8; 16] {
+        self.guid_datos
+    }
+
+    /// Especificación: el DataWriteGuid del padre debe ser `parent_linkage` (o, si existe,
+    /// `parent_linkage2`, que la especificación admite como vínculo alternativo).
+    fn link(&self, parent: &Self, _parent_mtime: Option<SystemTime>) -> Link {
+        let Some(d) = &self.diferencial else {
+            return Link::Mismatch("la imagen no es un disco diferencial".into());
+        };
+        let Some(v) = d.vinculo else {
+            return Link::Mismatch(
+                "el localizador no tiene un parent_linkage válido: no se puede verificar".into(),
+            );
+        };
+        if v == parent.guid_datos {
+            return Link::Verified(Vec::new());
+        }
+        if d.vinculo2 == Some(parent.guid_datos) {
+            return Link::Verified(vec!["vínculo verificado por parent_linkage2".to_string()]);
+        }
+        Link::Mismatch(format!(
+            "el diferencial espera el DataWriteGuid {} y el fichero tiene {}",
+            formatear_guid(&v),
+            formatear_guid(&parent.guid_datos)
+        ))
+    }
+
+    fn hints(&self) -> Vec<ExternalHint> {
+        let Some(d) = &self.diferencial else {
+            return Vec::new();
+        };
+        let mut v = vec![ExternalHint::new(
+            "locator_type",
+            &formatear_guid(&d.tipo_localizador),
+        )];
+        v.extend(d.pares.iter().map(|(k, x)| ExternalHint::new(k, x)));
+        v
+    }
+
+    fn reference(&self) -> String {
+        self.referencia_padre()
+    }
+
+    fn attach_parent(&mut self, parent: Arc<dyn BlockDevice>) {
+        self.padre = Some(parent);
+    }
+
+    fn describe(&self) -> String {
+        VhdxImage::describe(self)
+    }
+
+    fn discarded_blocks(&self) -> u64 {
+        self.descartados
+    }
+}
+
 impl BlockDevice for VhdxImage {
     fn size(&self) -> u64 {
         self.tam_virtual
@@ -924,17 +1381,22 @@ impl BlockDevice for VhdxImage {
             let dentro = pos % tb;
             let n = (tb - dentro).min(resto.len() as u64) as usize;
             let (parte, siguiente) = resto.split_at_mut(n);
-            let base = self
+            let v = self
                 .bloques
                 .get(b as usize)
                 .copied()
                 .ok_or_else(|| corrupto(format!("bloque {b} fuera de la BAT")))?;
-            if base == 0 {
-                parte.fill(0);
-            } else if base == DESCARTADO {
-                return Err(tolerant::discarded_read(FORMATO, "bloque", b, pos, n));
-            } else {
-                leer_en(&self.file, self.registro.as_ref(), base + dentro, parte)?;
+            match v {
+                0 => parte.fill(0),
+                DEL_PADRE => self.leer_padre(pos, parte)?,
+                DESCARTADO => return Err(tolerant::discarded_read(FORMATO, "bloque", b, pos, n)),
+                _ if v & PARCIAL != 0 => {
+                    let d = self.diferencial.as_ref().ok_or_else(|| {
+                        corrupto(format!("bloque {b} parcial en un disco sin padre"))
+                    })?;
+                    self.leer_parcial(d, b, v & !(MIB - 1), dentro, pos, parte)?;
+                }
+                base => leer_en(&self.file, self.registro.as_ref(), base + dentro, parte)?,
             }
             pos += n as u64;
             resto = siguiente;
@@ -954,15 +1416,41 @@ impl BlockDevice for VhdxImage {
         let mut s = lba;
         while s < fin {
             let b = s / por_bloque;
+            let primero = b * por_bloque;
             let limite = ((b + 1) * por_bloque).min(fin);
             // Un bloque descartado es `Data`: hay que «leerlo» para descubrir que no es fiable.
-            let tipo = match self.bloques.get(b as usize) {
-                Some(0) | None => Allocation::Sparse,
-                Some(_) => Allocation::Data,
-            };
-            match tramos.last_mut() {
-                Some((_, n, t)) if *t == tipo => *n += limite - s,
-                _ => tramos.push((s, limite - s, tipo)),
+            match self.bloques.get(b as usize).copied() {
+                Some(0) | None => anadir_tramo(&mut tramos, s, limite - s, Allocation::Sparse),
+                Some(DEL_PADRE) => self.tramos_padre(&mut tramos, s, limite - s),
+                Some(v) if v != DESCARTADO && v & PARCIAL != 0 => {
+                    let mapa = self.diferencial.as_ref().and_then(|d| {
+                        let len = usize::try_from((limite - s) * u64::from(self.sector_logico))
+                            .unwrap_or(usize::MAX);
+                        let voff = s * u64::from(self.sector_logico);
+                        self.mapa_bloque(d, b, voff, len).ok()
+                    });
+                    let Some(mapa) = mapa else {
+                        // Mapa ilegible: no se sabe qué sectores tiene esta capa (conservador).
+                        anadir_tramo(&mut tramos, s, limite - s, Allocation::Data);
+                        s = limite;
+                        continue;
+                    };
+                    let mut r = s;
+                    while r < limite {
+                        let presente = bit_lsb(&mapa, r - primero);
+                        let mut t = r + 1;
+                        while t < limite && bit_lsb(&mapa, t - primero) == presente {
+                            t += 1;
+                        }
+                        if presente {
+                            anadir_tramo(&mut tramos, r, t - r, Allocation::Data);
+                        } else {
+                            self.tramos_padre(&mut tramos, r, t - r);
+                        }
+                        r = t;
+                    }
+                }
+                Some(_) => anadir_tramo(&mut tramos, s, limite - s, Allocation::Data),
             }
             s = limite;
         }
