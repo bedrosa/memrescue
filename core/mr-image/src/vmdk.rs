@@ -30,7 +30,9 @@
 //!   grano que no se descomprime o no mide lo esperado da error de lectura, nunca datos.
 //! - Se rechazan con [`IoError::UnsupportedFeature`]: compresión sin marcadores (o al revés),
 //!   algoritmos distintos de deflate, `COWD` (ESX antiguo), versiones e indicadores desconocidos y
-//!   descriptores de texto separados (monolithicFlat, twoGbMaxExtent*, vmfs…).
+//!   descriptores de texto separados (monolithicFlat, twoGbMaxExtent*, vmfs…). Estos se abren con
+//!   [`crate::vmdk_extents`] y los ficheros que aprueba el usuario; allí cada extensión SPARSE usa
+//!   este lector (`VmdkImage::open_extent`).
 
 use crate::budget::{Budget, TABLE_CHUNK};
 use crate::tolerant::{self, Damage, Hit, Zone};
@@ -46,7 +48,7 @@ const HEADER_LEN: usize = 512;
 const MAGIC: &[u8; 4] = b"KDMV";
 /// Cabecera de los discos dispersos de ESX 2.x (formato «COWD»), no soportado.
 const COWD_MAGIC: &[u8; 4] = b"COWD";
-const TEXT_DESCRIPTOR_SIGNATURE: &[u8] = b"# disk descriptorfile";
+pub(crate) const TEXT_DESCRIPTOR_SIGNATURE: &[u8] = b"# disk descriptorfile";
 
 const FLAG_NEWLINE_TEST: u32 = 1;
 const FLAG_REDUNDANT_GT: u32 = 1 << 1;
@@ -81,21 +83,21 @@ pub const MAX_DESCRIPTOR_LINE: usize = 4096;
 const MAX_REFERENCE_CHARS: usize = 260;
 const NO_PARENT_CID: &str = "ffffffff";
 
-fn corrupt(detail: impl Into<String>) -> IoError {
+pub(crate) fn corrupt(detail: impl Into<String>) -> IoError {
     IoError::Corrupt {
         format: FORMAT,
         detail: detail.into(),
     }
 }
 
-fn unsupported(detail: impl Into<String>) -> IoError {
+pub(crate) fn unsupported(detail: impl Into<String>) -> IoError {
     IoError::UnsupportedFeature {
         format: FORMAT,
         detail: detail.into(),
     }
 }
 
-fn external(reference: &str) -> IoError {
+pub(crate) fn external(reference: &str) -> IoError {
     IoError::ExternalReference {
         format: FORMAT,
         reference: sanitize(reference),
@@ -104,7 +106,7 @@ fn external(reference: &str) -> IoError {
 
 /// Convierte un texto del fichero en algo seguro para un mensaje: caracteres de control escapados
 /// y longitud acotada. Nunca se interpreta como ruta.
-fn sanitize(s: &str) -> String {
+pub(crate) fn sanitize(s: &str) -> String {
     let mut out = String::new();
     for (i, c) in s.chars().enumerate() {
         if i >= MAX_REFERENCE_CHARS {
@@ -337,7 +339,7 @@ pub fn parse_descriptor(text: &str) -> Result<VmdkDescriptor> {
 
 /// Texto del descriptor: hasta el primer NUL, con conversión UTF-8 tolerante (los bytes no
 /// válidos se sustituyen; solo se usan como texto).
-fn descriptor_text(bytes: &[u8]) -> String {
+pub(crate) fn descriptor_text(bytes: &[u8]) -> String {
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
@@ -539,7 +541,7 @@ fn detail(e: IoError) -> String {
 
 /// Lectura posicional completa; reintenta `Interrupted` y convierte el fin de fichero prematuro
 /// (fichero acortado tras abrirlo) en error, nunca en datos inventados.
-fn read_exact_at(file: &File, offset: u64, buf: &mut [u8]) -> Result<()> {
+pub(crate) fn read_exact_at(file: &File, offset: u64, buf: &mut [u8]) -> Result<()> {
     mr_io::read_exact_at(file, offset, buf).map_err(|source| IoError::Read {
         offset,
         len: buf.len(),
@@ -616,12 +618,31 @@ impl VmdkImage {
     /// Como [`Self::open`]; con `tolerant`, las entradas de GD y GT inválidas o ambiguas no impiden
     /// abrir la imagen: sus granos se descartan (ver la documentación del módulo).
     pub fn open_with(file: File, tolerant: bool) -> Result<Self> {
+        Self::open_inner(file, tolerant, None)
+    }
+
+    /// Abre un fichero de extensión dispersa de un disco descrito por un descriptor separado
+    /// (`twoGbMaxExtentSparse` o un descriptor que cita un único fichero SPARSE). La semántica la
+    /// da el descriptor separado: el descriptor incrustado puede faltar (`descriptorOffset` = 0)
+    /// o estar vacío (qemu-img lo deja a ceros) y no se exige su `createType`; si tiene texto, se
+    /// interpreta y un padre declarado es `ExternalReference`. La capacidad de la cabecera debe
+    /// ser exactamente `sectors` (el tamaño declarado en el descriptor separado).
+    pub(crate) fn open_extent(file: File, tolerant: bool, sectors: u64) -> Result<Self> {
+        Self::open_inner(file, tolerant, Some(sectors))
+    }
+
+    fn open_inner(file: File, tolerant: bool, extent_sectors: Option<u64>) -> Result<Self> {
         let file_len = file.metadata()?.len();
         let mut head = [0u8; HEADER_LEN];
         let head_len = file_len.min(HEADER_LEN as u64) as usize;
         read_exact_at(&file, 0, &mut head[..head_len])?;
 
         if head_len < 4 || head[..4] != *MAGIC {
+            if extent_sectors.is_some() {
+                return Err(corrupt(
+                    "el fichero de una extensión SPARSE no empieza por la firma «KDMV»",
+                ));
+            }
             return Err(Self::reject_non_sparse(&file, file_len, &head[..head_len]));
         }
         if head_len < HEADER_LEN {
@@ -634,33 +655,50 @@ impl VmdkImage {
         let stream = header.is_stream();
 
         // Descriptor incrustado.
-        if header.descriptor_offset == 0 {
+        if header.descriptor_offset == 0 && extent_sectors.is_none() {
             return Err(unsupported(
                 "extensión dispersa sin descriptor incrustado: forma parte de un disco descrito \
-                 por otro fichero (p. ej. twoGbMaxExtentSparse)",
+                 por otro fichero (p. ej. twoGbMaxExtentSparse); abra el descriptor e indique \
+                 sus extensiones",
             ));
         }
-        let desc_bytes = header
-            .descriptor_size
-            .checked_mul(SECTOR)
-            .filter(|&b| b > 0 && b <= MAX_DESCRIPTOR_BYTES as u64)
-            .ok_or_else(|| {
-                corrupt(format!(
-                    "tamaño de descriptor no válido: {} sectores",
-                    header.descriptor_size
-                ))
-            })?;
-        let desc_off =
-            Self::checked_region("descriptor", header.descriptor_offset, desc_bytes, file_len)?;
-        let mut desc_raw = vec![0u8; desc_bytes as usize];
-        read_exact_at(&file, desc_off, &mut desc_raw)?;
-        let descriptor = parse_descriptor(&descriptor_text(&desc_raw))?;
-        Self::validate_descriptor(&descriptor, header.capacity, stream)?;
+        let mut zones = vec![Zone::fixed(0, HEADER_LEN as u64)];
+        let mut desc_zone: Option<(u64, u64)> = None;
+        let mut descriptor = VmdkDescriptor::default();
+        if header.descriptor_offset != 0 {
+            let desc_bytes = header
+                .descriptor_size
+                .checked_mul(SECTOR)
+                .filter(|&b| b > 0 && b <= MAX_DESCRIPTOR_BYTES as u64)
+                .ok_or_else(|| {
+                    corrupt(format!(
+                        "tamaño de descriptor no válido: {} sectores",
+                        header.descriptor_size
+                    ))
+                })?;
+            let desc_off =
+                Self::checked_region("descriptor", header.descriptor_offset, desc_bytes, file_len)?;
+            let mut desc_raw = vec![0u8; desc_bytes as usize];
+            read_exact_at(&file, desc_off, &mut desc_raw)?;
+            descriptor = parse_descriptor(&descriptor_text(&desc_raw))?;
+            zones.push(Zone::fixed(desc_off, desc_bytes));
+            desc_zone = Some((desc_off, desc_bytes));
+        }
+        match extent_sectors {
+            None => Self::validate_descriptor(&descriptor, header.capacity, stream)?,
+            Some(sectors) => {
+                if let Some(parent) = descriptor.parent_reference() {
+                    return Err(external(&parent));
+                }
+                if header.capacity != sectors {
+                    return Err(corrupt(format!(
+                        "la cabecera de la extensión declara {} sectores y el descriptor {sectors}",
+                        header.capacity
+                    )));
+                }
+            }
+        }
 
-        let mut zones = vec![
-            Zone::fixed(0, HEADER_LEN as u64),
-            Zone::fixed(desc_off, desc_bytes),
-        ];
         // streamOptimized: GD del pie si la cabecera lo deja al final. Con el GD en la cabecera no
         // se exige el marcador de fin de flujo: qemu-img no siempre lo escribe, y un fichero
         // truncado deja fuera algún grano o tabla (lo detectan sus propias comprobaciones).
@@ -695,7 +733,7 @@ impl VmdkImage {
         if gd_entries > 0 {
             let gd_off =
                 Self::checked_region("directorio de granos", gd_offset, gd_bytes, file_len)?;
-            if desc_off < gd_off + gd_bytes && gd_off < desc_off + desc_bytes {
+            if desc_zone.is_some_and(|(o, n)| o < gd_off + gd_bytes && gd_off < o + n) {
                 return Err(corrupt(
                     "el descriptor y el directorio de granos se solapan",
                 ));
@@ -1391,7 +1429,7 @@ impl BlockDevice for VmdkImage {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::io::Write;
 
@@ -1512,6 +1550,16 @@ mod tests {
         fn open(&self) -> Result<VmdkImage> {
             open_bytes(&self.build())
         }
+    }
+
+    /// Extensión dispersa de `capacity` sectores (granos de 16 sectores) sin texto en el
+    /// descriptor incrustado (como las de twoGbMaxExtentSparse de qemu-img); `grains`: (índice,
+    /// byte de relleno).
+    pub(crate) fn sparse_extent_bytes(capacity: u64, grains: &[(u64, u8)]) -> Vec<u8> {
+        let mut b = Builder::new(capacity);
+        b.descriptor = String::new();
+        b.grains = grains.to_vec();
+        b.build()
     }
 
     fn open_bytes(bytes: &[u8]) -> Result<VmdkImage> {

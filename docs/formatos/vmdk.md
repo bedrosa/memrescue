@@ -1,7 +1,10 @@
-# VMDK (monolithicSparse y streamOptimized): lector de solo lectura
+# VMDK (monolithicSparse, streamOptimized y descriptor separado): lector de solo lectura
 
 Implementación: `core/mr-image/src/vmdk.rs` (`mr_image::vmdk::VmdkImage`) y, para lo propio de
-streamOptimized (marcadores, pie, descompresión y caché), `core/mr-image/src/vmdk_stream.rs`.
+streamOptimized (marcadores, pie, descompresión y caché), `core/mr-image/src/vmdk_stream.rs`. Los
+discos con descriptor de texto separado (monolithicFlat, twoGbMaxExtent*) están en
+`core/mr-image/src/vmdk_extents.rs` (`VmdkExtentImage`, incidencia 11) y los ficheros que aprueba el
+usuario, en `core/mr-image/src/external.rs` (`ApprovedFiles`); ver «Descriptor separado» más abajo.
 Pruebas: unitarias en los mismos ficheros, cruzadas contra `qemu-img` en
 `core/mr-image/tests/vmdk_qemu.rs` y de corrupción en `core/mr-image/tests/corruption.rs`.
 
@@ -72,8 +75,10 @@ ignora claves informativas (`ddb.*`, `encoding`…).
 | Granos comprimidos sin marcadores, marcadores sin compresión, `compressAlgorithm` distinto de 1 con compresión, o GD al final / algoritmo sin los indicadores de compresión | `UnsupportedFeature` |
 | streamOptimized con granos de más de 2¹⁵ sectores (16 MiB; VMware y qemu usan 64 KiB) | `UnsupportedFeature` |
 | Cabecera de streamOptimized con `createType` monolithicSparse, o al revés | `Corrupt` (incoherente) |
-| Descriptor de texto separado (`monolithicFlat`, `twoGbMaxExtent*`, `vmfs*`…) | `ExternalReference` con los nombres (como texto) de los ficheros de extensión, que no se abren; si el descriptor no se puede interpretar, `UnsupportedFeature`. (Cambio del integrador: antes era siempre `UnsupportedFeature`; la interfaz necesita saber qué fichero falta.) |
-| Extensión dispersa sin descriptor incrustado (`descriptorOffset` = 0, p. ej. `-s001.vmdk`) | `UnsupportedFeature` |
+| Descriptor de texto separado abierto con la detección automática (`open_image`) | `ExternalReference` con los nombres (como texto) de los ficheros de extensión, que no se abren; si el descriptor no se puede interpretar, `UnsupportedFeature` |
+| Descriptor separado `monolithicFlat`, `twoGbMaxExtentFlat`, `twoGbMaxExtentSparse` o `monolithicSparse` con extensiones FLAT, SPARSE y ZERO, abierto con `open_vmdk_extents` y los ficheros aprobados uno a uno | **soportado** (incidencia 11; ver «Descriptor separado») |
+| Descriptor separado `vmfs*`, `streamOptimized`, `fullDevice`, `custom`…, o extensiones VMFS, VMFSSPARSE, VMFSRDM, VMFSRAW, SESPARSE | `UnsupportedFeature` |
+| Extensión dispersa sin descriptor incrustado (`descriptorOffset` = 0, p. ej. `-s001.vmdk`) abierta sola | `UnsupportedFeature` (se lee como extensión de su descriptor) |
 | Firma `COWD` (ESX 2.x) | `UnsupportedFeature` |
 | Versión fuera de 1–3, indicadores desconocidos | `UnsupportedFeature` |
 | Otro `createType` con cabecera `KDMV` | `UnsupportedFeature` |
@@ -85,6 +90,73 @@ El nombre de la extensión única SPARSE no se compara con el nombre real del fi
 no lo conoce y renombrar un `.vmdk` es habitual): por definición, en monolithicSparse y
 streamOptimized esa extensión es el propio fichero. Si el nombre parece una ruta se trata como
 referencia externa.
+
+## Descriptor separado con extensiones (incidencia 11)
+
+Un descriptor de texto (`# Disk DescriptorFile`, ≤ 1 MiB) describe el disco virtual como la
+concatenación, en orden, de sus líneas de extensión `ACCESO SECTORES TIPO ["FICHERO" [DESPL]]`. qemu-img
+genera `monolithicFlat` (`x.vmdk` + `x-flat.vmdk`), `twoGbMaxExtentFlat` (`x-f001.vmdk`, `x-f002.vmdk`…)
+y `twoGbMaxExtentSparse` (`x-s001.vmdk`…) en trozos de **exactamente 2 GiB** (4 194 304 sectores; no hay
+opción para cambiarlo); cada extensión SPARSE es una cabecera `KDMV` con `capacity` = sectores de la
+extensión y un descriptor incrustado vacío (a ceros, `descriptorOffset` = 1).
+
+**Apertura explícita (ADR-018, addendum).** El motor nunca abre un fichero que nombra el descriptor:
+
+1. `list_vmdk_extents(descriptor)` / `mr_api::vmdk_required_extents` / `mr_vmdk_extents_list` /
+   `memrescue-cli vmdk-extents` interpretan el descriptor y devuelven cada extensión (acceso, tipo,
+   sectores, desplazamiento, primer sector virtual, nombre **exacto** declarado, si necesita fichero y su
+   problema, si lo hay) **sin abrir ninguna**.
+2. El usuario asigna a cada nombre necesario un fichero (en la interfaz se sugiere, sin abrirlo, el del
+   mismo directorio con el nombre exacto, y se confirma uno a uno; en la CLI, `--extent NOMBRE=RUTA` por
+   cada extensión).
+3. `open_vmdk_extents(descriptor, &ApprovedFiles, opts)` abre **solo** esos ficheros. `ApprovedFiles`
+   admite cada ruta con la política de rutas (ADR-014) y la abre en solo lectura; la búsqueda por nombre
+   es por coincidencia exacta y nunca toca el sistema de archivos.
+
+No existe una opción «todas las extensiones del directorio» (`--extents-from-dir` se rechaza a
+propósito): un descriptor puede nombrar ficheros que el usuario no ha revisado (otro disco, un fichero
+de datos) y el motor los leería como parte del disco; cada fichero debe nombrarse o confirmarse.
+
+**Validaciones** (antes de abrir nada salvo el descriptor):
+
+- `createType` ∈ {monolithicFlat, twoGbMaxExtentFlat, twoGbMaxExtentSparse, monolithicSparse} (sin
+  distinguir mayúsculas); otro → `UnsupportedFeature`. Disco con padre (`parentFileNameHint` o
+  `parentCID` ≠ `ffffffff`) → `ExternalReference` (padres fuera del alcance).
+- Al menos una extensión y como mucho 32 768; ninguna de 0 sectores; la suma de sectores (= tamaño
+  virtual; el descriptor no declara otro) sin desbordar `u64::MAX / 512` → si no, `Corrupt`.
+- Tipos: FLAT, SPARSE (sin desplazamiento distinto de 0) y ZERO (sin fichero). VMFS, VMFSSPARSE,
+  VMFSRDM, VMFSRAW y SESPARSE → `UnsupportedFeature`. FLAT con `desplazamiento + sectores` que desborda →
+  `Corrupt`.
+- Nombre de fichero: solo **nombres simples**. Se rechazan (`UnsupportedFeature`, aunque el usuario los
+  apruebe) los vacíos, con `..`, con `/` o `\` (rutas absolutas o con directorios, UNC, `\\?\…`,
+  `\\.\…`), con `:` (unidad, flujo alternativo), con `<>"|?*` o caracteres de control, con espacios
+  en los extremos o punto final, los nombres de dispositivo DOS (`NUL`, `COM1`, `con.vmdk`…) y los que no
+  son UTF-8 válido.
+- Nombres repetidos (sin distinguir mayúsculas, el mismo fichero en NTFS) → `Corrupt`.
+- Ficheros aprobados: cada extensión necesaria (FLAT o SPARSE con acceso RW o RDONLY) debe tener uno
+  (si faltan → `ExternalReference` con los nombres que faltan); un fichero aprobado para un nombre que no
+  es una extensión necesaria, el propio descriptor, dos nombres con el mismo fichero o un nombre
+  repetido son un error del llamador (`InvalidInput`; `InvalidArgument` en la API y la ABI).
+- FLAT: el fichero debe medir al menos `(desplazamiento + sectores) × 512` → si no, `Corrupt`.
+- SPARSE: se abre con el lector de monolithicSparse / streamOptimized como extensión
+  (`VmdkImage::open_extent`): misma validación de cabecera, GD, GT y granos (y modo tolerante); el
+  descriptor incrustado puede faltar o estar vacío (si tiene texto y declara padre → `ExternalReference`)
+  y `capacity` debe ser exactamente los sectores declarados → si no, `Corrupt`. La especificación solo
+  define streamOptimized como disco monolítico; se acepta también como extensión porque el lector es el
+  mismo (probado con un descriptor escrito a mano y una extensión streamOptimized de qemu-img).
+
+**Lectura.** FLAT: bytes del fichero desde `desplazamiento × 512` (`Data` en `allocation`). SPARSE: el
+lector de la extensión, con sus dispersos y granos descartados. ZERO: ceros (`Sparse`). NOACCESS: el
+fichero no se abre ni se exige; `read_at` devuelve `IoError::Read` (`PermissionDenied`) con el rango
+virtual, `allocation` lo informa como `Data` y el lector tolerante lo marca `Unreadable` con el patrón de
+relleno: nunca datos. Un fichero FLAT acortado tras abrirlo da error de lectura. `describe()`: p. ej.
+«VMDK twoGbMaxExtentSparse (descriptor separado), 3 extensiones (SPARSE ×3)». Los ficheros de extensión
+abiertos se guardan como `segments` del origen: nunca se aceptan como destino de una extracción.
+
+**Lo que no se comprueba.** El descriptor no guarda ninguna suma de las extensiones ni su identidad
+(salvo el `CID`, que no se compara con nada): si el usuario aprueba un fichero equivocado del tamaño
+adecuado, se lee como si fuera la extensión. Por eso la interfaz muestra el nombre declarado junto al
+fichero elegido y exige confirmar cada uno.
 
 ## Validaciones
 
@@ -282,6 +354,8 @@ Integración contra `qemu-img` (`MR_QEMU_IMG` o
 | streamOptimized de 8 MiB con 1 a 3 bytes alterados en los datos comprimidos de 1 a 3 granos (120 iteraciones, ambos modos) | se abre sin descartes; cada grano se lee idéntico al original o da `IoError::Read`, y solo los alterados (resultado: todos los alterados ilegibles); lector tolerante sector a sector con un grano dañado; fichero intacto |
 | streamOptimized con el LBA de un marcador alterado, truncado a mitad del último grano y cortado justo tras el último grano | estricto `Corrupt` y tolerante con 1 grano descartado (sector a sector contra la referencia); el último caso abre en ambos modos y se lee entero |
 | `subformat=monolithicFlat` | el descriptor da `ExternalReference` citando `…-flat.vmdk`; el fichero plano da `Corrupt` (sin `KDMV`); no se sigue la referencia |
+| Descriptor separado (`vmdk_extents_qemu.rs`, incidencia 11): RAW disperso (`fsutil sparse setflag`) de 16 MiB + 37 sectores → `monolithicFlat`, `twoGbMaxExtentFlat` y `twoGbMaxExtentSparse` (1 extensión); 2 GiB + 3 MiB + 7 sectores → `twoGbMaxExtentFlat` (2 extensiones, unos 2 GiB en disco mientras dura la prueba); 4 GiB + 3 MiB + 7 sectores → `twoGbMaxExtentSparse` (3 extensiones) | `qemu-img compare` RAW ↔ VMDK; lista sin abrir nada con tamaño y nombres; sin aprobar (o sin la última) `ExternalReference` y la detección automática tampoco la sigue; con cada fichero aprobado: SHA-256 completo = RAW, 200 rangos aleatorios más los bordes de cada extensión, `allocation` = `qemu-img map` (SPARSE) o todo datos (FLAT); descriptor, extensiones y RAW intactos (SHA-256, tamaño, fecha) |
+| Descriptor escrito a mano con una extensión SPARSE: un monolithicSparse y un streamOptimized de qemu-img | SHA-256 = RAW; tamaño declarado distinto de la capacidad → `Corrupt`; descriptor con `parentFileNameHint` → `ExternalReference`; ficheros intactos |
 | `create -f vmdk -b base.vmdk -F vmdk hijo.vmdk` | `ExternalReference` con `base.vmdk` |
 
 Extremo a extremo (`core/mr-api/tests/containers_qemu.rs`): el corpus GPT/MBR (512 y 4096 bytes por
@@ -300,7 +374,8 @@ acortado tras abrir (cada grano cuyo marcador o datos quedan fuera da error).
 
 ## Limitaciones
 
-- No se interpretan discos multi-extensión, FLAT/VMFS, SESparse ni cadenas de instantáneas (padres).
+- Discos multiextensión y FLAT solo con descriptor separado y ficheros aprobados uno a uno (incidencia
+  11); VMFS*, SESparse y cadenas de instantáneas (padres) no se interpretan.
 - streamOptimized: solo deflate con marcadores; no se comprueban los marcadores de GT y GD (qemu-img
   no los escribe cuando deja las tablas al principio) ni el `numSectors` del marcador del pie.
 - No se usa el GD redundante para recuperar un GD principal dañado, y sus GT no se consideran al

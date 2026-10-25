@@ -18,6 +18,7 @@
 
 mod budget;
 pub mod crc32c;
+pub mod external;
 pub mod open;
 pub mod split;
 mod tolerant;
@@ -25,9 +26,14 @@ pub mod vhd;
 pub mod vhdx;
 mod vhdx_log;
 pub mod vmdk;
+pub mod vmdk_extents;
 mod vmdk_stream;
 
-pub use open::{open_image, open_split, OpenOptions, OpenedImage, Reblocked};
+pub use external::ApprovedFiles;
+pub use open::{
+    list_vmdk_extents, open_image, open_split, open_vmdk_extents, OpenOptions, OpenedImage,
+    Reblocked,
+};
 
 /// Límite de memoria para tablas de asignación (BAT, directorios de grano…).
 pub const MAX_TABLE_BYTES: u64 = 256 * 1024 * 1024;

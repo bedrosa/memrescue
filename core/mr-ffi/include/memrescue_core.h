@@ -42,6 +42,10 @@
  * listado de directorios por índice, rutas, árbol como tarea, un fichero como origen y copia de
  * un fichero como tarea; códigos 15 (MR_ERR_NOT_FOUND) y 16 (MR_ERR_ALREADY_EXISTS), que solo
  * devuelven estas funciones.
+ * Añadido sin cambiar la ABI 3 (M1.5, issue #11): VMDK con descriptor separado y extensiones
+ * aprobadas explícitamente (mr_vmdk_extents_list, mr_vmdk_extents_info, mr_vmdk_extents_describe,
+ * mr_vmdk_extents_issue, mr_vmdk_extent_get, mr_vmdk_extent_name, mr_vmdk_extent_issue,
+ * mr_vmdk_extents_free y mr_source_open_vmdk con mr_approved_file versionada).
  */
 #ifndef MEMRESCUE_CORE_H
 #define MEMRESCUE_CORE_H
@@ -756,6 +760,89 @@ mr_status mr_ntfs_copy_start(uint64_t volume, uint64_t record,
                              const uint8_t *out_path, size_t out_path_len,
                              uint32_t flags, uint64_t *out_task);
 mr_status mr_ntfs_copy_result(uint64_t task, mr_ntfs_copy_report *out);
+
+/*
+ * VMDK con descriptor separado (M1.5, issue #11, ADR-018): monolithicFlat, twoGbMaxExtentFlat,
+ * twoGbMaxExtentSparse y descriptor que cita un único fichero SPARSE. mr_vmdk_extents_list
+ * interpreta el descriptor SIN abrir ninguna extensión y devuelve un handle que se consulta por
+ * índice y se libera con mr_vmdk_extents_free. mr_source_open_vmdk abre el disco usando SOLO los
+ * ficheros de la lista files (nombre declarado en el descriptor, coincidencia exacta → ruta elegida
+ * por el usuario); el motor nunca busca ni abre otros ficheros. Una extensión necesaria sin fichero
+ * aprobado: MR_ERR_EXTERNAL_REFERENCE; nombre del descriptor que no es un nombre de fichero simple
+ * (ruta absoluta, UNC, "..", separadores, dispositivo): MR_ERR_UNSUPPORTED_FEATURE aunque se
+ * apruebe; lista mal formada (nombre repetido, dos nombres con el mismo fichero, nombre que no
+ * corresponde a una extensión necesaria, el propio descriptor): MR_ERR_INVALID_ARGUMENT. Las
+ * extensiones NOACCESS se leen como ilegibles; las ZERO, como dispersas.
+ */
+#define MR_VMDK_HAS_PARENT          1u   /* mr_vmdk_extents_info.flags */
+#define MR_VMDK_OPENABLE            2u
+#define MR_VMDK_ISSUE_NONE          0u   /* issue_kind */
+#define MR_VMDK_ISSUE_CORRUPT       1u
+#define MR_VMDK_ISSUE_UNSUPPORTED   2u
+#define MR_VMDK_ISSUE_PARENT        3u   /* disco padre: fuera del alcance */
+#define MR_VMDK_ACCESS_RW           1u   /* mr_vmdk_extent.access */
+#define MR_VMDK_ACCESS_RDONLY       2u
+#define MR_VMDK_ACCESS_NOACCESS     3u
+#define MR_VMDK_EXTENT_SPARSE       1u   /* mr_vmdk_extent.kind */
+#define MR_VMDK_EXTENT_FLAT         2u
+#define MR_VMDK_EXTENT_ZERO         3u
+#define MR_VMDK_EXTENT_VMFS         4u
+#define MR_VMDK_EXTENT_VMFSSPARSE   5u
+#define MR_VMDK_EXTENT_VMFSRDM      6u
+#define MR_VMDK_EXTENT_VMFSRAW      7u
+#define MR_VMDK_EXTENT_SESPARSE     8u
+#define MR_VMDK_EXTENT_NEEDS_FILE      1u   /* mr_vmdk_extent.flags: hay que aprobar un fichero */
+#define MR_VMDK_EXTENT_HAS_FILE_NAME   2u   /* la línea declara un nombre de fichero */
+#define MR_MAX_APPROVED_FILES 32768u
+
+typedef struct mr_vmdk_extents_info {  /* 32 bytes */
+    uint32_t struct_size;        /* = sizeof(mr_vmdk_extents_info), lo escribe el llamador */
+    uint32_t extent_count;
+    uint32_t required_count;     /* extensiones para las que hay que aprobar un fichero */
+    uint32_t flags;              /* MR_VMDK_HAS_PARENT | MR_VMDK_OPENABLE */
+    uint64_t virtual_size;       /* bytes (suma de las extensiones) */
+    uint32_t issue_kind;         /* primer problema (MR_VMDK_ISSUE_*) */
+    uint32_t reserved;
+} mr_vmdk_extents_info;
+
+typedef struct mr_vmdk_extent {  /* 48 bytes */
+    uint32_t struct_size;        /* = sizeof(mr_vmdk_extent), lo escribe el llamador */
+    uint32_t access;             /* MR_VMDK_ACCESS_* */
+    uint32_t kind;               /* MR_VMDK_EXTENT_* */
+    uint32_t flags;              /* MR_VMDK_EXTENT_NEEDS_FILE | MR_VMDK_EXTENT_HAS_FILE_NAME */
+    uint64_t sectors;            /* sectores de 512 bytes */
+    uint64_t offset;             /* sectores dentro del fichero (FLAT) */
+    uint64_t start_sector;       /* primer sector virtual */
+    uint32_t issue_kind;         /* MR_VMDK_ISSUE_* de esta extensión */
+    uint32_t reserved;
+} mr_vmdk_extent;
+
+typedef struct mr_approved_file {  /* 40 bytes en 64 bits */
+    uint32_t struct_size;        /* = sizeof(mr_approved_file), lo escribe el llamador */
+    uint32_t reserved;           /* debe ser 0 */
+    const uint8_t *name;         /* nombre declarado (UTF-8, coincidencia exacta) */
+    size_t name_len;
+    const uint8_t *path;         /* fichero elegido por el usuario (UTF-8) */
+    size_t path_len;
+} mr_approved_file;
+
+mr_status mr_vmdk_extents_list(const uint8_t *path, size_t path_len, uint64_t *out_list);
+mr_status mr_vmdk_extents_info(uint64_t list, mr_vmdk_extents_info *out);
+/* Tipo de disco y extensiones por tipo (texto). */
+mr_status mr_vmdk_extents_describe(uint64_t list, uint8_t *buf, size_t cap, size_t *out_len);
+/* Primer problema que impide abrir el disco (cadena vacía si no hay ninguno). */
+mr_status mr_vmdk_extents_issue(uint64_t list, uint8_t *buf, size_t cap, size_t *out_len);
+mr_status mr_vmdk_extent_get(uint64_t list, uint32_t index, mr_vmdk_extent *out);
+/* Nombre exactamente como lo declara el descriptor (cadena vacía en ZERO). */
+mr_status mr_vmdk_extent_name(uint64_t list, uint32_t index,
+                              uint8_t *buf, size_t cap, size_t *out_len);
+mr_status mr_vmdk_extent_issue(uint64_t list, uint32_t index,
+                               uint8_t *buf, size_t cap, size_t *out_len);
+mr_status mr_vmdk_extents_free(uint64_t list);
+/* flags: 0 o MR_OPEN_TOLERANT. files puede ser NULL con count = 0. Se cierra con mr_source_close. */
+mr_status mr_source_open_vmdk(const uint8_t *path, size_t path_len, uint32_t sector_size,
+                              uint32_t flags, const mr_approved_file *files, uint32_t count,
+                              uint64_t *out_source);
 
 mr_status mr_task_status_get(uint64_t task, mr_task_status *out);
 mr_status mr_task_cancel(uint64_t task);

@@ -24,6 +24,9 @@ internal static partial class NativeMethods
     internal const uint AnomalyValueSigned = 4;
     internal const uint GptPresent = 1;
     internal const uint PartitionOpenApplyShift = 1;
+    internal const uint VmdkHasParent = 1;
+    internal const uint VmdkOpenable = 2;
+    internal const uint VmdkExtentNeedsFile = 1;
 
     [LibraryImport(Dll)]
     internal static partial uint mr_abi_version();
@@ -133,6 +136,35 @@ internal static partial class NativeMethods
 
     [LibraryImport(Dll)]
     internal static partial int mr_partitions_free(ulong table);
+
+    // VMDK con descriptor separado (incidencia 11).
+    [LibraryImport(Dll)]
+    internal static partial int mr_vmdk_extents_list(byte[] path, nuint pathLen, out ulong list);
+
+    [LibraryImport(Dll)]
+    internal static partial int mr_vmdk_extents_info(ulong list, ref MrVmdkExtentsInfo info);
+
+    [LibraryImport(Dll)]
+    internal static partial int mr_vmdk_extents_describe(ulong list, byte[]? buf, nuint cap, out nuint outLen);
+
+    [LibraryImport(Dll)]
+    internal static partial int mr_vmdk_extents_issue(ulong list, byte[]? buf, nuint cap, out nuint outLen);
+
+    [LibraryImport(Dll)]
+    internal static partial int mr_vmdk_extent_get(ulong list, uint index, ref MrVmdkExtent extent);
+
+    [LibraryImport(Dll)]
+    internal static partial int mr_vmdk_extent_name(ulong list, uint index, byte[]? buf, nuint cap, out nuint outLen);
+
+    [LibraryImport(Dll)]
+    internal static partial int mr_vmdk_extent_issue(ulong list, uint index, byte[]? buf, nuint cap, out nuint outLen);
+
+    [LibraryImport(Dll)]
+    internal static partial int mr_vmdk_extents_free(ulong list);
+
+    [LibraryImport(Dll)]
+    internal static partial int mr_source_open_vmdk(byte[] path, nuint pathLen, uint sectorSize, uint flags,
+        MrApprovedFile[] files, uint count, out ulong source);
 
     [LibraryImport(Dll)]
     internal static partial int mr_task_status_get(ulong task, out MrTaskStatus status);

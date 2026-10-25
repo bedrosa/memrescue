@@ -143,7 +143,7 @@ public sealed record MappedSectors(byte[] Data, SectorState[] States)
 }
 
 /// <summary>Punto de entrada seguro al motor de MemRescue.</summary>
-public static class Engine
+public static partial class Engine
 {
     /// <summary>Tamaños de sector lógico ofrecidos en la interfaz.</summary>
     public static IReadOnlyList<uint> CommonSectorSizes { get; } = [512, 1024, 2048, 4096];
