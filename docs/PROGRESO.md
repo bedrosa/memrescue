@@ -276,7 +276,42 @@ The Sleuth Kit.
 copia localizable (escaneo completo, M6); los volúmenes sintéticos del corpus no tienen MFT; comparación
 manual con DMDE pendiente (opcional, ADR-002).
 
+## Etapa 9 · M3 NTFS, M1.5, M2.5 e investigaciones de M4 a M7 (2026-10-25)
+
+Trabajo en paralelo con varios agentes, cada uno en su rama y worktree, e integración centralizada por PR con
+los checks obligatorios en verde (en `main` se añadió como obligatorio el job del corpus NTFS).
+
+| Issue | PR | Resultado |
+|---|---|---|
+| #19 | #54 | Corpus NTFS reproducible byte a byte en un runner Linux desechable (mkntfs, ntfs-3g) con The Sleuth Kit como oráculo (ADR-024) |
+| #20 | #55 | `mr-fs-ntfs`: arranque y copia, MFT, registros con fixups estrictos y estado por registro (ADR-025) |
+| #21 | #56 | Atributos, runs, flujos con estado por tramo, LZNT1 contra vectores de la API de Windows, ADS; salida atómica (ADR-026) |
+| #58 | #59 | La salida nunca sustituye un fichero creado a la vez (`hard_link` atómico) |
+| #22 | #67 | Índices `$I30`, árbol, rutas y pestaña «Sistema de archivos» (ADR-028) |
+| #23 | #62, #71 | Ficheros borrados desde la MFT y desde entradas residuales de índice, recuperabilidad por clúster y recuperación (ADR-027) |
+| #18 | #60 | Copia del particionado con los bytes de las tablas, integridad y comparación |
+| #17 | #64 | Apple Partition Map |
+| #10 | #61 | Registro pendiente de VHDX reproducido en memoria |
+| #9 | #63 | VMDK streamOptimized (`miniz_oxide`, ADR-017 addendum) |
+| #11 | #69 | VMDK multiextensión y flat con confirmación explícita (`ApprovedFiles`) |
+| #8 | #70 | VHD/VHDX diferenciales con cadena de padres explícita |
+| #24, #28, #29, #30 | #57, #68, #65, #66 | Investigaciones INV-01 (recuperación), INV-03b (RAID), INV-03 (escaneo completo) e INV-02 (RAW), solo con fuentes públicas |
+
+**Validación de cierre de M3** sobre `main` (9ef6918):
+
+| Comprobación | Resultado |
+|---|---|
+| `scripts\test.ps1` (Debug, con corpus NTFS) | Todos los pasos correctos |
+| Interop C# / UI Automation | 282/282 y 22/22 |
+| `MemRescue.exe` Release publicado | Autodiagnóstico correcto con GPT 512 B y 4Kn, imágenes intactas |
+| Recuperación real con la CLI Release | 3 ficheros borrados de `ntfs_deleted` con el SHA-256 del manifiesto; imagen intacta |
+| Corpus NTFS | 503 rutas vivas, 419 ficheros con su SHA-256, 16 borrados con la recuperabilidad del manifiesto |
+
+**Limitaciones que quedan**: corpus NTFS de ntfs-3g (sin volúmenes de Windows, compresión real ni
+`$ATTRIBUTE_LIST`, cubiertos con vectores de Windows y volúmenes sintéticos); diferenciales de Hyper-V sin
+probar; restaurar particiones en disco llega con M12.
+
 ## Siguiente tarea
 
-1. M3 · NTFS lectura: #19 (corpus NTFS en GitHub Actions), después #20 (arranque y MFT con fixups), #21
-   (atributos y runs), #22 (índices y rutas) y #23 (ficheros borrados).
+1. M4 · VFS y motor de recuperación: #25 (`mr-vfs`, en integración), #26 (motor de recuperación) y #27
+   (informes), sobre el diseño de INV-01 y los valores por defecto de ADR-029.
