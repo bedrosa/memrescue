@@ -1,5 +1,6 @@
-//! Sistema de archivos NTFS (#22, ampliación compatible de la ABI 3): volumen, directorios,
-//! rutas, árbol en segundo plano, un fichero como origen y copia de un fichero a una salida.
+//! Sistema de archivos NTFS (#22 y #23, ampliaciones compatibles de la ABI 3): volumen,
+//! directorios, rutas, árbol en segundo plano, un fichero como origen, copia de un fichero a una
+//! salida, borrados y entradas residuales de los índices, y recuperación de un borrado.
 //!
 //! Mismos patrones que las particiones: handles del registro (nunca punteros), estructuras de
 //! salida versionadas por `struct_size`, consultas por índice y tareas con
@@ -8,9 +9,13 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use mr_api::mr_fs_ntfs::deleted::ClusterState;
 use mr_api::mr_fs_ntfs::dir::{DirEntry, OrphanReason, Tree, TreeOptions, TreeStatus};
 use mr_api::mr_fs_ntfs::upcase::UpcaseSource;
-use mr_api::mr_fs_ntfs::{BootSource, EntryState, NtfsVolume, RangeState, RecordState, TreeIssue};
+use mr_api::mr_fs_ntfs::{
+    BootSource, DeletedEntry, DeletedScan, DeletedStatus, EntryOrigin, EntryState, NtfsVolume,
+    ParentState, RangeState, RecordState, Recoverability, RecoveryReport, SuspectRange, TreeIssue,
+};
 use mr_api::task::Task;
 use mr_api::{NtfsCopyResult, Source};
 
@@ -91,7 +96,8 @@ pub struct MrNtfsVolumeInfo {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct MrNtfsEntry {
     pub struct_size: u32,
-    /// `MR_NTFS_ENTRY_LIVE`... (16 a 31 reservados para borrados y residuales, #23).
+    /// `MR_NTFS_ENTRY_LIVE`... en listados y árbol; `MR_NTFS_ENTRY_DELETED` (16) a
+    /// `MR_NTFS_ENTRY_RESIDUAL_FREE` (19) en los borrados (#23; hasta 31 reservados).
     pub state: u32,
     pub record: u64,
     pub parent_record: u64,
@@ -1010,5 +1016,672 @@ pub unsafe extern "C" fn mr_ntfs_copy_result(task: u64, out: *mut MrNtfsCopyRepo
         };
         // SAFETY: `out` comprobado.
         unsafe { write_out(out, v) }
+    })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Borrados y entradas residuales (#23)
+// ---------------------------------------------------------------------------------------------
+
+/// Tarea de borrados con su resultado.
+pub(crate) struct DeletedEntryTask {
+    pub(crate) task: Arc<Task<DeletedScan>>,
+    outcome: Outcome<DeletedScan>,
+}
+
+/// Tarea de recuperación con su resultado.
+pub(crate) struct RecoverEntry {
+    pub(crate) task: Arc<Task<RecoveryReport>>,
+    outcome: Outcome<RecoveryReport>,
+}
+
+/// Borrado con el registro (MFT; puede tener también orígenes de índice).
+pub const MR_NTFS_ENTRY_DELETED: u32 = 16;
+/// Solo en índices; el registro se reutilizó (el contenido es de otro fichero).
+pub const MR_NTFS_ENTRY_RESIDUAL_REUSED: u32 = 17;
+/// Solo en índices; el registro no es interpretable (`record_state`).
+pub const MR_NTFS_ENTRY_RESIDUAL_UNUSABLE: u32 = 18;
+/// Solo en índices; el registro está libre sin `$FILE_NAME`.
+pub const MR_NTFS_ENTRY_RESIDUAL_FREE: u32 = 19;
+
+pub const MR_NTFS_ORIGIN_MFT: u32 = 1;
+pub const MR_NTFS_ORIGIN_INDEX_STALE: u32 = 2;
+pub const MR_NTFS_ORIGIN_INDEX_SLACK: u32 = 4;
+pub const MR_NTFS_ORIGIN_INDEX_FREE_NODE: u32 = 8;
+pub const MR_NTFS_ORIGIN_DELETED_DIRECTORY_INDEX: u32 = 16;
+
+pub const MR_NTFS_RECOVERABLE_NOT_APPLICABLE: u32 = 0;
+pub const MR_NTFS_RECOVERABLE_FULL: u32 = 1;
+pub const MR_NTFS_RECOVERABLE_PARTIAL: u32 = 2;
+pub const MR_NTFS_RECOVERABLE_NONE: u32 = 3;
+
+pub const MR_NTFS_PARENT_LIVE: u32 = 1;
+pub const MR_NTFS_PARENT_DELETED: u32 = 2;
+pub const MR_NTFS_PARENT_ORPHAN: u32 = 3;
+
+pub const MR_NTFS_DELETED_ENTRIES_TRUNCATED: u32 = 1;
+pub const MR_NTFS_DELETED_BITMAP_UNUSABLE: u32 = 2;
+pub const MR_NTFS_DELETED_CLAIMS_TRUNCATED: u32 = 4;
+pub const MR_NTFS_DELETED_RESIDUAL_TRUNCATED: u32 = 8;
+pub const MR_NTFS_DELETED_INDEX_UNREADABLE: u32 = 16;
+pub const MR_NTFS_DELETED_MFT_UNREADABLE: u32 = 32;
+
+pub const MR_NTFS_DELETED_TEXT_NAME: u32 = 0;
+pub const MR_NTFS_DELETED_TEXT_PATH: u32 = 1;
+pub const MR_NTFS_DELETED_TEXT_SUMMARY: u32 = 2;
+pub const MR_NTFS_DELETED_TEXT_ORIGINS: u32 = 3;
+
+pub const MR_NTFS_RECOVER_OVERWRITE: u32 = 1;
+pub const MR_NTFS_RECOVER_RANGES_TRUNCATED: u32 = 1;
+
+pub const MR_NTFS_CLUSTER_FREE: u32 = 1;
+pub const MR_NTFS_CLUSTER_OWNED: u32 = 2;
+pub const MR_NTFS_CLUSTER_ALLOCATED: u32 = 3;
+pub const MR_NTFS_CLUSTER_UNKNOWN: u32 = 4;
+pub const MR_NTFS_CLUSTER_SHARED_WITH_DELETED: u32 = 5;
+pub const MR_NTFS_NO_OWNER: u64 = u64::MAX;
+
+/// Resumen de la búsqueda de borrados (88 bytes).
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MrNtfsDeletedInfo {
+    pub struct_size: u32,
+    /// `MR_NTFS_DELETED_*`.
+    pub flags: u32,
+    pub records: u64,
+    pub entry_count: u64,
+    /// Entradas que salen solo de los índices (estados 17 a 19).
+    pub residual_only_count: u64,
+    pub problem_count: u64,
+    pub index_directories: u64,
+    pub index_nodes: u64,
+    pub index_nodes_unreadable: u64,
+    pub index_free_nodes: u64,
+    pub residual_accepted: u64,
+    pub residual_rejected: u64,
+}
+
+/// Datos de un borrado además de su `MrNtfsEntry` (48 bytes).
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MrNtfsDeletedDetail {
+    pub struct_size: u32,
+    /// `MR_NTFS_RECOVERABLE_*` del flujo principal.
+    pub recoverability: u32,
+    /// `MR_NTFS_ORIGIN_*`.
+    pub origins: u32,
+    /// `MR_NTFS_PARENT_*`.
+    pub parent_state: u32,
+    pub stream_count: u32,
+    pub index_ref_count: u32,
+    /// Flujo principal: clústeres con contenido, libres y posiblemente sobrescritos.
+    pub clusters: u64,
+    pub free_clusters: u64,
+    pub possibly_overwritten_clusters: u64,
+}
+
+/// Informe de una recuperación (56 bytes).
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MrNtfsRecoverReport {
+    pub struct_size: u32,
+    /// `MR_NTFS_RECOVER_RANGES_TRUNCATED`.
+    pub flags: u32,
+    pub bytes: u64,
+    /// Bytes no fiables: patrón de relleno más posiblemente sobrescritos.
+    pub untrusted_bytes: u64,
+    pub possibly_overwritten_bytes: u64,
+    /// Bytes con el patrón de relleno (ilegibles, sin mapa...).
+    pub filled_bytes: u64,
+    /// `MR_NTFS_RECOVERABLE_*` del flujo evaluado.
+    pub recoverability: u32,
+    pub suspect_count: u32,
+    pub sequence: u32,
+    pub reserved: u32,
+}
+
+/// Tramo de bytes leído de clústeres posiblemente sobrescritos (48 bytes).
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MrNtfsSuspectRange {
+    pub struct_size: u32,
+    /// `MR_NTFS_CLUSTER_*`.
+    pub state: u32,
+    pub offset: u64,
+    pub length: u64,
+    pub lcn: u64,
+    pub clusters: u64,
+    /// Registro dueño (vivo) o borrado que lo reclama; `MR_NTFS_NO_OWNER` si no hay.
+    pub owner: u64,
+}
+
+fn recoverability_code(r: Option<Recoverability>) -> u32 {
+    match r {
+        None => MR_NTFS_RECOVERABLE_NOT_APPLICABLE,
+        Some(Recoverability::Full) => MR_NTFS_RECOVERABLE_FULL,
+        Some(Recoverability::Partial) => MR_NTFS_RECOVERABLE_PARTIAL,
+        Some(Recoverability::None) => MR_NTFS_RECOVERABLE_NONE,
+    }
+}
+
+fn origin_bit(o: EntryOrigin) -> u32 {
+    match o {
+        EntryOrigin::MftRecord => MR_NTFS_ORIGIN_MFT,
+        EntryOrigin::IndexStale => MR_NTFS_ORIGIN_INDEX_STALE,
+        EntryOrigin::IndexSlack => MR_NTFS_ORIGIN_INDEX_SLACK,
+        EntryOrigin::IndexFreeNode => MR_NTFS_ORIGIN_INDEX_FREE_NODE,
+        EntryOrigin::DeletedDirectoryIndex => MR_NTFS_ORIGIN_DELETED_DIRECTORY_INDEX,
+        _ => 0,
+    }
+}
+
+fn deleted_entry_of(e: &DeletedEntry) -> MrNtfsEntry {
+    let (state, record_state, found) = match &e.status {
+        DeletedStatus::Deleted => (MR_NTFS_ENTRY_DELETED, 0, u32::from(e.sequence)),
+        DeletedStatus::RecordReused { found_sequence } => {
+            (MR_NTFS_ENTRY_RESIDUAL_REUSED, 0, u32::from(*found_sequence))
+        }
+        DeletedStatus::RecordUnusable { state, .. } => (
+            MR_NTFS_ENTRY_RESIDUAL_UNUSABLE,
+            record_state_code(*state),
+            0,
+        ),
+        DeletedStatus::RecordFree { found_sequence } => {
+            (MR_NTFS_ENTRY_RESIDUAL_FREE, 0, u32::from(*found_sequence))
+        }
+    };
+    let attrs = e
+        .names
+        .iter()
+        .find(|n| n.name == e.name)
+        .map_or(0, |n| n.file_attributes);
+    let mut flags = 0;
+    for (on, bit) in [
+        (e.is_directory, MR_NTFS_ENTRY_DIRECTORY),
+        (e.record < 16, MR_NTFS_ENTRY_SYSTEM),
+        (e.name.contains('\u{FFFD}'), MR_NTFS_ENTRY_NAME_LOSSY),
+        (!e.status.has_record(), MR_NTFS_ENTRY_TIMES_FROM_INDEX),
+    ] {
+        if on {
+            flags |= bit;
+        }
+    }
+    MrNtfsEntry {
+        struct_size: std::mem::size_of::<MrNtfsEntry>() as u32,
+        state,
+        record: e.record,
+        parent_record: e.parent.record,
+        sequence: u32::from(e.sequence),
+        parent_sequence: u32::from(e.parent.sequence),
+        size: e.size,
+        allocated_size: e.allocated_size,
+        created: e.times.created,
+        modified: e.times.modified,
+        mft_modified: e.times.mft_modified,
+        accessed: e.times.accessed,
+        file_attributes: attrs,
+        flags,
+        name_space: match e.namespace {
+            mr_api::mr_fs_ntfs::values::Namespace::Posix => 0,
+            mr_api::mr_fs_ntfs::values::Namespace::Win32 => 1,
+            mr_api::mr_fs_ntfs::values::Namespace::Dos => 2,
+            mr_api::mr_fs_ntfs::values::Namespace::Win32AndDos => 3,
+        },
+        link_count: 0,
+        record_state,
+        found_sequence: found,
+    }
+}
+
+fn with_deleted<R>(task: u64, f: impl FnOnce(&DeletedScan) -> R) -> Result<R, i32> {
+    let r = with_entry(task, |e| match e {
+        Entry::NtfsDeleted(e) => settle(&e.task, &mut e.outcome).map(|()| match &e.outcome {
+            Some(Ok(s)) => Some(f(s)),
+            _ => None,
+        }),
+        _ => Err((
+            MR_ERR_INVALID_HANDLE,
+            format!("la tarea {task} no es una búsqueda de borrados NTFS"),
+        )),
+    });
+    match r {
+        None => Err(bad_task(task)),
+        Some(Err((c, m))) => Err(fail(c, m)),
+        Some(Ok(Some(v))) => Ok(v),
+        Some(Ok(None)) => Err(fail(MR_ERR_NOT_FINISHED, "resultado no disponible")),
+    }
+}
+
+fn with_recover<R>(task: u64, f: impl FnOnce(&RecoveryReport) -> R) -> Result<R, i32> {
+    let r = with_entry(task, |e| match e {
+        Entry::NtfsRecover(e) => settle(&e.task, &mut e.outcome).map(|()| match &e.outcome {
+            Some(Ok(s)) => Some(f(s)),
+            _ => None,
+        }),
+        _ => Err((
+            MR_ERR_INVALID_HANDLE,
+            format!("la tarea {task} no es una recuperación NTFS"),
+        )),
+    });
+    match r {
+        None => Err(bad_task(task)),
+        Some(Err((c, m))) => Err(fail(c, m)),
+        Some(Ok(Some(v))) => Ok(v),
+        Some(Ok(None)) => Err(fail(MR_ERR_NOT_FINISHED, "resultado no disponible")),
+    }
+}
+
+/// Lanza la búsqueda de ficheros borrados (MFT y entradas residuales de los índices) del volumen
+/// (tarea con progreso y cancelable).
+///
+/// # Safety
+/// `out_task` debe ser un puntero válido.
+#[no_mangle]
+pub unsafe extern "C" fn mr_ntfs_deleted_start(volume_h: u64, out_task: *mut u64) -> i32 {
+    guard(|| {
+        if out_task.is_null() {
+            return fail(MR_ERR_INVALID_ARGUMENT, "puntero de salida nulo");
+        }
+        let (_, vol) = match volume(volume_h) {
+            Ok(v) => v,
+            Err(c) => return c,
+        };
+        match mr_api::start_ntfs_deleted_task(vol) {
+            // SAFETY: `out_task` no es nulo.
+            Ok(task) => unsafe {
+                write_out(
+                    out_task,
+                    insert(Entry::NtfsDeleted(Box::new(DeletedEntryTask {
+                        task,
+                        outcome: None,
+                    }))),
+                )
+            },
+            Err(e) => api_fail(&e),
+        }
+    })
+}
+
+/// Resumen de una búsqueda de borrados terminada.
+///
+/// # Safety
+/// `out` debe apuntar a un `MrNtfsDeletedInfo` escribible con `struct_size` ya escrito.
+#[no_mangle]
+pub unsafe extern "C" fn mr_ntfs_deleted_result(task: u64, out: *mut MrNtfsDeletedInfo) -> i32 {
+    guard(|| {
+        // SAFETY: contrato del llamador.
+        if let Err(c) = unsafe { check_struct_size(out, "mr_ntfs_deleted_info") } {
+            return c;
+        }
+        match with_deleted(task, |s| {
+            let r = s.residual.clone().unwrap_or_default();
+            let mut flags = 0;
+            for (on, bit) in [
+                (s.entries_truncated, MR_NTFS_DELETED_ENTRIES_TRUNCATED),
+                (s.bitmap_issue.is_some(), MR_NTFS_DELETED_BITMAP_UNUSABLE),
+                (s.claims_truncated, MR_NTFS_DELETED_CLAIMS_TRUNCATED),
+                (r.truncated, MR_NTFS_DELETED_RESIDUAL_TRUNCATED),
+                (r.nodes_unreadable > 0, MR_NTFS_DELETED_INDEX_UNREADABLE),
+                (
+                    s.problems
+                        .iter()
+                        .any(|p| p.state == RecordState::Unreadable),
+                    MR_NTFS_DELETED_MFT_UNREADABLE,
+                ),
+            ] {
+                if on {
+                    flags |= bit;
+                }
+            }
+            MrNtfsDeletedInfo {
+                struct_size: std::mem::size_of::<MrNtfsDeletedInfo>() as u32,
+                flags,
+                records: s.records,
+                entry_count: s.entries.len() as u64,
+                residual_only_count: s.residual_only().count() as u64,
+                problem_count: s.problems.len() as u64,
+                index_directories: r.directories,
+                index_nodes: r.nodes,
+                index_nodes_unreadable: r.nodes_unreadable,
+                index_free_nodes: r.free_nodes,
+                residual_accepted: r.accepted,
+                residual_rejected: r.rejected,
+            }
+        }) {
+            // SAFETY: `out` comprobado.
+            Ok(v) => unsafe { write_out(out, v) },
+            Err(c) => c,
+        }
+    })
+}
+
+/// Entrada `index` de los borrados: `state` 16 (`MR_NTFS_ENTRY_DELETED`) a 19
+/// (`MR_NTFS_ENTRY_RESIDUAL_*`), registro y secuencia, padre, tamaños, fechas y espacio de nombres.
+///
+/// # Safety
+/// `out` debe apuntar a un `MrNtfsEntry` escribible con `struct_size` ya escrito.
+#[no_mangle]
+pub unsafe extern "C" fn mr_ntfs_deleted_entry(
+    task: u64,
+    index: u64,
+    out: *mut MrNtfsEntry,
+) -> i32 {
+    guard(|| {
+        // SAFETY: contrato del llamador.
+        if let Err(c) = unsafe { check_struct_size(out, "mr_ntfs_entry") } {
+            return c;
+        }
+        match with_deleted(task, |s| {
+            usize::try_from(index)
+                .ok()
+                .and_then(|i| s.entries.get(i))
+                .map(deleted_entry_of)
+        }) {
+            // SAFETY: `out` comprobado.
+            Ok(Some(v)) => unsafe { write_out(out, v) },
+            Ok(None) => index_error("entrada", index),
+            Err(c) => c,
+        }
+    })
+}
+
+/// Recuperabilidad, orígenes, estado del padre y clústeres del flujo principal de la entrada
+/// `index`.
+///
+/// # Safety
+/// `out` debe apuntar a un `MrNtfsDeletedDetail` escribible con `struct_size` ya escrito.
+#[no_mangle]
+pub unsafe extern "C" fn mr_ntfs_deleted_detail(
+    task: u64,
+    index: u64,
+    out: *mut MrNtfsDeletedDetail,
+) -> i32 {
+    guard(|| {
+        // SAFETY: contrato del llamador.
+        if let Err(c) = unsafe { check_struct_size(out, "mr_ntfs_deleted_detail") } {
+            return c;
+        }
+        match with_deleted(task, |s| {
+            usize::try_from(index)
+                .ok()
+                .and_then(|i| s.entries.get(i))
+                .map(|e| {
+                    let main = e.main_stream();
+                    MrNtfsDeletedDetail {
+                        struct_size: std::mem::size_of::<MrNtfsDeletedDetail>() as u32,
+                        recoverability: recoverability_code(e.recoverability()),
+                        origins: e.origins.iter().fold(0, |a, o| a | origin_bit(*o)),
+                        parent_state: match e.parent_state {
+                            ParentState::Live => MR_NTFS_PARENT_LIVE,
+                            ParentState::Deleted => MR_NTFS_PARENT_DELETED,
+                            ParentState::Orphan(_) => MR_NTFS_PARENT_ORPHAN,
+                        },
+                        stream_count: e.streams.len() as u32,
+                        index_ref_count: u32::try_from(e.index_refs.len()).unwrap_or(u32::MAX),
+                        clusters: main.map_or(0, |a| a.clusters),
+                        free_clusters: main.map_or(0, |a| a.free),
+                        possibly_overwritten_clusters: main.map_or(0, |a| a.possibly_overwritten()),
+                    }
+                })
+        }) {
+            // SAFETY: `out` comprobado.
+            Ok(Some(v)) => unsafe { write_out(out, v) },
+            Ok(None) => index_error("entrada", index),
+            Err(c) => c,
+        }
+    })
+}
+
+fn deleted_text(s: &DeletedScan, e: &DeletedEntry, field: u32) -> Option<String> {
+    Some(match field {
+        MR_NTFS_DELETED_TEXT_NAME => e.name.clone(),
+        MR_NTFS_DELETED_TEXT_PATH => e.display_path(),
+        MR_NTFS_DELETED_TEXT_SUMMARY => {
+            if !e.status.has_record() {
+                e.status.to_string()
+            } else if let Some(a) = e.main_stream() {
+                s.summary(a)
+            } else {
+                String::new()
+            }
+        }
+        MR_NTFS_DELETED_TEXT_ORIGINS => e
+            .origins
+            .iter()
+            .map(|o| o.label())
+            .collect::<Vec<_>>()
+            .join(", "),
+        _ => return None,
+    })
+}
+
+/// Texto de la entrada `index`: `MR_NTFS_DELETED_TEXT_NAME` (nombre), `_PATH` (ruta o
+/// `<huérfano N>/nombre`), `_SUMMARY` (motivo de la recuperabilidad o estado de una entrada solo
+/// residual) u `_ORIGINS` (fuentes, separadas por comas).
+///
+/// # Safety
+/// Ver contrato de cadenas de salida.
+#[no_mangle]
+pub unsafe extern "C" fn mr_ntfs_deleted_text(
+    task: u64,
+    index: u64,
+    field: u32,
+    buf: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> i32 {
+    guard(|| {
+        if field > MR_NTFS_DELETED_TEXT_ORIGINS {
+            return fail(MR_ERR_INVALID_ARGUMENT, "campo de texto no válido");
+        }
+        match with_deleted(task, |s| {
+            usize::try_from(index)
+                .ok()
+                .and_then(|i| s.entries.get(i))
+                .and_then(|e| deleted_text(s, e, field))
+        }) {
+            // SAFETY: contrato del llamador.
+            Ok(Some(t)) => unsafe { write_str(&t, buf, cap, out_len) },
+            Ok(None) => index_error("entrada", index),
+            Err(c) => c,
+        }
+    })
+}
+
+/// Recupera el flujo `stream` (vacío = el principal) del borrado `record` con la secuencia
+/// `sequence` (la de su entrada) en `out_path` (tarea). Antes de lanzarla se comprueban la ruta
+/// (nunca el origen, un dispositivo ni un directorio; si existe, `MR_ERR_ALREADY_EXISTS` salvo con
+/// `MR_NTFS_RECOVER_OVERWRITE`) y el registro: un registro en uso, con otra secuencia o libre es
+/// `MR_ERR_INVALID_ARGUMENT` (una entrada solo residual no se recupera). Escritura atómica.
+///
+/// # Safety
+/// `stream` y `out_path` deben apuntar a sus longitudes en bytes; `out_task` válido.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn mr_ntfs_recover_start(
+    volume_h: u64,
+    record: u64,
+    sequence: u32,
+    stream: *const u8,
+    stream_len: usize,
+    out_path: *const u8,
+    out_path_len: usize,
+    flags: u32,
+    out_task: *mut u64,
+) -> i32 {
+    guard(|| {
+        if out_task.is_null() {
+            return fail(MR_ERR_INVALID_ARGUMENT, "puntero de salida nulo");
+        }
+        if flags & !MR_NTFS_RECOVER_OVERWRITE != 0 {
+            return fail(
+                MR_ERR_INVALID_ARGUMENT,
+                "opciones de recuperación no válidas",
+            );
+        }
+        let Ok(sequence) = u16::try_from(sequence) else {
+            return fail(MR_ERR_INVALID_ARGUMENT, "secuencia fuera de rango");
+        };
+        // SAFETY: contrato del llamador.
+        let name = match unsafe { read_utf8(stream, stream_len) } {
+            Ok(s) => s.to_string(),
+            Err(c) => return c,
+        };
+        // SAFETY: contrato del llamador.
+        let path = match unsafe { read_utf8(out_path, out_path_len) } {
+            Ok(p) if !p.is_empty() => PathBuf::from(p),
+            Ok(_) => return fail(MR_ERR_INVALID_ARGUMENT, "ruta de salida vacía"),
+            Err(c) => return c,
+        };
+        let (src, vol) = match volume(volume_h) {
+            Ok(v) => v,
+            Err(c) => return c,
+        };
+        // El registro se comprueba antes de lanzar nada (sin crear la salida).
+        match vol.file(record) {
+            Ok(f) if f.in_use() || f.header.sequence != sequence || f.file_names().is_empty() => {
+                return fail(
+                    MR_ERR_INVALID_ARGUMENT,
+                    format!(
+                        "el registro {record} (secuencia {}) no es el borrado pedido (secuencia \
+                         {sequence}): no se recupera",
+                        f.header.sequence
+                    ),
+                )
+            }
+            Ok(_) => {}
+            Err(e) => return api_fail(&mr_api::ApiError::Ntfs(e)),
+        }
+        let overwrite = flags & MR_NTFS_RECOVER_OVERWRITE != 0;
+        match mr_api::start_ntfs_recover_task(src, vol, record, sequence, name, path, overwrite) {
+            // SAFETY: `out_task` no es nulo.
+            Ok(task) => unsafe {
+                write_out(
+                    out_task,
+                    insert(Entry::NtfsRecover(Box::new(RecoverEntry {
+                        task,
+                        outcome: None,
+                    }))),
+                )
+            },
+            Err(e) => api_fail(&e),
+        }
+    })
+}
+
+/// Informe de una recuperación terminada.
+///
+/// # Safety
+/// `out` debe apuntar a un `MrNtfsRecoverReport` escribible con `struct_size` ya escrito.
+#[no_mangle]
+pub unsafe extern "C" fn mr_ntfs_recover_result(task: u64, out: *mut MrNtfsRecoverReport) -> i32 {
+    guard(|| {
+        // SAFETY: contrato del llamador.
+        if let Err(c) = unsafe { check_struct_size(out, "mr_ntfs_recover_report") } {
+            return c;
+        }
+        match with_recover(task, |r| MrNtfsRecoverReport {
+            struct_size: std::mem::size_of::<MrNtfsRecoverReport>() as u32,
+            flags: if r.copy.truncated {
+                MR_NTFS_RECOVER_RANGES_TRUNCATED
+            } else {
+                0
+            },
+            bytes: r.copy.bytes,
+            untrusted_bytes: r.copy.untrusted_bytes(),
+            possibly_overwritten_bytes: r.copy.count(RangeState::PossiblyOverwritten),
+            filled_bytes: r.copy.filled_bytes(),
+            recoverability: recoverability_code(r.assessment.as_ref().map(|a| a.recoverability)),
+            suspect_count: u32::try_from(r.suspect.len()).unwrap_or(u32::MAX),
+            sequence: u32::from(r.sequence),
+            reserved: 0,
+        }) {
+            // SAFETY: `out` comprobado.
+            Ok(v) => unsafe { write_out(out, v) },
+            Err(c) => c,
+        }
+    })
+}
+
+fn suspect_of(x: &SuspectRange) -> MrNtfsSuspectRange {
+    let (state, owner) = match x.state {
+        ClusterState::Free => (MR_NTFS_CLUSTER_FREE, MR_NTFS_NO_OWNER),
+        ClusterState::Owned { owner } => (MR_NTFS_CLUSTER_OWNED, owner),
+        ClusterState::Allocated => (MR_NTFS_CLUSTER_ALLOCATED, MR_NTFS_NO_OWNER),
+        ClusterState::Unknown => (MR_NTFS_CLUSTER_UNKNOWN, MR_NTFS_NO_OWNER),
+        ClusterState::SharedWithDeleted { record } => (MR_NTFS_CLUSTER_SHARED_WITH_DELETED, record),
+    };
+    MrNtfsSuspectRange {
+        struct_size: std::mem::size_of::<MrNtfsSuspectRange>() as u32,
+        state,
+        offset: x.offset,
+        length: x.length,
+        lcn: x.lcn,
+        clusters: x.clusters,
+        owner,
+    }
+}
+
+/// Tramo `index` de bytes posiblemente sobrescritos de una recuperación terminada.
+///
+/// # Safety
+/// `out` debe apuntar a un `MrNtfsSuspectRange` escribible con `struct_size` ya escrito.
+#[no_mangle]
+pub unsafe extern "C" fn mr_ntfs_recover_suspect(
+    task: u64,
+    index: u32,
+    out: *mut MrNtfsSuspectRange,
+) -> i32 {
+    guard(|| {
+        // SAFETY: contrato del llamador.
+        if let Err(c) = unsafe { check_struct_size(out, "mr_ntfs_suspect_range") } {
+            return c;
+        }
+        match with_recover(task, |r| r.suspect.get(index as usize).map(suspect_of)) {
+            // SAFETY: `out` comprobado.
+            Ok(Some(v)) => unsafe { write_out(out, v) },
+            Ok(None) => index_error("tramo", u64::from(index)),
+            Err(c) => c,
+        }
+    })
+}
+
+/// Texto de una recuperación terminada: con `index` = `u32::MAX`, el resumen de la
+/// recuperabilidad (vacío si el registro no se evaluó); si no, el dueño del tramo sospechoso
+/// `index` (ruta o nombre del fichero vivo, o descripción del estado).
+///
+/// # Safety
+/// Ver contrato de cadenas de salida.
+#[no_mangle]
+pub unsafe extern "C" fn mr_ntfs_recover_text(
+    task: u64,
+    index: u32,
+    buf: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> i32 {
+    guard(|| {
+        match with_recover(task, |r| {
+            if index == u32::MAX {
+                return Some(r.summary.clone().unwrap_or_default());
+            }
+            r.suspect.get(index as usize).map(|x| match x.state {
+                ClusterState::Owned { owner } => r
+                    .owners
+                    .get(&owner)
+                    .map_or_else(|| format!("registro {owner}"), |o| o.display()),
+                ClusterState::Allocated => "asignados en $Bitmap sin dueño conocido".into(),
+                ClusterState::Unknown => "asignación desconocida".into(),
+                ClusterState::SharedWithDeleted { record } => {
+                    format!("reclamados también por el borrado {record}")
+                }
+                ClusterState::Free => "libres".into(),
+            })
+        }) {
+            // SAFETY: contrato del llamador.
+            Ok(Some(t)) => unsafe { write_str(&t, buf, cap, out_len) },
+            Ok(None) => index_error("tramo", u64::from(index)),
+            Err(c) => c,
+        }
     })
 }

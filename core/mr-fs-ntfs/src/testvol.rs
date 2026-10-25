@@ -1020,3 +1020,206 @@ pub fn upcase_table() -> Vec<u8> {
     t[0xFA] = 0xDA;
     t.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
+
+// ---------------------------------------------------------------------------------------------
+// Entradas residuales de los índices (#23)
+// ---------------------------------------------------------------------------------------------
+
+/// Nodo `INDX` como [`indx_block`] con `slack` justo después de los bytes en uso (dentro de los
+/// asignados), antes de proteger el nodo.
+pub fn indx_block_with_slack(
+    vcn: u64,
+    entries: &[Vec<u8>],
+    slack: &[u8],
+    block_size: usize,
+    has_subnodes: bool,
+) -> Vec<u8> {
+    let mut b = indx_block(vcn, entries, block_size, has_subnodes);
+    crate::record::apply_fixups(&mut b).expect("nodo de prueba");
+    let used = 0x18 + u32::from_le_bytes([b[0x1C], b[0x1D], b[0x1E], b[0x1F]]) as usize;
+    b[used..used + slack.len()].copy_from_slice(slack);
+    protect(&mut b);
+    b
+}
+
+/// Primer clúster de los 4 nodos `INDX` de la raíz en [`residual_volume`].
+pub const RESIDUAL_INDX_LCN: u64 = 230;
+
+/// Entradas mal formadas para el espacio libre del directorio `dir`: longitud incoherente, padre
+/// de otro directorio, referencia fuera de la MFT y a un registro del sistema (las dos únicas
+/// rechazadas: el resto no son candidatas), clave más larga que el nombre, indicadores
+/// desconocidos y nombre con una unidad nula.
+pub fn malformed_slack(dir: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut e = named_entry(fref(30, 1), dir, "largo.txt", 1, None);
+    e[8] = e[8].wrapping_add(8);
+    e.extend_from_slice(&[0; 8]);
+    out.extend(e);
+    out.extend(named_entry(fref(31, 1), fref(16, 2), "ajeno.txt", 1, None));
+    out.extend(named_entry(fref(999, 1), dir, "fuera.txt", 1, None));
+    out.extend(named_entry(fref(3, 3), dir, "sistema.txt", 1, None));
+    let mut k = file_name(dir, "corto.txt", 1, 0x20, 0);
+    k.extend_from_slice(&[0; 8]);
+    out.extend(index_entry(fref(32, 1), Some(&k), None));
+    let mut e = named_entry(fref(33, 1), dir, "raro.txt", 1, None);
+    e[0x0C] = 0x10;
+    out.extend(e);
+    out.extend(index_entry(
+        fref(34, 1),
+        Some(&file_name_units(dir, &[0x61, 0, 0x62], 1, 0x20, 0)),
+        None,
+    ));
+    out
+}
+
+/// Volumen con entradas residuales (clústeres de 4 KiB, nodos de 4 KiB, 40 registros):
+///
+/// ```text
+/// raíz (5): $INDEX_ROOT grande → VCN 0; $INDEX_ALLOCATION de 4 nodos en el clúster 230;
+///           $BITMAP 0b0001 (solo el VCN 0 asignado)
+///   VCN 0 (asignado): en uso «vivo.txt» (17); espacio libre: «borrado.txt» (18) dos veces,
+///         «reusado.txt» (19 sec. 1), «dañado.txt» (20), copia de «vivo.txt» y entradas mal
+///         formadas (malformed_slack)
+///   VCN 1 (libre, nodo válido): «borrado.txt» (18), «libre.txt» (21 sec. 3),
+///         «DOSLAR~1.TXT» y «dos largo.txt» (23)
+///   VCN 2 (libre): «secreto.txt» (26); las pruebas lo hacen ilegible con FaultyDevice
+///   VCN 3 (libre, fixups que no cuadran): «roto.txt» (27)
+/// 16 «Viejo»: directorio borrado (sec. 2); su $INDEX_ROOT lista «hijo.txt» (24)
+/// 17 «vivo.txt» en uso; 18 «borrado.txt» no en uso (sec. 2, residente); 19 en uso con sec. 2
+/// («nuevo.txt»); 20 y 23 BAAD; 21 no en uso sec. 4 sin $FILE_NAME; 24 «hijo.txt» no en uso
+/// (sec. 2, padre 16)
+/// ```
+pub fn residual_volume() -> Synth {
+    use crate::record::flags::{DIRECTORY, IN_USE};
+    let mut s = Synth::with_records(8, 40, 36);
+    let si = || res(0x10, "", &[0x10; 72], 0);
+    let root = fref(5, 5);
+    let vivo = named_entry(fref(17, 1), root, "vivo.txt", 1, None);
+    let borrado = named_entry(fref(18, 1), root, "borrado.txt", 1, None);
+    let mut slack = Vec::new();
+    slack.extend_from_slice(&borrado);
+    slack.extend_from_slice(&borrado);
+    slack.extend(named_entry(fref(19, 1), root, "reusado.txt", 1, None));
+    slack.extend(named_entry(fref(20, 1), root, "dañado.txt", 1, None));
+    slack.extend_from_slice(&vivo);
+    slack.extend(malformed_slack(root));
+    let vcn0 = indx_block_with_slack(0, &[vivo, index_entry(0, None, None)], &slack, 4096, false);
+    let vcn1 = indx_block(
+        1,
+        &[
+            borrado.clone(),
+            named_entry(fref(21, 3), root, "libre.txt", 1, None),
+            named_entry(fref(23, 1), root, "DOSLAR~1.TXT", 2, None),
+            named_entry(fref(23, 1), root, "dos largo.txt", 1, None),
+            index_entry(0, None, None),
+        ],
+        4096,
+        false,
+    );
+    let vcn2 = indx_block(
+        2,
+        &[
+            named_entry(fref(26, 1), root, "secreto.txt", 1, None),
+            index_entry(0, None, None),
+        ],
+        4096,
+        false,
+    );
+    let mut vcn3 = indx_block(
+        3,
+        &[
+            named_entry(fref(27, 1), root, "roto.txt", 1, None),
+            index_entry(0, None, None),
+        ],
+        4096,
+        false,
+    );
+    vcn3[1022] ^= 0xFF;
+    for (i, n) in [vcn0, vcn1, vcn2, vcn3].iter().enumerate() {
+        s.put_clusters(RESIDUAL_INDX_LCN + i as u64, n);
+    }
+    s.put_record(
+        5,
+        &record(
+            5,
+            5,
+            IN_USE | DIRECTORY,
+            &[
+                si(),
+                fname_attr(root, ".", 3, true, 1),
+                res(
+                    0x90,
+                    "$I30",
+                    &index_root_value(&[index_entry(0, None, Some(0))], 4096, true),
+                    2,
+                ),
+                with_id(
+                    non_resident(
+                        0xA0,
+                        "$I30",
+                        0,
+                        3,
+                        &encode_runs(&[(Some(RESIDUAL_INDX_LCN), 4)]),
+                        16384,
+                        16384,
+                        16384,
+                    ),
+                    3,
+                ),
+                res(0xB0, "$I30", &[0b0001, 0, 0, 0, 0, 0, 0, 0], 4),
+            ],
+            1024,
+        ),
+    );
+    let viejo = fref(16, 1);
+    s.put_record(
+        16,
+        &record(
+            16,
+            2,
+            DIRECTORY,
+            &[
+                si(),
+                fname_attr(root, "Viejo", 3, true, 1),
+                res(
+                    0x90,
+                    "$I30",
+                    &index_root_value(
+                        &[
+                            named_entry(fref(24, 1), viejo, "hijo.txt", 1, None),
+                            index_entry(0, None, None),
+                        ],
+                        4096,
+                        false,
+                    ),
+                    2,
+                ),
+            ],
+            1024,
+        ),
+    );
+    let file = |n: u32, seq: u16, flags: u16, parent: u64, name: &str, data: &[u8]| {
+        record(
+            n,
+            seq,
+            flags,
+            &[
+                si(),
+                fname_attr(parent, name, 1, false, 1),
+                res(0x80, "", data, 2),
+            ],
+            1024,
+        )
+    };
+    s.put_record(17, &file(17, 1, IN_USE, root, "vivo.txt", b"vivo"));
+    s.put_record(18, &file(18, 2, 0, root, "borrado.txt", b"hola borrado"));
+    s.put_record(19, &file(19, 2, IN_USE, root, "nuevo.txt", b"de otro"));
+    for n in [20u32, 23] {
+        let mut baad = record(n, 1, IN_USE, &[si()], 1024);
+        baad[..4].copy_from_slice(b"BAAD");
+        s.put_record(u64::from(n), &baad);
+    }
+    s.put_record(21, &record(21, 4, 0, &[si()], 1024));
+    s.put_record(24, &file(24, 2, 0, viejo, "hijo.txt", b"hijo"));
+    s
+}

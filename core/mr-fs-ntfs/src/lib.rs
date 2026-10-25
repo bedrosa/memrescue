@@ -23,8 +23,9 @@
 //! - [`mft`]: disposición de la MFT, lectura de registros por número y enumeración.
 //! - [`volume`]: [`NtfsVolume::open`]: arranque principal o copia, `$MFT`, `$MFTMirr`, etiqueta;
 //!   [`NtfsVolume::file`] y [`NtfsVolume::open_stream`].
-//! - [`bitmap`], [`deleted`] y [`recover`] (#23): mapa de asignación de clústeres (`$Bitmap`),
-//!   ficheros borrados de la MFT con su recuperabilidad y recuperación con estado por tramo.
+//! - [`bitmap`], [`deleted`], [`residual`] y [`recover`] (#23): mapa de asignación de clústeres
+//!   (`$Bitmap`), ficheros borrados de la MFT y entradas residuales de los índices con su
+//!   recuperabilidad, y recuperación con estado por tramo.
 //!
 //! Contrato común con `mr-part`: toda lectura pasa por `mr_part::sector::read_trusted` (un sector
 //! ilegible nunca se interpreta), aritmética comprobada, límites explícitos, ningún pánico con datos
@@ -42,6 +43,7 @@ pub mod mft;
 mod read;
 pub mod record;
 pub mod recover;
+pub mod residual;
 pub mod runs;
 pub mod stream;
 pub mod upcase;
@@ -58,8 +60,8 @@ pub mod testvol;
 pub use bitmap::{ClusterAlloc, ClusterBitmap};
 pub use boot::{parse_boot, BootError, BootSector};
 pub use deleted::{
-    scan_deleted, DeletedEntry, DeletedScan, ParentState, Recoverability, ScanObserver,
-    ScanOptions, StreamAssessment,
+    scan_deleted, DeletedEntry, DeletedScan, DeletedStatus, EntryOrigin, IndexRef, ParentState,
+    Recoverability, ScanObserver, ScanOptions, StreamAssessment,
 };
 pub use dir::{
     DirEntry, DirListing, EntryState, Orphan, OrphanReason, Tree, TreeAnomaly, TreeIssue, TreeNode,

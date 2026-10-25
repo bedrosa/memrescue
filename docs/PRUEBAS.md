@@ -637,8 +637,10 @@ Atributos, runs, flujos y LZNT1 (issue #21, ADR-026, `formatos/ntfs.md`):
 
 Ficheros borrados (issue #23, ADR-027, `formatos/ntfs.md` «Ficheros borrados»):
 
-- Unitarias (`core/mr-fs-ntfs/src/deleted_tests.rs` y `bitmap.rs`, 13): ver `formatos/ntfs.md`.
-- `core/mr-fs-ntfs/tests/ntfs_deleted_corpus.rs` (2, `--ignored`):
+- Unitarias (`core/mr-fs-ntfs/src/deleted_tests.rs` y `bitmap.rs`, 13; entradas residuales de los
+  índices en `residual_tests.rs`, 7, con fuzzing de 5000 tramos y 300 volúmenes): ver
+  `formatos/ntfs.md`.
+- `core/mr-fs-ntfs/tests/ntfs_deleted_corpus.rs` (4, `--ignored`):
   `deleted_entries_match_every_manifest` recorre los 10 manifiestos: **cada** entrada `deleted` u
   `overwritten` (16: 11 de `ntfs_deleted` con un directorio y 5 de `ntfs_overwritten`) aparece con
   su registro, secuencia, nombre, tipo, `path` completo y padre no huérfano; ningún vivo aparece y no
@@ -655,16 +657,37 @@ Ficheros borrados (issue #23, ADR-027, `formatos/ntfs.md` «Ficheros borrados»)
   siga intacto (se copia tal cual, 40 000 bytes `possibly_overwritten`) y el residente sigue
   `full`; un sector ilegible en un clúster libre de `objetivo_3.bin` da exactamente un tramo
   `unreadable` con su LBA y patrón, además de los `possibly_overwritten`.
+  `residual_index_entries_match_what_the_corpus_shows` (entradas residuales de los índices): se
+  comprobó primero qué deja ntfs-3g y se prueba exactamente eso. Al quitar una entrada, ntfs-3g
+  mueve las siguientes y escribe la entrada final encima, así que el espacio libre de los nodos
+  solo conserva restos con la cabecera pisada: en `ntfs_deleted`, 4 (1 en el nodo de `/docs` y 3 en
+  el de `/docs/cartas`), todos rechazados por la referencia y ninguno aceptado; el índice del
+  directorio borrado `/docs/cartas` (registro 68) conserva `sello.bin` (registro 103), que se une a
+  su entrada de la MFT (orígenes `mft_record` y `deleted_directory_index`); en las demás imágenes,
+  0 aceptadas y 0 rechazadas; ninguna imagen tiene nodos libres, nodos ilegibles ni entradas solo
+  residuales. En las 10 imágenes, cada borrado del manifiesto aparece **exactamente una vez** y
+  ningún vivo aparece. `unreadable_index_node_is_never_parsed_for_residual_entries`: un sector
+  ilegible en el nodo de `/docs/cartas` lo deja sin interpretar (`nodes_unreadable` 1, el resto de
+  ese nodo ni se acepta ni se rechaza) y `sello.bin` queda solo con su origen en la MFT.
 - CLI (`cli/tests/ntfs_deleted.rs`): `ntfs_deleted_and_recover_validate_arguments_before_writing`
   (origen sin NTFS sin crear la salida, 8 errores de uso) y, con `--ignored`,
   `ntfs_deleted_lists_the_manifest_entries` (`ntfs-deleted --json` de `ntfs_deleted`,
-  `ntfs_overwritten`, `ntfs_damaged_mft` y `ntfs_basic`: registro, secuencia, tipo, ruta,
-  recuperabilidad y dueños de cada entrada, ningún vivo, dañados en `problems`; texto; `ntfs_gpt`
-  con `--partition 1` sin borrados) y `ntfs_recover_matches_the_manifests_and_refuses_unsafe_outputs`
+  `ntfs_overwritten`, `ntfs_damaged_mft` y `ntfs_basic`: registro, secuencia, estado, orígenes,
+  tipo, ruta, recuperabilidad y dueños de cada entrada, ningún vivo, dañados en `problems`, los
+  recuentos de `index_entries` (aceptadas y rechazadas como arriba) y la referencia de índice de
+  `sello.bin`; texto con los recuentos y los orígenes; `ntfs_gpt` con `--partition 1` sin borrados)
+  y `ntfs_recover_matches_the_manifests_and_refuses_unsafe_outputs`
   (`ntfs-recover` de los 15 ficheros borrados: código 0 y `sha256` los íntegros, código 3,
   `recovered_sha256`, tramos y dueños en la salida de errores los sobrescritos; salida existente
   con código 2 y sustituida con `--overwrite`; salida = origen rechazada; registro dañado sin
   salida; sin temporales).
+- API, FFI, C# e interfaz: `mr-api` (`deleted_scan_includes_residual_entries_and_recovery_refuses_them`
+  con `testvol::residual_volume`), `mr-ffi` (`deleted_structs_match_header`,
+  `deleted_task_lists_mft_and_residual_entries`, `recover_task_writes_only_deleted_records`), C#
+  (`NtfsTests`: `Deleted_struct_layouts_match_header`, `Deleted_scan_matches_the_manifest` de
+  `ntfs_deleted` y `ntfs_overwritten`, `Recover_writes_deleted_files_and_reports_possibly_overwritten_ranges`
+  con el `recovered_sha256` del parcial, sus tramos con dueño y los rechazos) e interfaz
+  (`NtfsDeletedUiTests`, `PRUEBAS_UI.md`).
 
 Discos diferenciales VHD/VHDX (issue #8, ADR-018 addendum, detalle en `formatos/vhdx.md`, «Discos
 diferenciales»):

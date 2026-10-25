@@ -16,6 +16,14 @@ public enum NtfsEntryState : uint
     RecordUnusable = 4,
     /// <summary>Referencia fuera de la MFT o a un registro de extensión.</summary>
     InvalidReference = 5,
+    /// <summary>Borrado: registro MFT no en uso con sus atributos (#23; puede estar también en índices).</summary>
+    Deleted = 16,
+    /// <summary>Solo en índices: el registro se reutilizó, el contenido es de otro fichero.</summary>
+    ResidualReused = 17,
+    /// <summary>Solo en índices: el registro no es interpretable; sin runs conocidos.</summary>
+    ResidualUnusable = 18,
+    /// <summary>Solo en índices: el registro está libre sin <c>$FILE_NAME</c>.</summary>
+    ResidualFree = 19,
 }
 
 /// <summary>Indicadores de una entrada (<c>MR_NTFS_ENTRY_DIRECTORY</c>...).</summary>
@@ -53,6 +61,10 @@ public static class NtfsLabels
         NtfsEntryState.StaleReused => "RESIDUAL: registro reutilizado",
         NtfsEntryState.RecordUnusable => "REGISTRO NO UTILIZABLE",
         NtfsEntryState.InvalidReference => "REFERENCIA NO VÁLIDA",
+        NtfsEntryState.Deleted => "BORRADO",
+        NtfsEntryState.ResidualReused => "RESIDUAL: registro reutilizado (contenido de otro fichero)",
+        NtfsEntryState.ResidualUnusable => "RESIDUAL: registro no utilizable",
+        NtfsEntryState.ResidualFree => "RESIDUAL: registro libre",
         _ => "desconocido",
     };
 
@@ -132,7 +144,7 @@ public sealed record NtfsCopyReport(ulong Bytes, ulong UntrustedBytes, ulong Spa
 /// Volumen NTFS abierto en el motor (solo lectura). Sobrevive al cierre de su origen; los listados,
 /// tareas y orígenes abiertos desde él sobreviven a su liberación.
 /// </summary>
-public sealed class NtfsVolume : EngineHandle
+public sealed partial class NtfsVolume : EngineHandle
 {
     internal NtfsVolume(ulong handle, string sourcePath) : base(handle)
     {

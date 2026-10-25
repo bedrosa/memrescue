@@ -367,3 +367,238 @@ fn stream_source_and_copy_task() {
     // El origen sigue intacto.
     assert_eq!(std::fs::read(&image_path).unwrap(), tree_volume(true).image);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Borrados y entradas residuales (#23) sobre `mr_fs_ntfs::testvol::residual_volume`
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn deleted_structs_match_header() {
+    assert_eq!(std::mem::size_of::<MrNtfsDeletedInfo>(), 88);
+    assert_eq!(std::mem::size_of::<MrNtfsDeletedDetail>(), 48);
+    assert_eq!(std::mem::size_of::<MrNtfsRecoverReport>(), 56);
+    assert_eq!(std::mem::size_of::<MrNtfsSuspectRange>(), 48);
+    assert_eq!(
+        std::mem::offset_of!(MrNtfsDeletedInfo, residual_rejected),
+        80
+    );
+    assert_eq!(std::mem::offset_of!(MrNtfsDeletedDetail, clusters), 24);
+    assert_eq!(
+        std::mem::offset_of!(MrNtfsRecoverReport, recoverability),
+        40
+    );
+    assert_eq!(std::mem::offset_of!(MrNtfsSuspectRange, owner), 40);
+}
+
+fn residual_setup() -> (tempfile::TempDir, u64, u64) {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("residual.img");
+    std::fs::write(&p, mr_fs_ntfs::testvol::residual_volume().image).unwrap();
+    let ps = p.to_str().unwrap();
+    let mut src = 0u64;
+    assert_eq!(
+        unsafe { mr_source_open(ps.as_ptr(), ps.len(), 0, 0, &mut src) },
+        MR_OK
+    );
+    let mut vol = 0u64;
+    assert_eq!(
+        unsafe { mr_ntfs_open(src, &mut vol) },
+        MR_OK,
+        "{}",
+        last_error()
+    );
+    (dir, src, vol)
+}
+
+#[test]
+fn deleted_task_lists_mft_and_residual_entries() {
+    let (_d, src, vol) = residual_setup();
+    let mut task = 0u64;
+    assert_eq!(unsafe { mr_ntfs_deleted_start(vol, &mut task) }, MR_OK);
+    let st = wait(task);
+    assert_eq!(st.state, 2, "completada");
+    assert!(st.done == st.total && st.total > 0);
+    let mut info = MrNtfsDeletedInfo {
+        struct_size: std::mem::size_of::<MrNtfsDeletedInfo>() as u32,
+        ..MrNtfsDeletedInfo::default()
+    };
+    assert_eq!(unsafe { mr_ntfs_deleted_result(task, &mut info) }, MR_OK);
+    assert_eq!(info.entry_count, 8);
+    assert_eq!(info.residual_only_count, 5);
+    assert_eq!((info.index_directories, info.index_nodes), (2, 3));
+    assert_eq!((info.index_free_nodes, info.residual_rejected), (2, 2));
+    assert_eq!(info.flags & MR_NTFS_DELETED_INDEX_UNREADABLE, 0);
+    let mut got = Vec::new();
+    for i in 0..info.entry_count {
+        let mut e = entry();
+        assert_eq!(unsafe { mr_ntfs_deleted_entry(task, i, &mut e) }, MR_OK);
+        let mut d = MrNtfsDeletedDetail {
+            struct_size: std::mem::size_of::<MrNtfsDeletedDetail>() as u32,
+            ..MrNtfsDeletedDetail::default()
+        };
+        assert_eq!(unsafe { mr_ntfs_deleted_detail(task, i, &mut d) }, MR_OK);
+        let text = |f: u32| {
+            string(|b, c, n| unsafe { mr_ntfs_deleted_text(task, i, f, b, c, n) }).unwrap()
+        };
+        got.push((
+            e.record,
+            e.state,
+            d.recoverability,
+            d.origins,
+            text(0),
+            text(1),
+        ));
+        if e.state != MR_NTFS_ENTRY_DELETED {
+            assert_ne!(e.flags & MR_NTFS_ENTRY_TIMES_FROM_INDEX, 0);
+            assert_eq!(d.stream_count, 0);
+            assert!(text(2).starts_with("entrada residual"), "{}", text(2));
+        }
+        if e.record == 23 {
+            assert_eq!(e.record_state, 8, "dañado");
+        }
+        if e.record == 19 {
+            assert_eq!((e.sequence, e.found_sequence), (1, 2));
+        }
+    }
+    let o_mft = MR_NTFS_ORIGIN_MFT;
+    let full = MR_NTFS_RECOVERABLE_FULL;
+    let none = MR_NTFS_RECOVERABLE_NONE;
+    assert_eq!(
+        got.iter().map(|g| (g.0, g.1, g.2, g.3)).collect::<Vec<_>>(),
+        [
+            (
+                16,
+                MR_NTFS_ENTRY_DELETED,
+                MR_NTFS_RECOVERABLE_NOT_APPLICABLE,
+                o_mft
+            ),
+            (
+                18,
+                MR_NTFS_ENTRY_DELETED,
+                full,
+                o_mft | MR_NTFS_ORIGIN_INDEX_SLACK | MR_NTFS_ORIGIN_INDEX_FREE_NODE
+            ),
+            (
+                24,
+                MR_NTFS_ENTRY_DELETED,
+                full,
+                o_mft | MR_NTFS_ORIGIN_DELETED_DIRECTORY_INDEX
+            ),
+            (
+                19,
+                MR_NTFS_ENTRY_RESIDUAL_REUSED,
+                none,
+                MR_NTFS_ORIGIN_INDEX_SLACK
+            ),
+            (
+                20,
+                MR_NTFS_ENTRY_RESIDUAL_UNUSABLE,
+                none,
+                MR_NTFS_ORIGIN_INDEX_SLACK
+            ),
+            (
+                21,
+                MR_NTFS_ENTRY_RESIDUAL_FREE,
+                none,
+                MR_NTFS_ORIGIN_INDEX_FREE_NODE
+            ),
+            (
+                23,
+                MR_NTFS_ENTRY_RESIDUAL_UNUSABLE,
+                none,
+                MR_NTFS_ORIGIN_INDEX_FREE_NODE
+            ),
+            (
+                26,
+                MR_NTFS_ENTRY_RESIDUAL_FREE,
+                none,
+                MR_NTFS_ORIGIN_INDEX_FREE_NODE
+            ),
+        ]
+    );
+    assert_eq!(got[1].4, "borrado.txt");
+    assert_eq!(got[2].5, "/Viejo/hijo.txt");
+    assert_eq!(got[6].4, "dos largo.txt");
+    // Índice y campo fuera de rango.
+    let mut e = entry();
+    assert_eq!(
+        unsafe { mr_ntfs_deleted_entry(task, 8, &mut e) },
+        MR_ERR_OUT_OF_RANGE
+    );
+    let mut n = 0usize;
+    assert_eq!(
+        unsafe { mr_ntfs_deleted_text(task, 0, 9, std::ptr::null_mut(), 0, &mut n) },
+        MR_ERR_INVALID_ARGUMENT
+    );
+    // Otro tipo de handle.
+    assert_eq!(
+        unsafe { mr_ntfs_deleted_result(vol, &mut info) },
+        MR_ERR_INVALID_HANDLE
+    );
+    assert_eq!(mr_task_free(task), MR_OK);
+    assert_eq!(mr_ntfs_volume_free(vol), MR_OK);
+    assert_eq!(mr_source_close(src), MR_OK);
+}
+
+#[test]
+fn recover_task_writes_only_deleted_records() {
+    let (d, src, vol) = residual_setup();
+    let out = d.path().join("recuperado.txt");
+    let os = out.to_str().unwrap();
+    let start = |rec: u64, seq: u32, flags: u32, task: &mut u64| unsafe {
+        mr_ntfs_recover_start(
+            vol,
+            rec,
+            seq,
+            std::ptr::null(),
+            0,
+            os.as_ptr(),
+            os.len(),
+            flags,
+            task,
+        )
+    };
+    // Entradas solo residuales y vivos: nunca se recuperan ni crean la salida.
+    for (rec, seq) in [(19u64, 1u32), (21, 3), (17, 1), (18, 1)] {
+        let mut t = 0u64;
+        assert_eq!(start(rec, seq, 0, &mut t), MR_ERR_INVALID_ARGUMENT, "{rec}");
+        assert!(!out.exists());
+    }
+    let mut t = 0u64;
+    assert_ne!(start(20, 1, 0, &mut t), MR_OK, "registro dañado");
+    let mut task = 0u64;
+    assert_eq!(start(18, 2, 0, &mut task), MR_OK, "{}", last_error());
+    assert_eq!(wait(task).state, 2);
+    let mut r = MrNtfsRecoverReport {
+        struct_size: std::mem::size_of::<MrNtfsRecoverReport>() as u32,
+        ..MrNtfsRecoverReport::default()
+    };
+    assert_eq!(unsafe { mr_ntfs_recover_result(task, &mut r) }, MR_OK);
+    assert_eq!((r.bytes, r.untrusted_bytes, r.suspect_count), (12, 0, 0));
+    assert_eq!(r.recoverability, MR_NTFS_RECOVERABLE_FULL);
+    assert_eq!(std::fs::read(&out).unwrap(), b"hola borrado");
+    let summary =
+        string(|b, c, n| unsafe { mr_ntfs_recover_text(task, u32::MAX, b, c, n) }).unwrap();
+    assert!(summary.contains("residente"), "{summary}");
+    let mut x = MrNtfsSuspectRange {
+        struct_size: std::mem::size_of::<MrNtfsSuspectRange>() as u32,
+        ..MrNtfsSuspectRange::default()
+    };
+    assert_eq!(
+        unsafe { mr_ntfs_recover_suspect(task, 0, &mut x) },
+        MR_ERR_OUT_OF_RANGE
+    );
+    // Salida existente: sin confirmación, MR_ERR_ALREADY_EXISTS; con ella, se sustituye.
+    let mut t = 0u64;
+    assert_eq!(start(24, 2, 0, &mut t), MR_ERR_ALREADY_EXISTS);
+    assert_eq!(std::fs::read(&out).unwrap(), b"hola borrado");
+    let mut t = 0u64;
+    assert_eq!(start(24, 2, MR_NTFS_RECOVER_OVERWRITE, &mut t), MR_OK);
+    assert_eq!(wait(t).state, 2);
+    assert_eq!(std::fs::read(&out).unwrap(), b"hijo");
+    // Opciones desconocidas.
+    let mut t = 0u64;
+    assert_eq!(start(24, 2, 8, &mut t), MR_ERR_INVALID_ARGUMENT);
+    assert_eq!(mr_ntfs_volume_free(vol), MR_OK);
+    assert_eq!(mr_source_close(src), MR_OK);
+}
