@@ -79,7 +79,7 @@ Completado en M1 por issues:
 
 - **Paridad objetivo**: IM-01, IM-02, IM-03, IM-04, IM-05, IO-06…IO-09 (simulados).
 
-## M1.5 · Variantes adicionales de contenedores
+## M1.5 · Variantes adicionales de contenedores: **TERMINADO 2026-10-25**
 
 Milestone propio para no retrasar particiones y sistemas de archivos. Exigen abrir otros ficheros con
 confirmación explícita del usuario o descomprimir; hoy se rechazan con errores tipados
@@ -113,7 +113,7 @@ Cerrado por el propietario (`PROGRESO.md`, etapa 8). APM y la copia del particio
   (`formatos/busqueda-particiones.md`).
 - **Paridad objetivo**: PT-01…PT-06, PT-10 (lectura/guardar).
 
-## M2.5 · Funciones adicionales de particiones
+## M2.5 · Funciones adicionales de particiones: **TERMINADO 2026-10-24**
 
 Milestone propio para no retrasar NTFS y la recuperación.
 - **Apple Partition Map: hecho (#17, PT-04)**: lector `mr-part::apm` con DDM, entradas, límites y anomalías
@@ -125,7 +125,10 @@ Milestone propio para no retrasar NTFS y la recuperación.
   validación estricta y comparación con un origen de solo lectura; API y CLI (`partitions
   --save-backup`, `partition-backup-check`). Restaurar en disco llega con M12; FFI e interfaz pendientes.
 
-## M3 · NTFS lectura: **EN CURSO**
+## M3 · NTFS lectura: **TERMINADO 2026-10-25**
+
+Validación de cierre en `PROGRESO.md`, etapa 9: primera recuperación real verificada (ficheros borrados de
+`ntfs_deleted` recuperados con la CLI Release con el SHA-256 del manifiesto e imagen intacta).
 
 - Corpus NTFS (#19) generado en un runner Linux desechable de GitHub Actions con mkntfs y ntfs-3g y
   validado con The Sleuth Kit como oráculo independiente (decisión del propietario, 2026-10-18).
