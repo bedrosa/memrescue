@@ -7,6 +7,7 @@ members = [
     "core/mr-image",
     "core/mr-part",
     "core/mr-fs-ntfs",
+    "core/mr-vfs",
     "core/mr-api",
     "core/mr-ffi",
     "cli",
@@ -27,6 +28,7 @@ mr-store = { path = "core/mr-store" }
 mr-image = { path = "core/mr-image" }
 mr-part = { path = "core/mr-part" }
 mr-fs-ntfs = { path = "core/mr-fs-ntfs" }
+mr-vfs = { path = "core/mr-vfs" }
 mr-api = { path = "core/mr-api" }
 thiserror = "2"
 crc32fast = "1"

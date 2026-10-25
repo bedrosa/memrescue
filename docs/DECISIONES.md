@@ -906,3 +906,59 @@ con caracteres no ASCII) y cada ruta se resuelve a su registro y a su SHA-256; l
 `ntfs_damaged_mft` que apuntan a registros dañados se informan; un nodo `INDX` ilegible del corpus
 no bloquea el resto (lo perdido aparece como huérfano con su ruta). Los índices distintos de `$I30`
 (`$SII`, `$SDH`, `$O`, `$R`, `$Q`) quedan fuera; la búsqueda por colación solo se usa para `$I30`.
+
+---
+
+## ADR-029 · Árbol virtual: valores por defecto de M4 para carpetas sintéticas, nombres UTF-16 y estado de los datos (Aceptada, 2026-10-25)
+
+**Contexto.** Issue #25 (M4): el árbol virtual (`mr-vfs`) que une vivos, borrados, huérfanos y
+metadatos y que usarán la recuperación (#26) y sus informes (#27). INV-01 (§7.2, §7.3 y §10) dejó
+abiertas tres preguntas que afectan a nombres de salida, a pruebas y a la ABI: el nombre de las
+carpetas sintéticas (pregunta 2), si se conservan los nombres UTF-16 originales (pregunta 13) y los
+estados de los datos por fichero. Para no bloquear M4 se han **propuesto al propietario unos valores
+por defecto y se adoptan mientras no indique otra cosa**; cambiarlos después solo afecta a constantes
+documentadas.
+
+**Decisión** (detalle en `formatos/vfs.md`):
+1. **Carpetas sintéticas en español entre corchetes**: `[Metadatos]` (ficheros del sistema),
+   `[Huérfanos]` (registros en uso no alcanzables desde la raíz), `[Borrados sin carpeta]` (borrados
+   cuyo padre no existe, es ilegible o se reutilizó) y `[Registro N]` (agrupación por el registro
+   padre citado). Son válidos como nombres de Windows y se ordenan después de los nodos reales.
+2. **Nombres UTF-16 sin pérdida**: cada nodo guarda las unidades originales (también las sueltas);
+   la forma visible (UTF-8 con U+FFFD) y el escape para rutas (`%XX`, `%uXXXX`, solo en los nombres
+   que lo necesitan) se calculan aparte y nunca sustituyen al original. Donde `mr-fs-ntfs` daba
+   nombres con pérdida (`FileName::name`, `DeletedEntry::name`, `Orphan::name`) se añade, sin
+   cambiar nada existente, `FileName::parse_with_units` y `NtfsFile::file_names_with_units`; el
+   árbol vuelve a leer el registro solo cuando la forma visible tiene U+FFFD. La ABI da las unidades
+   con `mr_vfs_node_name_utf16` y C# las convierte en `string` sin pérdida.
+3. **Estado de los datos por fichero** como propone INV-01 §7.3: `integro`,
+   `integro_no_verificable`, `parcial`, `sobrescrito`, `sin_datos`, `no_disponible`, `cifrado`. Solo
+   `integro` es íntegro, y solo un registro en uso puede tenerlo; un borrado con todos sus clústeres
+   libres es `integro_no_verificable`. El estado sale de los metadatos (disposición del flujo y
+   recuperabilidad de ADR-027) sin leer datos; la recuperación lo puede rebajar, nunca subir.
+4. **Categorías** `vivo`, `borrado`, `huerfano`, `metadatos`, con `encontrado` y `raw` reservadas.
+   Un borrado sin padre válido es `huerfano` (con el indicador `deleted`), como propone INV-01; sus
+   descendientes heredan la categoría.
+5. **Colocación**: un borrado cuelga de su padre solo si la secuencia coincide (la del directorio
+   vivo, o la citada o una más en un directorio borrado); una entrada de índice residual que
+   coincide con un borrado encontrado en la MFT no se duplica.
+6. **Arena compacta** de identificadores `u32` (104 B por nodo más nombres), límites con error
+   tipado (16 Mi nodos, 2^29 unidades de nombre, profundidad 4096) y orden de hijos determinista
+   (sintéticas al final; nombre sin distinguir mayúsculas; desempates por unidades, categoría,
+   registro e identificador).
+7. **Filtros**: reglas de nombre separadas por `;`, la primera que coincide gana, `!` excluye; si
+   ninguna coincide, pasa solo cuando todas son de exclusión (para que `!*.tmp` no lo excluya todo).
+
+**Alternativas.** Nombres de carpetas en inglés o según el idioma de la interfaz (cambiarían las
+rutas de salida con el idioma); sin tildes (`[Huerfanos]`, como sugería INV-01: se prefiere la
+ortografía correcta, válida en NTFS y en FAT con nombres largos); aceptar la pérdida de los
+sustitutos sueltos y tratarla como conflicto (dos ficheros distintos podrían recuperarse con el
+mismo nombre); un único estado «borrado» sin distinguir la procedencia (presentaría como íntegro lo
+que nada garantiza); guardar el árbol en SQLite desde ya (más lento y no hace falta hasta M6).
+
+**Consecuencias.** Los 10 manifiestos del corpus NTFS se reproducen en el árbol: cada ruta viva una
+vez con su tamaño e `integro`, cada borrado o sobrescrito una vez en su ruta con el estado que
+corresponde a su recuperabilidad y los 4 registros dañados como `no_disponible`. #26 decidirá las
+políticas por estado (pregunta abierta 1) sobre estos valores. Si el propietario cambia los
+nombres de las carpetas, cambian `mr_vfs::ntfs::*_FOLDER` y las pruebas que los citan. Numeración
+provisional: puede cambiar al integrar las ramas paralelas.

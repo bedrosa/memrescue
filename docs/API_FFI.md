@@ -280,6 +280,34 @@ En C#: `NtfsVolume.StartDeletedScan()` → `NtfsDeletedTask.GetResult()` (`NtfsD
 (`NtfsRecoveryReport` con los tramos sospechosos y su dueño); `NtfsEntryState.Deleted`,
 `ResidualReused`, `ResidualUnusable`, `ResidualFree`.
 
+## Árbol virtual (ampliación compatible de la ABI 3, issue #25, ADR-029)
+
+Funciones nuevas; ninguna firma, estructura ni significado existente cambia (`MR_ERR_NOT_FOUND` lo
+devuelve también `mr_vfs_find`). Handles del registro: la tarea de construcción, el árbol (que
+sobrevive a la tarea, al volumen y al origen) y el resultado de una consulta. Estructuras
+versionadas por `struct_size`, de entrada (`mr_vfs_build_options` 32 B, opcional; `mr_vfs_filter`
+56 B) y de salida (`mr_vfs_info` 176 B, `mr_vfs_node` 128 B). Los nodos se identifican por un
+`uint32_t` estable (0 = raíz). Modelo, estados, escape de rutas y reglas de filtro en
+`formatos/vfs.md`.
+
+| Función | Descripción |
+|---|---|
+| `mr_vfs_build_start(volume, options, out_task)` | Construye el árbol del volumen NTFS como tarea (progreso en milésimas por fase, 3000 en total; cancelable con `mr_task_cancel`). `options` puede ser nulo; `MR_VFS_BUILD_NO_DELETED` / `NO_ORPHANS` / `NO_METADATA`; límites a 0 = por defecto. Bits desconocidos o `struct_size` distinto → `MR_ERR_INVALID_ARGUMENT` |
+| `mr_vfs_build_result(task, out_vfs)` | Handle nuevo del árbol terminado. Cancelada → `MR_ERR_CANCELLED`; límite de la arena superado → `MR_ERR_TASK_FAILED` con el detalle en `mr_last_error` |
+| `mr_vfs_info(vfs, out)` | Nodos, ficheros, directorios, sintéticos, borrados, nodos por categoría, ficheros por estado de los datos, memoria de la arena, unidades de nombre, notas y `MR_VFS_INFO_PARTIAL` |
+| `mr_vfs_node(vfs, node, out)` | Padre (`MR_VFS_NO_PARENT` en la raíz), nº de hijos, tipo (`MR_VFS_KIND_*`), categoría (`MR_VFS_CAT_*`), origen del nombre (`MR_VFS_NAME_*`), estado de los datos (`MR_VFS_DATA_*`, 0 en directorios), indicadores (`MR_VFS_NODE_*`), espacio de nombres, profundidad, atributos, tamaños, 4 FILETIME, registro y secuencia (con `has_origin`) y los del padre citado. Nodo inexistente → `MR_ERR_OUT_OF_RANGE` |
+| `mr_vfs_child(vfs, node, index, out_child)` | Hijo `index` en el orden determinista (reales y después sintéticos; nombre sin distinguir mayúsculas) |
+| `mr_vfs_node_name` / `mr_vfs_node_name_utf16` / `mr_vfs_node_path` | Nombre visible UTF-8 (U+FFFD en las unidades sueltas); unidades UTF-16 originales sin pérdida (capacidad y longitud en unidades, sin terminador); ruta visible con los componentes escapados |
+| `mr_vfs_find(vfs, path, len, out_node)` | Nodo de una ruta visible (forma visible o escapada; después sin distinguir mayúsculas). No existe → `MR_ERR_NOT_FOUND` |
+| `mr_vfs_note_text(vfs, index, ...)` | Nota de la construcción: `"<código>\n<nodo o vacío>\n<descripción>"` |
+| `mr_vfs_query(vfs, start, filter, masks, len, out_query)` / `_count` / `_get` / `_free` | Nodos visibles bajo `start` (`MR_VFS_QUERY_RECURSIVE`, `DELETED_ONLY`, `FILES_ONLY`; máscaras de categorías y de estados; rangos de tamaño y fecha con 0 y `UINT64_MAX` como abiertos; `MR_VFS_TIME_*`) y reglas de nombre UTF-8 `regla;regla;!exclusión`. Regla o filtro no válido → `MR_ERR_INVALID_ARGUMENT` |
+| `mr_vfs_free(vfs)` | Libera el handle del árbol |
+
+En C#: `NtfsVolume.StartVirtualFileSystem(VfsBuildOptions?)` → `VfsBuildTask.GetResult()` →
+`VirtualFileSystem` (`Info`, `GetNode(id)` con el nombre UTF-16 original, `GetChildren(id)`,
+`Find(path)`, `PathOf(id)`, `DisplayNameOf(id)`, `Notes()`, `Query(VfsFilter, start)`). La
+interfaz gráfica todavía no lo usa (panel de recuperación de #26).
+
 ## Modo tolerante de contenedores (`MR_OPEN_TOLERANT`, ADR-020)
 
 Ampliación compatible de la ABI 3 (nuevo bit de `flags`; las estructuras y la versión no cambian). Sin el
@@ -312,6 +340,7 @@ después de liberarlos.
 ## Pruebas que garantizan el contrato
 
 - Rust (`core/mr-ffi/src/ntfs_tests.rs`, 5 pruebas, #22): tamaños y desplazamientos de las 6 estructuras NTFS, volumen sintético con árbol (`mr_fs_ntfs::testvol`, característica `test-support`): datos y etiqueta, volumen que sobrevive al cierre del origen, listado por índice con cada estado (vivo, referencia no válida, reutilizado, registro dañado con `record_state`, libre) y nombre con sustituto suelto, índices fuera de límites, handles de otro tipo, `struct_size` incorrecto, registro que no es un directorio; `mr_ntfs_resolve` sin distinguir mayúsculas y `MR_ERR_NOT_FOUND`; `mr_ntfs_path_of` y huérfano; árbol como tarea con progreso, nodos, rutas, huérfanos y opción sin huérfanos; fichero como origen leído con `mr_source_read_mapped`; copia como tarea con informe, `MR_ERR_ALREADY_EXISTS`, rechazo de la propia imagen, de opciones desconocidas y de rutas de dispositivo, sustitución con `MR_NTFS_COPY_OVERWRITE` e imagen intacta.
+- Rust (`core/mr-ffi/src/vfs_tests.rs`, 3 pruebas, #25): tamaños y desplazamientos de las 4 estructuras del árbol virtual; construcción como tarea sobre el volumen sintético (progreso 3000/3000, árbol que sobrevive a la tarea, al volumen y al origen), resumen, hijos por índice, nodo vivo, borrado y con nombre UTF-16 suelto (unidades exactas con el protocolo de búfer pequeño), `MR_ERR_NOT_FOUND`, consultas recursivas, directas, de borrados, por máscara y por estado, errores de filtro, `struct_size`, nodos inexistentes y handles liberados; opciones sin borrados ni huérfanos, límite de nodos (`MR_ERR_TASK_FAILED`), opciones no válidas, handle de otro tipo y cancelación.
 - Rust (`core/mr-ffi/src/tests.rs`, 33 pruebas): búsqueda de particiones perdidas (tamaños y desplazamientos de las 4 estructuras, flujo completo con apertura de volúmenes también tras cerrar el origen, opciones versionadas y validadas, presupuesto agotado, familias, desplazamiento con anomalías con signo y apertura solo con `MR_PARTITION_OPEN_APPLY_SHIFT`, cancelación con resultado parcial, handles de otro tipo), tamaños de estructuras (incluidas las de particiones), tabla GPT sintética (copia, GUID de disco, nombre, GUID único, nombre de tipo, apertura) y GPT desplazada (copia de respaldo, `image_shifted` con signo, apertura rechazada sin `MR_PARTITION_OPEN_APPLY_SHIFT` y correcta con él), tablas de particiones por índice (esquema, confianza, anomalías de tabla y de partición, nombres de tipo con búfer pequeño, apertura de una partición y de una recortada, tabla que sobrevive a su origen, `struct_size` incorrecto, punteros nulos, handles de otro tipo, EBR ilegible como anomalía), verificación extendida con
   códigos de error simulados (origen `FaultyDevice` registrado con `mr_api::source_from_device`) y
   validación de `mr_verify_options`, protocolo de búfer pequeño, rutas
@@ -325,5 +354,5 @@ después de liberarlos.
 - C# (`app/tests/MemRescue.Core.Interop.Tests`): los mismos contratos desde .NET contra la DLL
   real (política de errores y `ErrorCodeList` en `VerifyPolicyTests`; patrones de relleno, preferencias y
   paleta en `FillPatternTests`, incluidos VHD fijo construido según la especificación, descriptor VMDK malicioso, rangos, estados y
-  divididas y modo tolerante con un VHD dinámico dañado; particiones en `PartitionTests` con un disco MBR sintético y el corpus completo; búsqueda de particiones perdidas en `PartitionSearchTests` con discos sintéticos y los 38 manifiestos; árbol NTFS en `NtfsTests` contra el corpus NTFS: árbol de los 10 manifiestos, rutas, ficheros como origen, copia con SHA-256, salida existente y origen rechazados, entradas a registros dañados), finalizadores, rutas no ASCII, cancelación, base de datos de trabajo, inmutabilidad del origen y el
+  divididas y modo tolerante con un VHD dinámico dañado; particiones en `PartitionTests` con un disco MBR sintético y el corpus completo; búsqueda de particiones perdidas en `PartitionSearchTests` con discos sintéticos y los 38 manifiestos; árbol NTFS en `NtfsTests` contra el corpus NTFS: árbol de los 10 manifiestos, rutas, ficheros como origen, copia con SHA-256, salida existente y origen rechazados, entradas a registros dañados; árbol virtual en `VfsTests`: estructuras, cada entrada de `ntfs_deleted` y `ntfs_overwritten` en su ruta con su categoría y estado, metadatos, consultas, determinismo, opciones y límite), finalizadores, rutas no ASCII, cancelación, base de datos de trabajo, inmutabilidad del origen y el
   corpus sintético (lectura de marcadores en LBA exactas y cabeceras GPT).

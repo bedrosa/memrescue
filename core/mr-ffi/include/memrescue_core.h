@@ -53,6 +53,14 @@
  * Añadido sin cambiar la ABI 3 (M3, issue #23): borrados de la MFT y entradas residuales de los
  * índices como tarea (mr_ntfs_deleted_*, estados 16-19 de mr_ntfs_entry) y recuperación de un
  * borrado como tarea (mr_ntfs_recover_*).
+ * Añadido sin cambiar la ABI 3 (M4, issue #25): árbol virtual (mr_vfs_*): construcción como tarea
+ * desde un volumen NTFS (mr_vfs_build_start con mr_vfs_build_options versionada, opcional), el
+ * árbol como handle (mr_vfs_build_result, mr_vfs_free), resumen (mr_vfs_info), nodos por
+ * identificador (mr_vfs_node), hijos por índice (mr_vfs_child), nombre visible y UTF-16 original
+ * (mr_vfs_node_name, mr_vfs_node_name_utf16), ruta (mr_vfs_node_path), búsqueda por ruta
+ * (mr_vfs_find), notas (mr_vfs_note_text) y consultas con filtro como handle (mr_vfs_query con
+ * mr_vfs_filter, mr_vfs_query_count, mr_vfs_query_get, mr_vfs_query_free). mr_task_status_get,
+ * mr_task_cancel y mr_task_free admiten la tarea de construcción.
  */
 #ifndef MEMRESCUE_CORE_H
 #define MEMRESCUE_CORE_H
@@ -1003,6 +1011,172 @@ mr_status mr_ntfs_recover_suspect(uint64_t task, uint32_t index, mr_ntfs_suspect
 /* index = UINT32_MAX: resumen de la recuperabilidad; si no, dueño del tramo sospechoso. */
 mr_status mr_ntfs_recover_text(uint64_t task, uint32_t index,
                                uint8_t *buf, size_t cap, size_t *out_len);
+
+/* ---------- Árbol virtual (#25) ---------- */
+
+#define MR_VFS_BUILD_NO_DELETED   1u   /* sin borrados ni entradas de índice residuales */
+#define MR_VFS_BUILD_NO_ORPHANS   2u   /* sin registros en uso no alcanzables desde la raíz */
+#define MR_VFS_BUILD_NO_METADATA  4u   /* sin ficheros del sistema ([Metadatos]) */
+
+typedef struct mr_vfs_build_options {  /* 32 bytes; los límites a 0 = por defecto */
+    uint32_t struct_size;        /* = sizeof(mr_vfs_build_options) */
+    uint32_t flags;              /* MR_VFS_BUILD_* */
+    uint32_t max_nodes;          /* por defecto 16777216 */
+    uint32_t max_depth;          /* por defecto 4096 (máximo 65535) */
+    uint64_t max_name_units;     /* unidades UTF-16 de nombre en total; por defecto 2^29 */
+    uint64_t reserved;
+} mr_vfs_build_options;
+
+#define MR_VFS_INFO_PARTIAL       1u   /* mr_vfs_info.flags: construcción no completa */
+
+typedef struct mr_vfs_info {  /* 176 bytes */
+    uint32_t struct_size;
+    uint32_t flags;              /* MR_VFS_INFO_PARTIAL */
+    uint64_t node_count;         /* el nodo 0 es la raíz */
+    uint64_t files;
+    uint64_t directories;
+    uint64_t synthetic;
+    uint64_t deleted;            /* entradas con MR_VFS_NODE_DELETED */
+    uint64_t live;               /* nodos por categoría */
+    uint64_t deleted_category;
+    uint64_t orphan;
+    uint64_t metadata;
+    uint64_t found;              /* reservada (M6) */
+    uint64_t raw;                /* reservada (M7) */
+    uint64_t integro;            /* ficheros por estado de los datos */
+    uint64_t integro_no_verificable;
+    uint64_t parcial;
+    uint64_t sobrescrito;
+    uint64_t sin_datos;
+    uint64_t no_disponible;
+    uint64_t cifrado;
+    uint64_t memory_bytes;       /* memoria de la arena */
+    uint64_t name_units;
+    uint32_t note_count;         /* mr_vfs_note_text */
+    uint32_t reserved;
+} mr_vfs_info;
+
+#define MR_VFS_KIND_FILE          1u
+#define MR_VFS_KIND_DIRECTORY     2u
+#define MR_VFS_KIND_SYNTHETIC     3u   /* carpeta propia: [Metadatos], [Huérfanos]... */
+
+#define MR_VFS_CAT_LIVE           1u
+#define MR_VFS_CAT_DELETED        2u
+#define MR_VFS_CAT_ORPHAN         3u
+#define MR_VFS_CAT_METADATA       4u
+#define MR_VFS_CAT_FOUND          5u   /* reservada (M6) */
+#define MR_VFS_CAT_RAW            6u   /* reservada (M7) */
+
+#define MR_VFS_NAME_STRUCTURE     1u   /* índice vivo o $FILE_NAME de un registro en uso */
+#define MR_VFS_NAME_RESIDUAL      2u   /* entrada de índice residual */
+#define MR_VFS_NAME_RECORD        3u   /* solo $FILE_NAME de un registro no en uso */
+#define MR_VFS_NAME_SYNTHETIC     4u
+
+/* Estado de los datos (solo MR_VFS_DATA_INTEGRO se presenta como íntegro). */
+#define MR_VFS_DATA_NONE                   0u  /* directorios y carpetas sintéticas */
+#define MR_VFS_DATA_INTEGRO                1u
+#define MR_VFS_DATA_INTEGRO_NO_VERIFICABLE 2u  /* borrado, clústeres libres: procedencia no verificable */
+#define MR_VFS_DATA_PARCIAL                3u
+#define MR_VFS_DATA_SOBRESCRITO            4u
+#define MR_VFS_DATA_SIN_DATOS              5u
+#define MR_VFS_DATA_NO_DISPONIBLE          6u  /* registro dañado o flujo con error tipado */
+#define MR_VFS_DATA_CIFRADO                7u  /* EFS */
+
+/* mr_vfs_node.flags */
+#define MR_VFS_NODE_DELETED               0x0001u
+#define MR_VFS_NODE_SYSTEM                0x0002u
+#define MR_VFS_NODE_NAME_LOSSY            0x0004u   /* unidades UTF-16 sueltas (ver _name_utf16) */
+#define MR_VFS_NODE_TIMES_FROM_INDEX      0x0008u
+#define MR_VFS_NODE_FROM_INDEX            0x0010u
+#define MR_VFS_NODE_FROM_MFT              0x0020u
+#define MR_VFS_NODE_RECORD_DAMAGED        0x0040u
+#define MR_VFS_NODE_PARENT_REUSED         0x0080u
+#define MR_VFS_NODE_CYCLE_CUT             0x0100u
+#define MR_VFS_NODE_DUPLICATE_NAME        0x0200u
+#define MR_VFS_NODE_ANOMALIES             0x0400u
+#define MR_VFS_NODE_ASSESSMENT_TRUNCATED  0x0800u
+#define MR_VFS_NODE_DIR_INCOMPLETE        0x1000u
+#define MR_VFS_NODE_HARD_LINK             0x2000u
+
+#define MR_VFS_NO_PARENT          UINT32_MAX
+#define MR_VFS_NO_NAMESPACE       255u
+
+typedef struct mr_vfs_node {  /* 128 bytes */
+    uint32_t struct_size;
+    uint32_t id;
+    uint32_t parent;             /* MR_VFS_NO_PARENT en la raíz */
+    uint32_t child_count;        /* mr_vfs_child */
+    uint32_t kind;               /* MR_VFS_KIND_* */
+    uint32_t category;           /* MR_VFS_CAT_* */
+    uint32_t name_reliability;   /* MR_VFS_NAME_* */
+    uint32_t data_state;         /* MR_VFS_DATA_* */
+    uint32_t flags;              /* MR_VFS_NODE_* */
+    uint32_t name_space;         /* 0 POSIX, 1 Win32, 2 DOS, 3 Win32 y DOS, MR_VFS_NO_NAMESPACE */
+    uint32_t depth;              /* la raíz es 0 */
+    uint32_t attributes;         /* atributos DOS */
+    uint64_t size;
+    uint64_t allocated_size;
+    uint64_t created;            /* FILETIME UTC (0 = desconocida) */
+    uint64_t modified;
+    uint64_t changed;            /* cambio del registro (MFT) */
+    uint64_t accessed;
+    uint64_t record;             /* con has_origin: registro MFT y secuencia para abrirlo */
+    uint64_t parent_record;      /* padre citado por el nombre */
+    uint32_t sequence;
+    uint32_t parent_sequence;
+    uint32_t has_origin;         /* 0 en carpetas sintéticas */
+    uint32_t reserved;
+} mr_vfs_node;
+
+#define MR_VFS_QUERY_RECURSIVE    1u   /* todo el subárbol (si no, los hijos directos) */
+#define MR_VFS_QUERY_DELETED_ONLY 2u
+#define MR_VFS_QUERY_FILES_ONLY   4u   /* directorios solo si llevan a un fichero visible */
+#define MR_VFS_TIME_MODIFIED      0u
+#define MR_VFS_TIME_CREATED       1u
+#define MR_VFS_TIME_CHANGED       2u
+#define MR_VFS_TIME_ACCESSED      3u
+
+typedef struct mr_vfs_filter {  /* 56 bytes */
+    uint32_t struct_size;
+    uint32_t flags;              /* MR_VFS_QUERY_* */
+    uint32_t categories;         /* máscara de 1 << MR_VFS_CAT_* (0 = todas) */
+    uint32_t data_states;        /* máscara de 1 << MR_VFS_DATA_* (0 = todos; solo ficheros) */
+    uint64_t size_min;           /* incluidos; 0 y UINT64_MAX = sin límite */
+    uint64_t size_max;
+    uint64_t time_min;           /* FILETIME incluidos; 0 y UINT64_MAX = sin límite */
+    uint64_t time_max;
+    uint32_t time_field;         /* MR_VFS_TIME_* */
+    uint32_t reserved;
+} mr_vfs_filter;
+
+/* Tarea (progreso en milésimas por fase, 3000 en total). options puede ser NULL. */
+mr_status mr_vfs_build_start(uint64_t volume, const mr_vfs_build_options *options,
+                             uint64_t *out_task);
+/* Handle nuevo del árbol terminado (sobrevive a la tarea). Límite superado: la tarea falla
+ * (MR_ERR_TASK_FAILED con el detalle en mr_last_error). */
+mr_status mr_vfs_build_result(uint64_t task, uint64_t *out_vfs);
+mr_status mr_vfs_info(uint64_t vfs, mr_vfs_info *out);
+mr_status mr_vfs_node(uint64_t vfs, uint32_t node, mr_vfs_node *out);
+/* Hijos en orden determinista: reales y después sintéticos, por nombre sin mayúsculas. */
+mr_status mr_vfs_child(uint64_t vfs, uint32_t node, uint32_t index, uint32_t *out_child);
+/* UTF-8; las unidades UTF-16 sueltas aparecen como U+FFFD. */
+mr_status mr_vfs_node_name(uint64_t vfs, uint32_t node, uint8_t *buf, size_t cap, size_t *out_len);
+/* Unidades UTF-16 originales, sin terminador; cap y *out_len en unidades. */
+mr_status mr_vfs_node_name_utf16(uint64_t vfs, uint32_t node, uint16_t *buf, size_t cap,
+                                 size_t *out_len);
+/* Ruta visible con los componentes escapados (docs/formatos/vfs.md). */
+mr_status mr_vfs_node_path(uint64_t vfs, uint32_t node, uint8_t *buf, size_t cap, size_t *out_len);
+/* No existe: MR_ERR_NOT_FOUND. */
+mr_status mr_vfs_find(uint64_t vfs, const uint8_t *path, size_t path_len, uint32_t *out_node);
+/* "<código>\n<nodo o vacío>\n<descripción>" */
+mr_status mr_vfs_note_text(uint64_t vfs, uint32_t index, uint8_t *buf, size_t cap, size_t *out_len);
+/* masks: reglas de nombre UTF-8 "regla;regla;!exclusión" (gana la primera que coincide). */
+mr_status mr_vfs_query(uint64_t vfs, uint32_t start, const mr_vfs_filter *filter,
+                       const uint8_t *masks, size_t masks_len, uint64_t *out_query);
+mr_status mr_vfs_query_count(uint64_t query, uint64_t *out_count);
+mr_status mr_vfs_query_get(uint64_t query, uint64_t index, uint32_t *out_node);
+mr_status mr_vfs_query_free(uint64_t query);
+mr_status mr_vfs_free(uint64_t vfs);
 
 mr_status mr_task_status_get(uint64_t task, mr_task_status *out);
 mr_status mr_task_cancel(uint64_t task);

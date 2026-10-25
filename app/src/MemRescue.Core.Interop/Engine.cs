@@ -360,6 +360,9 @@ public abstract class EngineHandle : IDisposable
 
     public bool IsDisposed => Volatile.Read(ref _handle) == 0;
 
+    /// <summary>Handle del motor para otras clases del ensamblado (excepción si está liberado).</summary>
+    internal ulong RawHandle => Handle;
+
     private protected abstract void Release(ulong handle);
 
     public void Dispose()
