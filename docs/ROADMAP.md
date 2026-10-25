@@ -158,6 +158,14 @@ Milestone propio para no retrasar NTFS y la recuperación.
 
 - INV-01 → `mr-vfs` (árbol, estados, carpetas sintéticas) y `mr-recover` (copiado, filtros,
   categorías, conflictos, errores, rutas largas, división, fechas).
+  - `mr-vfs` (#25, ADR-029, `formatos/vfs.md`): **hecho** para NTFS. Árbol unificado de vivos,
+    borrados (bajo su padre con la misma secuencia), huérfanos (`[Huérfanos]`,
+    `[Borrados sin carpeta]`, `[Registro N]`) y metadatos (`[Metadatos]`), con categoría, origen del
+    nombre, estado de los datos (`integro` ... `cifrado`), nombres UTF-16 sin pérdida, orden
+    determinista, límites tipados y filtros; tarea cancelable en `mr-api`, ABI (`mr_vfs_*`), C#
+    (`VirtualFileSystem`) y CLI `vfs-ls`. Pendiente: uso en la interfaz (panel de recuperación de
+    #26) y flujos alternativos por nodo. Las entradas `INDX` residuales de #23 ya entran en el
+    árbol (nombre `residual`, indicador `from_index`).
 - `mr-report`: listas TXT/CSV/HTML, informe con hashes, lista de sectores.
 - CLI: `recover` de extremo a extremo sobre imágenes NTFS.
 - **Paridad objetivo**: RC-01…RC-13, FS-05 (lectura raw EFS).

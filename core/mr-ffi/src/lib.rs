@@ -459,6 +459,16 @@ fn api_error_code(e: &ApiError) -> i32 {
         ) => MR_ERR_INVALID_ARGUMENT,
         ApiError::OutputExists(_) => MR_ERR_ALREADY_EXISTS,
         ApiError::Ntfs(_) => MR_ERR_CORRUPT,
+        ApiError::Vfs(v) => match v {
+            mr_api::mr_vfs::VfsError::LimitExceeded { .. } => MR_ERR_OUT_OF_RANGE,
+            mr_api::mr_vfs::VfsError::InvalidFilter(_)
+            | mr_api::mr_vfs::VfsError::NoSuchNode(_)
+            | mr_api::mr_vfs::VfsError::NotAContainer(_) => MR_ERR_INVALID_ARGUMENT,
+            mr_api::mr_vfs::VfsError::Ntfs(mr_api::mr_fs_ntfs::NtfsError::Io(io)) => {
+                io_error_code(io)
+            }
+            mr_api::mr_vfs::VfsError::Ntfs(_) => MR_ERR_CORRUPT,
+        },
         ApiError::Cancelled => MR_ERR_CANCELLED,
         ApiError::InvalidArgument(_) => MR_ERR_INVALID_ARGUMENT,
         ApiError::Spawn(_) => MR_ERR_IO,
@@ -514,6 +524,12 @@ enum Entry {
     NtfsDeleted(Box<ntfs::DeletedEntryTask>),
     /// Recuperación de un borrado NTFS en segundo plano (#23).
     NtfsRecover(Box<ntfs::RecoverEntry>),
+    /// Construcción del árbol virtual en segundo plano (#25).
+    VfsBuild(Box<vfs::BuildEntry>),
+    /// Árbol virtual terminado.
+    Vfs(Arc<mr_api::mr_vfs::Vfs>),
+    /// Resultado de una consulta sobre el árbol virtual.
+    VfsQuery(Vec<mr_api::mr_vfs::NodeId>),
 }
 
 /// Tarea de búsqueda de particiones con su resultado y el origen en que se hizo.
@@ -2731,11 +2747,14 @@ pub unsafe extern "C" fn mr_task_status_get(task: u64, out: *mut MrTaskStatus) -
                 Entry::NtfsCopy(e) => (e.task.state(), e.task.progress()),
                 Entry::NtfsDeleted(e) => (e.task.state(), e.task.progress()),
                 Entry::NtfsRecover(e) => (e.task.state(), e.task.progress()),
+                Entry::VfsBuild(e) => (e.task.state(), e.task.progress()),
                 Entry::Source(_)
                 | Entry::Partitions { .. }
                 | Entry::Ntfs(_)
                 | Entry::NtfsListing(_)
-                | Entry::VmdkExtents(_) => return None,
+                | Entry::VmdkExtents(_)
+                | Entry::Vfs(_)
+                | Entry::VfsQuery(_) => return None,
             };
             Some(MrTaskStatus {
                 state: state as u32,
@@ -2784,11 +2803,17 @@ pub extern "C" fn mr_task_cancel(task: u64) -> i32 {
                 e.task.cancel();
                 true
             }
+            Entry::VfsBuild(e) => {
+                e.task.cancel();
+                true
+            }
             Entry::Source(_)
             | Entry::Partitions { .. }
             | Entry::Ntfs(_)
             | Entry::NtfsListing(_)
-            | Entry::VmdkExtents(_) => false,
+            | Entry::VmdkExtents(_)
+            | Entry::Vfs(_)
+            | Entry::VfsQuery(_) => false,
         });
         if cancelled == Some(true) {
             MR_OK
@@ -2810,7 +2835,8 @@ pub extern "C" fn mr_task_free(task: u64) -> i32 {
                 | Entry::NtfsTree(_)
                 | Entry::NtfsCopy(_)
                 | Entry::NtfsDeleted(_)
-                | Entry::NtfsRecover(_),
+                | Entry::NtfsRecover(_)
+                | Entry::VfsBuild(_),
             ) => {}
             _ => return bad_task(task),
         }
@@ -2823,6 +2849,7 @@ pub extern "C" fn mr_task_free(task: u64) -> i32 {
             Some(Entry::NtfsCopy(e)) => e.task.cancel(),
             Some(Entry::NtfsDeleted(e)) => e.task.cancel(),
             Some(Entry::NtfsRecover(e)) => e.task.cancel(),
+            Some(Entry::VfsBuild(e)) => e.task.cancel(),
             _ => {}
         }
         MR_OK
@@ -2831,6 +2858,8 @@ pub extern "C" fn mr_task_free(task: u64) -> i32 {
 
 mod ntfs;
 pub use ntfs::*;
+mod vfs;
+pub use vfs::*;
 
 #[cfg(test)]
 mod ntfs_tests;
@@ -2839,3 +2868,5 @@ pub use vmdk_extents::*;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod vfs_tests;

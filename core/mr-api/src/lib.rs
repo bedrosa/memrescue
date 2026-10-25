@@ -37,11 +37,15 @@
 //!   directorios contrastados con la MFT, rutas y árbol completo cancelable con progreso;
 //!   [`ntfs_stream_source`] presenta un fichero como origen (visor) y [`ntfs_copy_file`] /
 //!   [`start_ntfs_copy_task`] lo copian con la política de [`create_output`].
+//! - [`vfs_build_ntfs`] / [`start_vfs_build_task`] y [`vfs_query`] (#25): árbol virtual de un
+//!   volumen NTFS (vivos, borrados, huérfanos y metadatos con el estado de sus datos) como tarea
+//!   cancelable con progreso, y consultas con filtro (`mr_vfs`).
 //! - [`start_hash_task`]: hashes del fichero completo en segundo plano.
 //! - [`start_verify_task`]: lectura completa tolerante a errores con mapa de validez por sector.
 
 mod ntfs;
 pub mod task;
+mod vfs;
 
 use mr_common::{HashAlgorithm, MultiHasher};
 use mr_image::OpenedImage;
@@ -68,10 +72,12 @@ pub use mr_image::OpenOptions;
 pub use mr_part;
 pub use mr_part::search::{SearchOptions, SearchResult};
 pub use mr_part::{Partition, PartitionTable};
+pub use mr_vfs;
 pub use ntfs::{
     ntfs_copy_file, ntfs_list_dir, ntfs_path_of, ntfs_resolve, ntfs_stream_source, ntfs_tree,
     start_ntfs_copy_task, start_ntfs_tree_task, NtfsCopyResult, STREAM_SOURCE_SECTOR,
 };
+pub use vfs::{start_vfs_build_task, vfs_build_ntfs, vfs_query};
 
 #[derive(Debug, Error)]
 pub enum ApiError {
@@ -81,6 +87,9 @@ pub enum ApiError {
     Store(#[from] mr_store::StoreError),
     #[error(transparent)]
     Ntfs(#[from] mr_fs_ntfs::NtfsError),
+    /// Árbol virtual (#25): límite de la arena, filtro no válido o nodo inexistente.
+    #[error(transparent)]
+    Vfs(#[from] mr_vfs::VfsError),
     #[error("operación cancelada")]
     Cancelled,
     #[error("argumento no válido: {0}")]

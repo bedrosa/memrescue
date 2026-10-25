@@ -225,6 +225,7 @@ dependencies = [
  "mr-io",
  "mr-part",
  "mr-store",
+ "mr-vfs",
  "tempfile",
  "thiserror",
 ]
@@ -300,6 +301,16 @@ version = "0.2.0"
 dependencies = [
  "rusqlite",
  "tempfile",
+ "thiserror",
+]
+
+[[package]]
+name = "mr-vfs"
+version = "0.2.0"
+dependencies = [
+ "mr-fs-ntfs",
+ "mr-io",
+ "mr-part",
  "thiserror",
 ]
 

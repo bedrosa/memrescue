@@ -110,7 +110,9 @@ el SHA-256 de cada imagen debe coincidir con su manifiesto versionado) y ejecuta
 `cargo test -p mr-fs-ntfs --test ntfs_corpus -- --ignored`,
 `cargo test -p memrescue-cli --test ntfs_corpus -- --ignored` y, para los borrados (#23),
 `cargo test -p mr-fs-ntfs --test ntfs_deleted_corpus -- --ignored` y
-`cargo test -p memrescue-cli --test ntfs_deleted -- --ignored`. En local, `scripts/test.ps1` tiene el
+`cargo test -p memrescue-cli --test ntfs_deleted -- --ignored` y, para el árbol virtual (#25),
+`cargo test -p mr-vfs --test vfs_corpus -- --ignored` y
+`cargo test -p memrescue-cli --test vfs_corpus -- --ignored`. En local, `scripts/test.ps1` tiene el
 mismo paso (`-SkipNtfsCorpus` para omitirlo; sin corpus, el paso falla e indica cómo descargarlo).
 
 **Árbol de ficheros (#22).** `core/mr-fs-ntfs/tests/ntfs_corpus.rs` añade tres pruebas: el árbol
@@ -705,6 +707,47 @@ diferenciales»):
   (`cli/tests/differencing.rs`: indicaciones en `image-info` texto y JSON, `--parent` repetido en
   orden, orden equivocado, padre ajeno, cadena incompleta, `--ignore-parent-mismatch` con aviso,
   combinaciones no válidas con código 2, ruta de dispositivo), C# e interfaz.
+
+Árbol virtual (issue #25, ADR-029, `formatos/vfs.md`):
+
+- Unitarias (`core/mr-vfs`, 17): forma visible, escape y su inverso (separadores, códigos de
+  control, `.`/`..`, vacío, `%`, unidades sueltas), plegado y orden total sin distinguir mayúsculas;
+  reglas de nombre (comodines, primera que coincide, exclusión, solo exclusiones, reglas de ruta,
+  límites), listas de categorías y estados; nodo de 104 B (≤ 128 B también al compilar); orden de
+  hijos independiente del orden de construcción y duplicados sin distinguir mayúsculas; vista de
+  nodo, rutas, búsqueda por ruta (también con `\` y sin mayúsculas), por registro y recuentos;
+  límites de nodos, profundidad y unidades de nombre como errores tipados, padre inexistente o
+  fichero como padre; nombres con sustitutos sueltos sin pérdida y su ruta escapada; consultas por
+  máscaras, borrados, categoría, estado, tamaño, fecha y ruta relativa, recursivas o directas, y
+  filtros incoherentes; **escala**: un millón de nodos con la arena por debajo de 156 B por nodo y
+  orden y consulta correctos; **NTFS sintético** (`tree_volume` con un directorio borrado con su
+  hijo, un borrado con nombre `x<DC00>`, un borrado con el padre reutilizado y un directorio en uso
+  sin padre): vivos íntegros y enlaces duros, nombre suelto sin pérdida, registros dañados y
+  referencia no válida como `no_disponible`, borrado con índice residual una sola vez (`from_index`),
+  residual hacia un registro reutilizado como `residual`/`sin_datos`, directorio borrado con su
+  hijo `integro_no_verificable`, `[Borrados sin carpeta]/[Registro 23]` con `parent_reused`,
+  `[Huérfanos]/[Registro N]`, metadatos fuera de la raíz, determinismo, opciones sin borrados ni
+  huérfanos, cancelación en distintos puntos, progreso monótono hasta 3000/3000 y límite de nodos.
+- `core/mr-vfs/tests/vfs_corpus.rs` (2, `--ignored`): `every_manifest_entry_is_in_place_with_its_state`
+  recorre los 10 manifiestos: **cada** ruta del manifiesto aparece **una sola vez**, con su tipo,
+  registro y nombre UTF-16 exacto; los vivos con categoría `vivo`, nombre `estructura`, tamaño del
+  manifiesto y datos `integro` (los 4 registros de `ntfs_damaged_mft` con `record_damaged` y
+  `no_disponible`); los borrados y sobrescritos (16) con categoría `borrado`, nombre `registro` y
+  datos según `recoverable` (`full` → `integro_no_verificable`, `partial` → `parcial`, `none` de un
+  sobrescrito → `sobrescrito`); ningún borrado `integro`; `$MFT` en `[Metadatos]` e `integro`; ningún
+  `$` en la raíz; recuentos de borrados iguales al manifiesto; sin huérfanos.
+  `deleted_view_filters_and_determinism`: la consulta de borrados de `ntfs_deleted` da exactamente
+  sus ficheros borrados, la exclusión `!*.bin` sobre los vivos da los vivos que no son `.bin`, y dos
+  construcciones dan el mismo árbol.
+- `mr-api` (2): tarea con progreso y consulta de borrados; cancelación y límite como errores.
+- FFI (`core/mr-ffi/src/vfs_tests.rs`, 3) y C# (`VfsTests`, 5, categoría `NtfsCorpus`): ver
+  `API_FFI.md`.
+- CLI (`cli/tests/vfs_corpus.rs`): `vfs_options_are_validated` (opciones de `vfs-ls` en otra orden,
+  sin imagen o sin valor: código 2) y, con `--ignored`,
+  `vfs_ls_lists_every_manifest_entry_with_its_state` (`vfs-ls / -r --json` de 6 imágenes, las
+  particionadas con `--partition 1`: cada ruta una vez con su categoría y estado) y
+  `vfs_ls_filters_deleted_masks_and_states` (texto con `--deleted`, `--state`, `--filter`,
+  `--category`, un fichero solo, ruta inexistente: código 1, categoría o regla no válida: código 2).
 
 Campos del manifiesto NTFS que no se comparan todavía: `[[files]]` `path` de los vivos (#22; el de
 los borrados se compara con la ruta por la cadena de padres de la MFT).

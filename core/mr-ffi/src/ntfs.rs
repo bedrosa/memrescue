@@ -430,7 +430,12 @@ pub extern "C" fn mr_ntfs_volume_free(volume_h: u64) -> i32 {
     free_kind(volume_h, "volumen NTFS", |e| matches!(e, Entry::Ntfs(_)))
 }
 
-fn free_kind(h: u64, what: &str, is: impl Fn(&Entry) -> bool) -> i32 {
+/// Volumen NTFS de un handle (para otros módulos de la ABI).
+pub(crate) fn volume_of(h: u64) -> Result<Arc<NtfsVolume>, i32> {
+    volume(h).map(|(_, v)| v)
+}
+
+pub(crate) fn free_kind(h: u64, what: &str, is: impl Fn(&Entry) -> bool) -> i32 {
     guard(|| {
         let mut map = super::registry().lock().unwrap_or_else(|p| p.into_inner());
         match map.get(&h) {

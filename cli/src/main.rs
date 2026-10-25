@@ -5,6 +5,7 @@
 mod ntfs_deleted;
 mod ntfs_files;
 mod partition_backup;
+mod vfs;
 
 use mr_api::mr_fs_ntfs::{
     BackupState, BootSource, NtfsVolume, RecordOutcome, RecordSource, RecordState,
@@ -46,6 +47,8 @@ USO:
                          [ORIGEN]
   memrescue-cli ntfs-deleted <imagen> [ORIGEN] [--json]
   memrescue-cli ntfs-recover <imagen> --record N -o SALIDA [--stream NOMBRE] [--overwrite] [ORIGEN]
+  memrescue-cli vfs-ls <imagen> [RUTA] [-r] [--deleted] [--filter MÁSCARAS] [--category LISTA]
+                       [--state LISTA] [ORIGEN] [--json]
   memrescue-cli sectors <imagen> --lba N [--count M] [--retries N] [--jump N] [--read-back]
                         [--bad-fill PATRÓN] [--skip-fill PATRÓN] [ORIGEN]
   memrescue-cli verify <imagen> [--retries N] [--jump N] [--read-back]
@@ -189,6 +192,25 @@ VMDK CON DESCRIPTOR SEPARADO (vmdk-extents, --extent):
   ficheros que el usuario no ha revisado, así que cada fichero debe nombrarse explícitamente
   (ADR-018). Un disco con padre (parentFileNameHint) no se admite.
 
+ÁRBOL VIRTUAL (vfs-ls):
+  Une en un solo árbol los ficheros vivos, los borrados (bajo su carpeta si el padre existe con la
+  misma secuencia), los huérfanos ([Huérfanos] y [Borrados sin carpeta], agrupados por el registro
+  padre citado en [Registro N]) y los ficheros del sistema ([Metadatos]). Columnas: categoría
+  (vivo, borrado, huerfano, metadatos), estado de los datos (integro, integro_no_verificable,
+  parcial, sobrescrito, sin_datos, no_disponible, cifrado; solo «integro» es íntegro), origen del
+  nombre (estructura, residual, registro, sintetico), tamaño y ruta. Los nombres con separadores,
+  códigos de control o unidades UTF-16 sueltas se muestran escapados (%XX, %uXXXX); con --json se
+  da también el nombre UTF-16 original.
+  RUTA               nodo desde la raíz del árbol virtual («/» por defecto)
+  -r, --recursive    todo el subárbol
+  --deleted          solo entradas borradas (y las carpetas que llevan a ellas)
+  --filter MÁSCARAS  reglas de nombre de fichero «*.txt;*.doc;!tmp*»: gana la primera que
+                     coincide, «!» excluye, comodines * y ?, sin distinguir mayúsculas; una regla
+                     con «/» se compara con la ruta relativa a RUTA
+  --category LISTA   vivo,borrado,huerfano,metadatos
+  --state LISTA      estados de los datos (p. ej. integro,parcial)
+  Código de salida 3 si el árbol no es completo (directorios que no se pudieron listar o límite).
+
 Formatos: RAW, VHD (fijo/dinámico), VHDX (fijo/dinámico), VMDK monolithicSparse,
 streamOptimized y con descriptor separado (--extent), e imágenes divididas.
 Tamaños de sector habituales: 512, 1024, 2048, 4096.
@@ -239,10 +261,18 @@ struct Args {
     overwrite: bool,
     /// Copia del particionado (`partitions`, `find-partitions`).
     save_backup: Option<PathBuf>,
-    /// Subárbol completo (`ntfs-ls -r`).
+    /// Subárbol completo (`ntfs-ls -r`, `vfs-ls -r`).
     recursive: bool,
     /// Extensiones VMDK aprobadas (`--extent NOMBRE=RUTA`).
     extents: Vec<(String, PathBuf)>,
+    /// Solo entradas borradas (`vfs-ls`).
+    deleted: bool,
+    /// Reglas de nombre (`vfs-ls --filter`).
+    filter: Option<String>,
+    /// Categorías (`vfs-ls --category`).
+    category: Option<String>,
+    /// Estados de los datos (`vfs-ls --state`).
+    state: Option<String>,
 }
 
 /// Analiza `--skip-codes`: códigos positivos separados por comas (decimal o `0x…`), sin
@@ -316,6 +346,10 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
         save_backup: None,
         recursive: false,
         extents: Vec::new(),
+        deleted: false,
+        filter: None,
+        category: None,
+        state: None,
     };
     while let Some(s) = it.next() {
         match s.as_str() {
@@ -416,6 +450,10 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
                 a.save_backup = Some(it.next().ok_or("falta el valor de --save-backup")?.into());
             }
             "-r" | "--recursive" => a.recursive = true,
+            "--deleted" => a.deleted = true,
+            "--filter" => a.filter = Some(it.next().ok_or("falta el valor de --filter")?),
+            "--category" => a.category = Some(it.next().ok_or("falta el valor de --category")?),
+            "--state" => a.state = Some(it.next().ok_or("falta el valor de --state")?),
             "-o" | "--output" => {
                 a.output = Some(it.next().ok_or("falta el valor de -o")?.into());
             }
@@ -1035,8 +1073,15 @@ fn run(args: Vec<String>) -> Result<(), (u8, String)> {
     if cmd == "ntfs-recover" && a.json {
         return Err(usage("ntfs-recover no admite --json"));
     }
-    if cmd != "ntfs-ls" && a.recursive {
-        return Err(usage("-r solo se aplica a ntfs-ls"));
+    if cmd != "ntfs-ls" && cmd != "vfs-ls" && a.recursive {
+        return Err(usage("-r solo se aplica a ntfs-ls y vfs-ls"));
+    }
+    if cmd != "vfs-ls"
+        && (a.deleted || a.filter.is_some() || a.category.is_some() || a.state.is_some())
+    {
+        return Err(usage(
+            "--deleted, --filter, --category y --state solo se aplican a vfs-ls",
+        ));
     }
     if cmd == "ntfs-cat" && a.json {
         return Err(usage(
@@ -1346,6 +1391,27 @@ fn run(args: Vec<String>) -> Result<(), (u8, String)> {
             let src = open_src(&a, &p).map_err(|e| op(&e))?;
             let v = std::sync::Arc::new(mr_api::ntfs_open(&src).map_err(|e| op(&e))?);
             ntfs_files::ls(&v, &path, a.recursive, a.json)?;
+        }
+        "vfs-ls" => {
+            let (p, path) = match a.positional.as_slice() {
+                [p] => (p.clone(), "/".to_string()),
+                [p, r] => (p.clone(), r.clone()),
+                _ => return Err(usage("se esperaba la imagen y, opcionalmente, una ruta")),
+            };
+            let src = open_src(&a, &p).map_err(|e| op(&e))?;
+            let v = mr_api::ntfs_open(&src).map_err(|e| op(&e))?;
+            vfs::ls(
+                &v,
+                &vfs::LsOptions {
+                    path: &path,
+                    recursive: a.recursive,
+                    json: a.json,
+                    deleted: a.deleted,
+                    masks: a.filter.as_deref(),
+                    categories: a.category.as_deref(),
+                    states: a.state.as_deref(),
+                },
+            )?;
         }
         "ntfs-stat" | "ntfs-cat" => {
             let (p, path) = match (a.positional.as_slice(), a.record) {
