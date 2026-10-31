@@ -34,9 +34,44 @@ pub struct RecoverRequest {
 }
 
 /// Salidas con [`crate::create_output`] (ver el módulo).
+///
+/// **Destino frente al origen** ([`ApiSink::destination_problem`], también en
+/// [`OutputSink::is_source`]), con cierre ante la duda como `check_output_path`: la ruta se hace
+/// absoluta y se resuelve por su **antecesor existente más profundo** (forma canónica de ese
+/// antecesor más los componentes que aún no existen). Así `imagen\x\y` se compara con la forma
+/// canónica de `imagen` aunque `canonicalize` falle (un componente intermedio es un fichero) y
+/// aunque la ruta pedida use otra forma del mismo directorio (nombre corto 8.3, mayúsculas,
+/// `.`/`..`, `\\?\`). Si ningún antecesor se puede resolver, el destino se rechaza. Cada ruta del
+/// origen se guarda en su forma canónica y en su forma absoluta (si no se puede canonizar, solo la
+/// absoluta).
 pub struct ApiSink {
     src: Source,
     paths: Vec<PathBuf>,
+}
+
+/// Forma resuelta de una ruta para compararla con el origen: forma canónica del antecesor existente
+/// más profundo seguida de los componentes que no existen, y si ese antecesor es un fichero con
+/// componentes por debajo (la ruta estaría «dentro» de un fichero). `None` si ningún antecesor se
+/// puede resolver.
+fn resolve_existing_prefix(path: &Path) -> Option<(PathBuf, bool)> {
+    let abs = std::path::absolute(path).ok()?;
+    let mut base = abs.clone();
+    let mut rest: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        if let Ok(c) = std::fs::canonicalize(&base) {
+            let inside_file = !rest.is_empty() && !c.is_dir();
+            let mut out = c;
+            for r in rest.iter().rev() {
+                out.push(r);
+            }
+            return Some((out, inside_file));
+        }
+        let name = base.file_name()?.to_os_string();
+        rest.push(name);
+        if !base.pop() || base.as_os_str().is_empty() {
+            return None;
+        }
+    }
 }
 
 impl ApiSink {
@@ -50,12 +85,52 @@ impl ApiSink {
             if p.as_os_str().is_empty() {
                 continue;
             }
-            paths.push(std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()));
+            if let Ok(c) = std::fs::canonicalize(p) {
+                paths.push(c);
+            }
+            if let Ok(a) = std::path::absolute(p) {
+                paths.push(a);
+            }
         }
         ApiSink {
             src: Arc::clone(src),
             paths,
         }
+    }
+
+    fn matches_source(&self, resolved: &Path) -> bool {
+        let c = norm(resolved);
+        self.paths.iter().any(|p| {
+            let p = norm(p);
+            c == p || c.starts_with(&format!("{p}\\"))
+        })
+    }
+
+    /// Motivo por el que `dest` no puede ser un destino de recuperación, o `None` si puede: es o
+    /// está dentro del origen, de uno de sus segmentos o de sus ficheros externos; está dentro de
+    /// un fichero; o no se puede verificar (ningún antecesor resoluble).
+    pub fn destination_problem(&self, dest: &Path) -> Option<String> {
+        let Some((resolved, inside_file)) = resolve_existing_prefix(dest) else {
+            return Some(format!(
+                "no se puede verificar que el destino {} no sea el origen (ninguna parte de la \
+                 ruta se puede resolver): se rechaza",
+                dest.display()
+            ));
+        };
+        if self.matches_source(&resolved) || self.matches_source(dest) {
+            return Some(format!(
+                "el destino {} es el origen o está dentro de él (o de uno de sus segmentos o \
+                 ficheros externos): nunca se escribe en el origen",
+                dest.display()
+            ));
+        }
+        if inside_file {
+            return Some(format!(
+                "el destino {} está dentro de un fichero, no de una carpeta",
+                dest.display()
+            ));
+        }
+        None
     }
 }
 
@@ -106,17 +181,12 @@ impl OutputSink for ApiSink {
             .map_err(create_error)
     }
 
+    /// Cierre ante la duda: una ruta que no se puede resolver cuenta como origen.
     fn is_source(&self, path: &Path) -> bool {
-        let c = std::fs::canonicalize(path).unwrap_or_else(|_| {
-            // Si no existe: la forma absoluta tal cual (un destino nuevo dentro de una ruta del
-            // origen también se rechaza).
-            std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
-        });
-        let c = norm(&c);
-        self.paths.iter().any(|p| {
-            let p = norm(p);
-            c == p || c.starts_with(&format!("{p}\\"))
-        })
+        match resolve_existing_prefix(path) {
+            Some((resolved, _)) => self.matches_source(&resolved) || self.matches_source(path),
+            None => true,
+        }
     }
 
     fn source_paths(&self) -> Vec<PathBuf> {
@@ -329,14 +399,146 @@ pub fn start_recover_task(
 ) -> Result<RecoverTask> {
     precheck(&req)?;
     let sink = ApiSink::new(&src);
-    if sink.is_source(&req.options.destination) {
-        return Err(ApiError::InvalidArgument(format!(
-            "el destino {} es el origen o está dentro de él: nunca se escribe en el origen",
-            req.options.destination.display()
-        )));
+    if let Some(problem) = sink.destination_problem(&req.options.destination) {
+        return Err(ApiError::InvalidArgument(problem));
+    }
+    if let Some(j) = &req.options.journal {
+        if sink.is_source(j) {
+            return Err(ApiError::InvalidArgument(format!(
+                "el diario {} sería el origen o no se puede verificar: nunca se escribe en el origen",
+                j.display()
+            )));
+        }
     }
     let shared = Arc::new(Shared::default());
     let sh = Arc::clone(&shared);
     let task = Task::spawn(move |ctx| recover_observed(&src, &vol, &vfs, &req, ctx, Some(&sh)))?;
     Ok(RecoverTask { task, shared })
+}
+
+#[cfg(test)]
+mod tests {
+    //! Regresión (CI de #26): el destino se comprobaba con la forma léxica de la ruta cuando
+    //! `canonicalize` fallaba (un componente intermedio es la imagen), así que `imagen\x` escrito
+    //! con otra forma del mismo directorio (nombre corto 8.3 del directorio temporal del ejecutor,
+    //! `RUNNER~1`) no coincidía con la forma canónica del origen y se aceptaba. Estas pruebas no
+    //! dependen de dónde esté el directorio temporal: usan variantes textuales de la misma ruta.
+    use super::*;
+    use crate::task::TaskContext;
+    use mr_fs_ntfs::testvol::tree_volume;
+    use mr_recover::Selection;
+    use mr_vfs::{NodeId, NtfsBuildOptions};
+
+    /// Primera letra de unidad que no existe (para una ruta cuyo antecesor no se puede resolver).
+    fn missing_drive() -> Option<PathBuf> {
+        (b'D'..=b'Z')
+            .rev()
+            .map(|c| PathBuf::from(format!("{}:\\", c as char)))
+            .find(|p| !p.exists())
+    }
+
+    /// Forma corta 8.3 de una ruta, si el sistema la tiene (solo Windows; `None` si no).
+    fn short_form(p: &Path) -> Option<PathBuf> {
+        #[cfg(not(windows))]
+        {
+            let _ = p;
+            return None;
+        }
+        #[cfg(windows)]
+        let o = {
+            use std::os::windows::process::CommandExt;
+            std::process::Command::new("cmd")
+                .raw_arg(format!("/c for %I in (\"{}\") do @echo %~sI", p.display()))
+                .output()
+                .ok()?
+        };
+        if !o.status.success() {
+            return None;
+        }
+        let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+        (!s.is_empty() && s != p.display().to_string()).then(|| PathBuf::from(s))
+    }
+
+    #[test]
+    fn destination_inside_the_source_is_always_refused_before_starting() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("arbol.img");
+        std::fs::write(&img, tree_volume(true).image).unwrap();
+        let src = crate::open_source(&img, 0).unwrap();
+        let sink = ApiSink::new(&src);
+        let upper = PathBuf::from(img.to_string_lossy().to_uppercase());
+        let dotted = dir
+            .path()
+            .join(".")
+            .join("sub")
+            .join("..")
+            .join("arbol.img");
+        let verbatim = PathBuf::from(format!(
+            r"\\?\{}",
+            std::path::absolute(&img).unwrap().display()
+        ));
+        let mut bad = vec![
+            img.clone(),
+            img.join("x"),
+            img.join("x").join("y"),
+            upper.join("x"),
+            dotted.join("x"),
+            verbatim.join("x"),
+        ];
+        if let Some(short) = short_form(dir.path()) {
+            bad.push(short.join("arbol.img").join("x"));
+        }
+        for d in &bad {
+            assert!(sink.destination_problem(d).is_some(), "{d:?}");
+            assert!(sink.is_source(d) || d == &img || sink.destination_problem(d).is_some());
+        }
+        // Sin nada que lo resuelva: se rechaza (cierre ante la duda).
+        if let Some(drive) = missing_drive() {
+            let d = drive.join("x").join("y");
+            assert!(sink.destination_problem(&d).is_some(), "{d:?}");
+            assert!(sink.is_source(&d));
+        }
+        // Un destino normal (aunque no exista todavía) se admite.
+        assert_eq!(
+            sink.destination_problem(&dir.path().join("nuevo").join("dir")),
+            None
+        );
+        assert!(!sink.is_source(&dir.path().join("nuevo")));
+
+        // `start_recover_task` rechaza todos antes de lanzar la tarea.
+        let vol = Arc::new(crate::ntfs_open(&src).unwrap());
+        let vfs =
+            crate::vfs_build_ntfs(&vol, &NtfsBuildOptions::default(), &TaskContext::detached())
+                .unwrap();
+        for d in &bad {
+            let req = RecoverRequest {
+                selection: Selection {
+                    nodes: vec![NodeId::ROOT],
+                    ..Selection::default()
+                },
+                options: RecoverOptions::new(d),
+            };
+            assert!(
+                start_recover_task(Arc::clone(&src), Arc::clone(&vol), Arc::clone(&vfs), req)
+                    .is_err(),
+                "{d:?}"
+            );
+        }
+        assert_eq!(std::fs::read(&img).unwrap(), tree_volume(true).image);
+    }
+
+    #[test]
+    fn segments_of_a_split_image_are_refused_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let s1 = dir.path().join("disco.001");
+        let s2 = dir.path().join("disco.002");
+        std::fs::write(&s1, vec![0u8; 4096]).unwrap();
+        std::fs::write(&s2, vec![0u8; 4096]).unwrap();
+        let src = crate::open_split_source(&s1, crate::OpenOptions::default()).unwrap();
+        let sink = ApiSink::new(&src);
+        for d in [s2.clone(), s2.join("x"), s1.join("x").join("y")] {
+            assert!(sink.destination_problem(&d).is_some(), "{d:?}");
+        }
+        assert_eq!(sink.destination_problem(&dir.path().join("ok")), None);
+    }
 }

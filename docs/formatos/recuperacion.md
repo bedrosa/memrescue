@@ -15,7 +15,13 @@ que en la API es `mr_api::create_output` (`mr_api::ApiSink`).
 1. **El origen nunca se escribe.** El destino no es ni está dentro del origen, de uno de sus
    segmentos o de sus ficheros externos (padres de un disco diferencial), ni es una ruta de dispositivo
    (`\\.\`, `\\?\C:`, `\\?\GLOBALROOT`..., política de ADR-014). Se comprueba antes de leer nada y otra
-   vez en cada fichero (`create_output`). El diario tampoco puede ser el origen.
+   vez en cada fichero (`create_output`). El diario tampoco puede ser el origen. La comparación cierra
+   ante la duda (como `check_output_path`): la ruta se resuelve por su antecesor existente más profundo
+   (forma canónica más los componentes que faltan), así que `imagen\x\y` se rechaza aunque
+   `canonicalize` falle por ser `imagen` un fichero y aunque se escriba con otra forma del mismo
+   directorio (nombre corto 8.3, mayúsculas, `.`/`..`, `\\?\`); una ruta sin ningún antecesor
+   resoluble se rechaza, y un destino dentro de cualquier fichero también. `start_recover_task` (y la
+   ABI) lo comprueban antes de lanzar la tarea.
 2. **Nada no fiable se presenta como íntegro.** Cada byte escrito tiene su estado de tramo; un fichero
    con algún tramo no fiable baja a `parcial` (nunca sube) y su hash lleva el ámbito
    `escrito_con_relleno`.
