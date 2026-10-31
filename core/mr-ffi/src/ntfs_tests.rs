@@ -70,16 +70,47 @@ fn entry() -> MrNtfsEntry {
     }
 }
 
+/// Plazo para que una tarea termine. Las tareas de estas pruebas tardan milisegundos, pero las de
+/// copia sincronizan el fichero en disco (`FlushFileBuffers`) y crean ficheros nuevos que el
+/// antivirus analiza: con el equipo cargado (compilaciones o pruebas en paralelo) eso no tiene
+/// cota. El plazo se mide en tiempo real, no en número de sondeos, y es el mismo margen que las
+/// pruebas de interfaz conceden al análisis antivirus (docs/PRUEBAS_UI.md).
+const TASK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(90);
+
 fn wait(task: u64) -> MrTaskStatus {
     let mut st = MrTaskStatus::default();
-    for _ in 0..2000 {
+    let start = std::time::Instant::now();
+    loop {
         assert_eq!(unsafe { mr_task_status_get(task, &mut st) }, MR_OK);
         if st.state != 1 {
             return st;
         }
+        assert!(
+            start.elapsed() < TASK_DEADLINE,
+            "la tarea {task} no terminó en {TASK_DEADLINE:?} (progreso {}/{})",
+            st.done,
+            st.total
+        );
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    panic!("la tarea no terminó");
+}
+
+/// Espera una copia y comprueba que terminó bien; si no, el fallo incluye el error de la tarea
+/// (antes solo decía «3 != 2» y no se podía saber qué operación de E/S había fallado).
+fn wait_copy(task: u64) -> MrNtfsCopyReport {
+    let st = wait(task);
+    let mut r = MrNtfsCopyReport {
+        struct_size: std::mem::size_of::<MrNtfsCopyReport>() as u32,
+        ..MrNtfsCopyReport::default()
+    };
+    let rc = unsafe { mr_ntfs_copy_result(task, &mut r) };
+    assert!(
+        st.state == 2 && rc == MR_OK,
+        "la copia {task} terminó en el estado {} (código {rc}): {}",
+        st.state,
+        last_error()
+    );
+    r
 }
 
 #[test]
@@ -286,7 +317,7 @@ fn tree_task_lists_nodes_and_orphans() {
 
 #[test]
 fn stream_source_and_copy_task() {
-    let (d, _src, vol) = setup();
+    let (d, src, vol) = setup();
     let mut s = 0u64;
     assert_eq!(
         unsafe { mr_ntfs_open_stream(vol, 20, std::ptr::null(), 0, &mut s) },
@@ -339,12 +370,7 @@ fn stream_source_and_copy_task() {
         )
     };
     assert_eq!(copy(o, 0, &mut task), MR_OK, "{}", last_error());
-    assert_eq!(wait(task).state, 2);
-    let mut r = MrNtfsCopyReport {
-        struct_size: std::mem::size_of::<MrNtfsCopyReport>() as u32,
-        ..MrNtfsCopyReport::default()
-    };
-    assert_eq!(unsafe { mr_ntfs_copy_result(task, &mut r) }, MR_OK);
+    let r = wait_copy(task);
     assert_eq!((r.bytes, r.untrusted_bytes, r.flags), (3000, 0, 0));
     assert_eq!(std::fs::read(&out).unwrap(), tree_data());
     assert_eq!(mr_task_free(task), MR_OK);
@@ -361,11 +387,20 @@ fn stream_source_and_copy_task() {
         copy(r"\\.\PhysicalDrive0", 0, &mut task),
         MR_ERR_PATH_REJECTED
     );
-    assert_eq!(copy(o, MR_NTFS_COPY_OVERWRITE, &mut task), MR_OK);
-    assert_eq!(wait(task).state, 2);
+    assert_eq!(
+        copy(o, MR_NTFS_COPY_OVERWRITE, &mut task),
+        MR_OK,
+        "{}",
+        last_error()
+    );
+    wait_copy(task);
+    assert_eq!(std::fs::read(&out).unwrap(), tree_data());
     assert_eq!(mr_task_free(task), MR_OK);
     // El origen sigue intacto.
     assert_eq!(std::fs::read(&image_path).unwrap(), tree_volume(true).image);
+    // Sin handles abiertos al terminar (el registro es global y compartido por todas las pruebas).
+    assert_eq!(mr_ntfs_volume_free(vol), MR_OK);
+    assert_eq!(mr_source_close(src), MR_OK);
 }
 
 // ---------------------------------------------------------------------------------------------
