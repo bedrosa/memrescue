@@ -18,6 +18,8 @@ mr-store.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# Volumen NTFS sintético de las pruebas de `recover`.
+mr-fs-ntfs = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true

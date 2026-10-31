@@ -306,7 +306,31 @@ versionadas por `struct_size`, de entrada (`mr_vfs_build_options` 32 B, opcional
 En C#: `NtfsVolume.StartVirtualFileSystem(VfsBuildOptions?)` → `VfsBuildTask.GetResult()` →
 `VirtualFileSystem` (`Info`, `GetNode(id)` con el nombre UTF-16 original, `GetChildren(id)`,
 `Find(path)`, `PathOf(id)`, `DisplayNameOf(id)`, `Notes()`, `Query(VfsFilter, start)`). La
-interfaz gráfica todavía no lo usa (panel de recuperación de #26).
+interfaz gráfica lo usa en la pestaña «Recuperación» (#26).
+
+## Recuperación (ampliación compatible de la ABI 3, issue #26, adenda de ADR-029)
+
+Funciones nuevas; ninguna firma, estructura ni significado existente cambia. Comportamiento en
+`formatos/recuperacion.md` y diario en `formatos/diario-recuperacion.md`. La tarea es un handle del
+registro como las demás: `mr_task_status_get` (progreso en bytes de los flujos principales; el total
+sale de los metadatos), `mr_task_cancel` (cancelada con resultado parcial: estado 4 y
+`mr_recover_result` disponible) y `mr_task_free`. Estructuras versionadas por `struct_size`: de
+entrada `mr_recover_options` (48 B, opcional) y de salida `mr_recover_progress` (56 B),
+`mr_recover_question` (40 B) y `mr_recover_report` (200 B).
+
+| Función | Descripción |
+|---|---|
+| `mr_recover_start(volume, vfs, nodes, count, options, dest, len, masks, len, journal, len, out_task)` | Recupera los nodos (1 a 2^20, identificadores del árbol `vfs` construido desde `volume`) en la carpeta `dest`. `options` nulo = renombrar, estados íntegro/íntegro no verificable/parcial, categorías vivo/borrado/huérfano, división automática, `BAD!`. `masks`: reglas de nombre (vacía = todas). `journal` vacío = `<dest>\MemRescue-registro\...`. Antes de lanzar: destino de dispositivo → `MR_ERR_PATH_REJECTED`; destino que es o está dentro del origen, sus segmentos o ficheros externos, opciones no válidas (`struct_size`, indicadores o `reserved`, política, `MR_RECOVER_CONFLICT_OVERWRITE` sin `MR_RECOVER_CONFIRM_OVERWRITE`, relleno con 4 bytes iguales), reglas no válidas → `MR_ERR_INVALID_ARGUMENT`; nodo inexistente → `MR_ERR_OUT_OF_RANGE`; handles de otro tipo → `MR_ERR_INVALID_HANDLE`. Un diario que ya existe hace fallar la tarea (`MR_ERR_TASK_FAILED`) sin escribir nada |
+| `mr_recover_progress(task, out)` | Ficheros y bytes hechos y totales, bytes no fiables, errores y `MR_RECOVER_PROGRESS_QUESTION` si hay una pregunta pendiente |
+| `mr_recover_current(task, buf, cap, out_len)` | Ruta relativa en curso |
+| `mr_recover_question(task, out)` / `mr_recover_question_text(task, id, which, ...)` | Pregunta de conflicto pendiente (política `MR_RECOVER_CONFLICT_ASK`): identificador, nodo, `MR_RECOVER_QUESTION_DIRECTORY`/`DELETED`/`EXISTING_IS_DIR`, tamaños; textos: ruta pedida (`_TEXT_REQUESTED`) y ruta existente (`_TEXT_EXISTING`). Ninguna → `MR_ERR_NOT_FOUND` |
+| `mr_recover_answer(task, id, decision, apply_to_all)` | `MR_RECOVER_CONFLICT_RENAME`/`SKIP`/`SKIP_IDENTICAL`/`OVERWRITE` (la respuesta es la confirmación; en directorios, reutilizar) o `MR_RECOVER_ANSWER_CANCEL`; `apply_to_all` 0 o 1. Pregunta que ya no está pendiente → `MR_ERR_NOT_FOUND`. La tarea espera la respuesta (o la cancelación): las preguntas se responden por sondeo, sin llamadas de vuelta |
+| `mr_recover_result(task, out)` | Informe: estado (`MR_RECOVER_STATUS_COMPLETE`/`CANCELLED`/`FAILED`), recuentos planificados y escritos, ficheros escritos por estado final, omitidos (por estado, por conflicto, idénticos), no soportados, errores, renombrados, rutas largas, marcados con `.mrbad`, bytes no fiables y de relleno, capacidades del destino (`MR_RECOVER_CAP_*`) y `exit_code` (0/3/1, como la CLI) |
+| `mr_recover_result_text(task, which, ...)` | Ruta del diario (`MR_RECOVER_TEXT_JOURNAL`), raíz de destino (`_DESTINATION`) o motivo de una recuperación fallida (`_REASON`) |
+
+En C#: `VirtualFileSystem.StartRecover(volume, nodes, destination, RecoverOptions?)` → `RecoverTask`
+(`Progress()`, `Current()`, `PendingQuestion()`, `Answer(id, RecoverDecision, applyToAll)`,
+`GetReport()` → `RecoverReport` con `JournalPath`, `Destination`, `AllIntact`).
 
 ## Modo tolerante de contenedores (`MR_OPEN_TOLERANT`, ADR-020)
 
@@ -340,6 +364,7 @@ después de liberarlos.
 ## Pruebas que garantizan el contrato
 
 - Rust (`core/mr-ffi/src/ntfs_tests.rs`, 5 pruebas, #22): tamaños y desplazamientos de las 6 estructuras NTFS, volumen sintético con árbol (`mr_fs_ntfs::testvol`, característica `test-support`): datos y etiqueta, volumen que sobrevive al cierre del origen, listado por índice con cada estado (vivo, referencia no válida, reutilizado, registro dañado con `record_state`, libre) y nombre con sustituto suelto, índices fuera de límites, handles de otro tipo, `struct_size` incorrecto, registro que no es un directorio; `mr_ntfs_resolve` sin distinguir mayúsculas y `MR_ERR_NOT_FOUND`; `mr_ntfs_path_of` y huérfano; árbol como tarea con progreso, nodos, rutas, huérfanos y opción sin huérfanos; fichero como origen leído con `mr_source_read_mapped`; copia como tarea con informe, `MR_ERR_ALREADY_EXISTS`, rechazo de la propia imagen, de opciones desconocidas y de rutas de dispositivo, sustitución con `MR_NTFS_COPY_OVERWRITE` e imagen intacta.
+- Rust (`core/mr-ffi/src/recover_tests.rs`, 3 pruebas, #26): tamaños y desplazamientos de las 4 estructuras de la recuperación; tarea sobre el volumen sintético con progreso, informe (`exit_code` 3 por el registro dañado omitido), textos (diario, destino, motivo), contenido escrito; política `MR_RECOVER_CONFLICT_ASK` con dos preguntas respondidas por sondeo («aplicar a todos»), respuesta no válida y pregunta inexistente; cancelación mientras espera una respuesta (estado 4 con informe); rechazos: destino = imagen, dispositivo, `struct_size`, indicadores, política, sustitución sin confirmar, relleno, selección vacía, nodo inexistente, handle de otro tipo, reglas no válidas; diario explícito, diario existente (tarea fallida) y sustitución confirmada; la imagen no cambia. `core/mr-ffi/tests/recover_memory.rs` (2, una `--ignored` de escala) mide el pico de memoria con un asignador que cuenta: 1 MiB con un fichero de 8 o de 96 MiB y 906 KiB con 100 000 ficheros.
 - Rust (`core/mr-ffi/src/vfs_tests.rs`, 3 pruebas, #25): tamaños y desplazamientos de las 4 estructuras del árbol virtual; construcción como tarea sobre el volumen sintético (progreso 3000/3000, árbol que sobrevive a la tarea, al volumen y al origen), resumen, hijos por índice, nodo vivo, borrado y con nombre UTF-16 suelto (unidades exactas con el protocolo de búfer pequeño), `MR_ERR_NOT_FOUND`, consultas recursivas, directas, de borrados, por máscara y por estado, errores de filtro, `struct_size`, nodos inexistentes y handles liberados; opciones sin borrados ni huérfanos, límite de nodos (`MR_ERR_TASK_FAILED`), opciones no válidas, handle de otro tipo y cancelación.
 - Rust (`core/mr-ffi/src/tests.rs`, 33 pruebas): búsqueda de particiones perdidas (tamaños y desplazamientos de las 4 estructuras, flujo completo con apertura de volúmenes también tras cerrar el origen, opciones versionadas y validadas, presupuesto agotado, familias, desplazamiento con anomalías con signo y apertura solo con `MR_PARTITION_OPEN_APPLY_SHIFT`, cancelación con resultado parcial, handles de otro tipo), tamaños de estructuras (incluidas las de particiones), tabla GPT sintética (copia, GUID de disco, nombre, GUID único, nombre de tipo, apertura) y GPT desplazada (copia de respaldo, `image_shifted` con signo, apertura rechazada sin `MR_PARTITION_OPEN_APPLY_SHIFT` y correcta con él), tablas de particiones por índice (esquema, confianza, anomalías de tabla y de partición, nombres de tipo con búfer pequeño, apertura de una partición y de una recortada, tabla que sobrevive a su origen, `struct_size` incorrecto, punteros nulos, handles de otro tipo, EBR ilegible como anomalía), verificación extendida con
   códigos de error simulados (origen `FaultyDevice` registrado con `mr_api::source_from_device`) y

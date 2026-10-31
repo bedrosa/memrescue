@@ -40,10 +40,14 @@
 //! - [`vfs_build_ntfs`] / [`start_vfs_build_task`] y [`vfs_query`] (#25): árbol virtual de un
 //!   volumen NTFS (vivos, borrados, huérfanos y metadatos con el estado de sus datos) como tarea
 //!   cancelable con progreso, y consultas con filtro (`mr_vfs`).
+//! - [`recover`] / [`start_recover_task`] (#26): recuperación de ficheros y directorios del árbol
+//!   virtual a un destino seguro (`mr_recover`), con [`create_output`] por fichero, diario JSON
+//!   Lines, progreso, cancelación y peticiones de conflicto.
 //! - [`start_hash_task`]: hashes del fichero completo en segundo plano.
 //! - [`start_verify_task`]: lectura completa tolerante a errores con mapa de validez por sector.
 
 mod ntfs;
+mod recover;
 pub mod task;
 mod vfs;
 
@@ -72,10 +76,14 @@ pub use mr_image::OpenOptions;
 pub use mr_part;
 pub use mr_part::search::{SearchOptions, SearchResult};
 pub use mr_part::{Partition, PartitionTable};
+pub use mr_recover;
 pub use mr_vfs;
 pub use ntfs::{
     ntfs_copy_file, ntfs_list_dir, ntfs_path_of, ntfs_resolve, ntfs_stream_source, ntfs_tree,
     start_ntfs_copy_task, start_ntfs_tree_task, NtfsCopyResult, STREAM_SOURCE_SECTOR,
+};
+pub use recover::{
+    recover, recover_source_info, start_recover_task, ApiSink, RecoverRequest, RecoverTask,
 };
 pub use vfs::{start_vfs_build_task, vfs_build_ntfs, vfs_query};
 

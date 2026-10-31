@@ -53,8 +53,12 @@ public sealed class SourceEntry(Source source, ImageFormat detected, bool forced
 
     public NtfsDeletedScan? FsDeleted { get; set; }
 
+    /// <summary>Árbol virtual del volumen (pestaña Recuperación, #26), construido a petición.</summary>
+    public VirtualFileSystem? Vfs { get; set; }
+
     public void Dispose()
     {
+        Vfs?.Dispose();
         Ntfs?.Dispose();
         Search?.Dispose();
         Partitions?.Dispose();
@@ -550,9 +554,11 @@ public partial class MainWindow : Window
             UntrustedBanner.Visibility = Visibility.Collapsed;
             TolerantBanner.Visibility = Visibility.Collapsed;
             ShowFileSystem(null);
+            UpdateRecoverView();
             return;
         }
         ShowFileSystem(s);
+        UpdateRecoverView();
         TolerantBanner.Visibility = s.Tolerant ? Visibility.Visible : Visibility.Collapsed;
         TolerantBannerText.Text = s.Tolerant
             ? $"MODO TOLERANTE: {s.Source.Description}. Los bloques descartados se muestran como ilegibles (patrón de relleno), nunca como datos."

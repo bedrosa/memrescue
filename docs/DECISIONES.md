@@ -993,3 +993,42 @@ corresponde a su recuperabilidad y los 4 registros dañados como `no_disponible`
 políticas por estado (pregunta abierta 1) sobre estos valores. Si el propietario cambia los
 nombres de las carpetas, cambian `mr_vfs::ntfs::*_FOLDER` y las pruebas que los citan. Numeración
 provisional: puede cambiar al integrar las ramas paralelas.
+
+**Adenda (issue #26): políticas de la recuperación adoptadas por defecto.** Para cerrar las preguntas
+abiertas de INV-01 §10 que afectan a `mr-recover` sin bloquear M4 se adoptan estos valores **por
+defecto, mientras el propietario no indique otra cosa** (cambiarlos solo afecta a constantes y
+opciones documentadas en `formatos/recuperacion.md`):
+1. **Por estado** (pregunta 1): se escriben `integro` e `integro_no_verificable`; `parcial` se escribe
+   con el patrón de relleno en los tramos no fiables y se marca; `sobrescrito`, `sin_datos` y
+   `no_disponible` se omiten salvo opción explícita (`write_states`, `--include-overwritten`);
+   `cifrado` se informa como `no_soportado` (la exportación en bruto de EFS, FS-05, queda pendiente).
+2. **Marca de incompleto** (pregunta 4): fichero lateral `nombre.ext.mrbad` (texto con los tramos no
+   fiables) además del diario; activado por defecto.
+3. **Conflictos** (pregunta 3): renombrado `nombre (2).ext`, `(3)`... y ` (borrado)`, ` (borrado 2)`...
+   para un borrado; políticas preguntar (por defecto en la interfaz), renombrar (por defecto en la CLI y
+   la ABI), omitir, omitir si es idéntico (tamaño y SHA-256) y sustituir solo con confirmación
+   explícita. Los conflictos dentro de la propia recuperación se renombran siempre. Límite de 1000
+   renombrados por nombre (no 10, que dejaría de recuperar una carpeta repetida once veces).
+4. **Hashes de ficheros no íntegros** (pregunta 9): se calculan con el ámbito `escrito_con_relleno` y
+   nunca se presentan como hash del contenido; el ámbito acompaña siempre a los valores.
+5. **Reanudación** (pregunta 6): repetir con `omitir_si_identico`; no hay reanudación a mitad de
+   fichero.
+6. **Bytes reasignados** (pregunta 12): los tramos `possibly_overwritten` se escriben como relleno salvo
+   `include_reallocated_bytes` (desactivado por defecto también en la interfaz).
+7. **Diario** (pregunta 11): JSON Lines en la ubicación que indique el llamador; por defecto en
+   `<destino>\MemRescue-registro\`, nunca en el origen (`formatos/diario-recuperacion.md`, versión 1).
+8. **Orden de copia** (pregunta 7): el del árbol; el orden por LBA queda para más adelante.
+
+Decisiones de diseño de #26: el motor (`mr-recover`) está por debajo de `mr-api` y escribe a través
+del rasgo `OutputSink`, que la API implementa con `create_output` (temporal y publicación sin
+sustituir); los flujos alternativos en un destino NTFS se escriben en `temporal:flujo` del fichero que
+acaba de crear `create_output` (o `directorio:flujo` de un directorio ya comprobado), sin pasar esa ruta
+con `:` por `check_output_path`; las capacidades del destino (flujos con nombre, mayúsculas, límite de
+4 GiB) se averiguan con una sonda en la raíz, sin `unsafe`; las preguntas de conflicto se responden
+por sondeo en la ABI (sin llamadas de vuelta), como el resto de las tareas.
+
+**Consecuencias (adenda).** Los 10 manifiestos del corpus se recuperan con su SHA-256 y su fecha de
+modificación; los borrados íntegros dan su SHA-256 con estado `integro_no_verificable`; los
+sobrescritos se omiten por defecto y con la opción y los bytes reasignados reproducen
+`recovered_sha256`; los sectores ilegibles simulados quedan con relleno y su LBA en el diario. Código de
+salida de la CLI: 0 solo si todo es `integro`, 3 si algo no lo es, 1 con errores.

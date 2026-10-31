@@ -435,6 +435,11 @@ pub(crate) fn volume_of(h: u64) -> Result<Arc<NtfsVolume>, i32> {
     volume(h).map(|(_, v)| v)
 }
 
+/// Volumen NTFS de un handle con su origen (para la recuperación, #26).
+pub(crate) fn volume_with_source(h: u64) -> Result<(Source, Arc<NtfsVolume>), i32> {
+    volume(h)
+}
+
 pub(crate) fn free_kind(h: u64, what: &str, is: impl Fn(&Entry) -> bool) -> i32 {
     guard(|| {
         let mut map = super::registry().lock().unwrap_or_else(|p| p.into_inner());

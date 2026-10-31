@@ -169,8 +169,18 @@ Validación de cierre en `PROGRESO.md`, etapa 9: primera recuperación real veri
     (`VirtualFileSystem`) y CLI `vfs-ls`. Pendiente: uso en la interfaz (panel de recuperación de
     #26) y flujos alternativos por nodo. Las entradas `INDX` residuales de #23 ya entran en el
     árbol (nombre `residual`, indicador `from_index`).
-- `mr-report`: listas TXT/CSV/HTML, informe con hashes, lista de sectores.
-- CLI: `recover` de extremo a extremo sobre imágenes NTFS.
+  - `mr-recover` (#26, adenda de ADR-029, `formatos/recuperacion.md`): **hecho** para NTFS. Selección
+    y filtro del árbol virtual a un destino validado (nunca el origen, sus segmentos o ficheros
+    externos ni un dispositivo), política por estado (`parcial` con relleno y `.mrbad`, `sobrescrito`
+    omitido salvo opción, bytes reasignados como relleno salvo opción), nombres válidos en Windows con
+    el original en el diario, rutas largas, conflictos con ` (2)`/` (borrado)`, omitir si es idéntico
+    (reanudar) y sustitución confirmada, flujos alternativos como flujos o ficheros hermanos, división
+    para FAT32, fechas y solo lectura, cancelación, memoria acotada y diario JSON Lines
+    (`formatos/diario-recuperacion.md`); tarea en `mr-api`, ABI (`mr_recover_*`), C# (`RecoverTask`),
+    CLI `recover` y pestaña «Recuperación» de la interfaz. Pendiente: exportación EFS en bruto (FS-05)
+    y el mismo disco físico (M9).
+- `mr-report` (#27): listas TXT/CSV/HTML, informe con hashes, lista de sectores, derivados del diario.
+- CLI: `recover` de extremo a extremo sobre imágenes NTFS (**hecho**, #26).
 - **Paridad objetivo**: RC-01…RC-13, FS-05 (lectura raw EFS).
 
 ## M5 · RAID virtual  *(prioridad 3)*

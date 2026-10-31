@@ -112,7 +112,9 @@ el SHA-256 de cada imagen debe coincidir con su manifiesto versionado) y ejecuta
 `cargo test -p mr-fs-ntfs --test ntfs_deleted_corpus -- --ignored` y
 `cargo test -p memrescue-cli --test ntfs_deleted -- --ignored` y, para el árbol virtual (#25),
 `cargo test -p mr-vfs --test vfs_corpus -- --ignored` y
-`cargo test -p memrescue-cli --test vfs_corpus -- --ignored`. En local, `scripts/test.ps1` tiene el
+`cargo test -p memrescue-cli --test vfs_corpus -- --ignored`. Para la recuperación (#26):
+`cargo test -p mr-recover --test corpus -- --ignored` y
+`cargo test -p memrescue-cli --test recover -- --ignored`. En local, `scripts/test.ps1` tiene el
 mismo paso (`-SkipNtfsCorpus` para omitirlo; sin corpus, el paso falla e indica cómo descargarlo).
 
 **Árbol de ficheros (#22).** `core/mr-fs-ntfs/tests/ntfs_corpus.rs` añade tres pruebas: el árbol
@@ -764,6 +766,54 @@ diferenciales»):
   particionadas con `--partition 1`: cada ruta una vez con su categoría y estado) y
   `vfs_ls_filters_deleted_masks_and_states` (texto con `--deleted`, `--state`, `--filter`,
   `--category`, un fichero solo, ruta inexistente: código 1, categoría o regla no válida: código 2).
+
+Recuperación (issue #26, adenda de ADR-029, `formatos/recuperacion.md`,
+`formatos/diario-recuperacion.md`). Las pruebas de integración escriben siempre en directorios
+temporales a través de la vía real de la API (`mr_api::ApiSink` → `create_output`), leen el diario con
+un analizador JSON propio e independiente del escritor y comprueban que no queda ningún `.mrtmp`:
+
+- Unitarias (`core/mr-recover`, 6): escape de nombres para Windows (prohibidos, reservados con y sin
+  extensión, punto y espacio final, `.`/`..`, vacío, sustitutos sueltos; todo pasa la política de
+  rutas), recorte determinista sin partir escapes, sufijos de conflicto y claves sin mayúsculas;
+  escritor JSON y fechas ISO; FILETIME ↔ `SystemTime`.
+- `core/mr-recover/tests/engine.rs` (14, árboles sintéticos y contenido en memoria): nombres hostiles
+  dentro del destino con su original (`nombre_utf16`); conflictos internos (`A.txt`/`a.txt`, vivo y
+  borrado → ` (borrado)`, nombres que el escape iguala); cada política ante ficheros existentes
+  (renombrar sin tocar el ajeno, omitir si es idéntico sin escribir nada, omitir con el directorio,
+  sustituir rechazado sin confirmación y atómico con ella); preguntar con y sin «aplicar a todos» y
+  cancelar desde la pregunta; rutas de más de 260 y de 1024 caracteres leídas con `\\?\` y marcadas;
+  destinos prohibidos (imagen, dentro de ella, `\\.\PhysicalDrive0`, `\\?\C:`, `GLOBALROOT`,
+  componente reservado, segmento de una imagen dividida, diario sobre un segmento) sin escribir nada;
+  cancelación a mitad de un fichero de 3 MiB (solo ficheros completos, diario `cancelada` con
+  `lineas` exacto); repetición con `omitir_si_identico` y determinismo de árbol y diario; relleno
+  exacto en tramos ilegibles con su LBA, bytes reasignados como relleno o del disco con la opción,
+  `.mrbad`, ámbitos de hash, `sobrescrito`/`cifrado`/`no_disponible` omitidos y con opciones;
+  borrado íntegro con ámbito `contenido` y nunca `integro`; división por tamaño y FAT32 simulado
+  (concatenación, hashes de cada parte, repetición reconocida, error sin división); flujos
+  alternativos como hermanos (destino simulado) o como flujos (sonda real); filtros, selección de un
+  directorio y de un fichero, directorios vacíos; fechas y solo lectura.
+- `core/mr-recover/tests/ntfs.rs` (3, volumen NTFS sintético por `mr_api::recover`): vivos, enlaces
+  duros como copias, nombre con sustituto suelto, registro dañado y residual sin contenido inventado,
+  origen intacto; **sector ilegible simulado** (`FaultyDevice`, LBA 1681 dentro de `ñandú.bin`):
+  relleno exactamente en los bytes 512..1024, estado `parcial`, tramo con la LBA exacta, `.mrbad`;
+  tarea con progreso completo, preguntas respondidas, cancelación mientras espera y rechazos previos.
+- `core/mr-recover/tests/corpus.rs` (4, `--ignored`): los vivos de los **10 manifiestos** con su
+  SHA-256, su fecha de modificación, sus flujos alternativos (también el del directorio) y los
+  registros dañados omitidos como `no_disponible`; la LBA del volumen de las particionadas; los
+  borrados (`integro_no_verificable` con el SHA-256 del manifiesto; `objetivo_3` parcial con relleno,
+  `.mrbad` y tramos `possibly_overwritten` con LBA; los sobrescritos omitidos) y, con las opciones,
+  los sobrescritos con relleno o con `recovered_sha256`; sector ilegible simulado en un fichero de
+  `ntfs_basic` y de `ntfs_mbr` con `lba_origen` = inicio de la partición + LBA del volumen; repetición
+  y determinismo sobre `ntfs_deleted`.
+- `core/mr-ffi/src/recover_tests.rs` (3) y `core/mr-ffi/tests/recover_memory.rs` (2, una
+  `--ignored`): ver `API_FFI.md`; la de escala recupera 100 000 ficheros con 906 KiB de pico.
+- CLI (`cli/tests/recover.rs`, 3, una `--ignored`): errores de uso con código 2 sin escribir nada;
+  volumen sintético de extremo a extremo (código 0 con `/Docs/Sub`, 3 con todo, repetición con
+  `skip-identical`, diario explícito que no se sustituye, destinos prohibidos con código 1, filtros);
+  corpus (`ntfs_basic`, `ntfs_gpt` con `--partition`, `ntfs_deleted`, `ntfs_overwritten`): SHA-256 de
+  los vivos, borrados, `--include-overwritten --include-reallocated-bytes` con `recovered_sha256`.
+- C# (`RecoverTests`, 5, categoría `NtfsCorpus`) e interfaz (`RecoverUiTests`, 1): ver `API_FFI.md` y
+  `PRUEBAS_UI.md`.
 
 Campos del manifiesto NTFS que no se comparan todavía: `[[files]]` `path` de los vivos (#22; el de
 los borrados se compara con la ruta por la cadena de padres de la MFT).
