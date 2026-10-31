@@ -764,6 +764,37 @@ fichero creado por otro proceso entre la comprobación y el renombrado se perdí
 - El temporal se borra en cualquier error de `commit` y al descartar el `OutputFile`. La CLI
   devuelve el código 2 también cuando el destino aparece durante la escritura.
 
+**Adenda (2026-10-25, issue #76): `check_output_path` falla cerrada.** Si `canonicalize` de un
+fichero del origen fallaba, se comparaba la ruta sin resolver: con el origen renombrado después
+de abrirlo, la salida con el nombre nuevo pasaba la comprobación y la protección «nunca escribir
+sobre el origen» se desactivaba en silencio. Se decide:
+
+- **Falla cerrada**: si no se puede canonicalizar el fichero principal del origen, uno de sus
+  segmentos (imagen dividida, extensiones VMDK) o uno de sus ficheros externos (padres de un disco
+  diferencial), la salida existente o el directorio de una salida nueva, la escritura se rechaza con
+  `ApiError::OutputNotVerifiable { output, reason }` (FFI: `MR_ERR_INVALID_ARGUMENT`, sin cambio de
+  ABI; el mensaje dice qué fichero no se pudo resolver). Un origen sin fichero (dispositivo en
+  memoria, ruta vacía) no tiene nada que proteger. Las firmas de `check_output_path` y
+  `create_output` no cambian.
+- **Forma de la salida**: la lista blanca léxica de ADR-014 se aplica a la ruta dada y también a su
+  forma canónica (`check_canonical`); en Windows se rechaza cualquier componente con `:` (flujo
+  alternativo, p. ej. `origen.img:x`, que escribiría dentro del fichero del origen).
+- **Equivalencias cubiertas** (todas las que resuelve `std::fs::canonicalize`, comparadas sin el
+  prefijo `\\?\` y sin distinguir mayúsculas en todas las plataformas, lo que solo puede rechazar de
+  más): mayúsculas, `\\?\`, `.` y `..`, separador `/`, puntos y espacios finales que Win32
+  descarta, nombres cortos 8.3, enlaces simbólicos y uniones en cualquier componente. En Unix,
+  además, identidad del fichero (`dev`, `ino` de `std::os::unix::fs::MetadataExt`, estable): los
+  enlaces duros al origen se rechazan.
+- **No cubierto en Windows: enlaces duros.** La serie del volumen y el índice del fichero
+  (`MetadataExt::volume_serial_number`, `file_index`) y el número de enlaces
+  (`number_of_links`) no están en Rust estable, y `GetFileInformationByHandle` exige `unsafe`, que
+  solo se admite en `mr-ffi`. Un enlace duro al origen con otro nombre pasa la comprobación. Los
+  datos del origen siguen a salvo: `create_output` nunca abre un fichero existente para escribir
+  (temporal nuevo y `rename`, enlace o `create_new`), así que lo único que cambia es que ese otro
+  nombre pasa a ser la salida; sin `overwrite`, ni eso (`OutputExists`).
+- **Fuera de alcance**: carreras entre la comprobación y la escritura (renombrar o enlazar el
+  origen justo después) y volúmenes cuyas reglas de mayúsculas difieren de `to_lowercase`.
+
 ## ADR-027 · Borrados NTFS: recuperabilidad conservadora por clúster y estado `possibly_overwritten` (Aceptada, 2026-10-24)
 
 **Contexto.** Issue #23 (FS-16): decir, para cada fichero borrado de un volumen NTFS, qué datos

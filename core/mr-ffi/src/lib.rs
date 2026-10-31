@@ -470,7 +470,11 @@ fn api_error_code(e: &ApiError) -> i32 {
             mr_api::mr_vfs::VfsError::Ntfs(_) => MR_ERR_CORRUPT,
         },
         ApiError::Cancelled => MR_ERR_CANCELLED,
-        ApiError::InvalidArgument(_) => MR_ERR_INVALID_ARGUMENT,
+        // Salida que no se puede comprobar frente al origen (#76): mismo código que «la salida es
+        // el origen», sin cambiar la ABI; el mensaje da el motivo.
+        ApiError::InvalidArgument(_) | ApiError::OutputNotVerifiable { .. } => {
+            MR_ERR_INVALID_ARGUMENT
+        }
         ApiError::Spawn(_) => MR_ERR_IO,
     }
 }

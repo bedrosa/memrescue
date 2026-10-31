@@ -40,7 +40,8 @@ stream.with_suspect_clusters(tramos)    // lo leído de esos clústeres: possibl
   (`open_partition`) o volumen encontrado (`open_found_volume`). Errores en `ApiError::Ntfs`.
 - `mr_api::ntfs_file`, `ntfs_open_stream`, `ntfs_read_stream` (con el estado de cada tramo) y
   `ntfs_copy_stream` (#21), por número de registro MFT y nombre de flujo; `check_output_path`
-  valida el destino de una extracción (nunca el origen, nunca un dispositivo).
+  valida el destino de una extracción (nunca el origen, nunca un dispositivo; si un fichero del
+  origen o el destino no se pueden resolver, rechaza la escritura: adenda de ADR-026, #76).
 - CLI: `memrescue-cli ntfs-info <imagen> [--partition N | --found N | --range I:N] [--json]`
   (arranque usado y estado de la copia, campos, serie, etiqueta, versión, runs de `$MFT`, comparación
   con `$MFTMirr`, recuento de registros por estado y lista de dañados e ilegibles). Código de salida

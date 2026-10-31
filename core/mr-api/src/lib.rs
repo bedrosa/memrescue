@@ -97,6 +97,13 @@ pub enum ApiError {
     /// El fichero de salida ya existe y no se pidió sobrescribirlo.
     #[error("la salida {} ya existe: no se sobrescribe sin una petición explícita", .0.display())]
     OutputExists(PathBuf),
+    /// No se puede comprobar que la salida no sea el origen (un fichero del origen, la propia
+    /// salida o su directorio no se pueden resolver): la escritura se rechaza (#76).
+    #[error(
+        "no se puede comprobar que la salida {} no sea el origen ({reason}): no se escribe",
+        .output.display()
+    )]
+    OutputNotVerifiable { output: PathBuf, reason: String },
     #[error("no se pudo iniciar la tarea: {0}")]
     Spawn(std::io::Error),
 }
@@ -612,52 +619,161 @@ pub fn start_ntfs_recover_task(
 }
 
 /// Comprueba que `out` puede ser el fichero de salida de una extracción del origen `src`: no es
-/// una ruta de dispositivo (la misma lista blanca léxica que los orígenes, ADR-014), no es un
-/// directorio y no es el propio origen ni uno de sus segmentos. Nunca se escribe sobre el origen.
+/// una ruta de dispositivo (la misma lista blanca léxica que los orígenes, ADR-014, también sobre
+/// la forma canónica), no es un directorio, no es un flujo alternativo (`fichero:flujo`, Windows)
+/// y no es el propio origen ni uno de sus segmentos ni uno de sus ficheros externos. Nunca se
+/// escribe sobre el origen.
+///
+/// Falla cerrada (#76): si no se puede canonicalizar un fichero del origen (borrado o renombrado
+/// después de abrirlo, sin permisos…), la salida existente o el directorio de una salida nueva,
+/// devuelve [`ApiError::OutputNotVerifiable`] en vez de comparar rutas sin resolver.
+///
+/// Equivalencias detectadas: las que resuelve `std::fs::canonicalize` (mayúsculas, prefijo
+/// `\\?\`, `.` y `..`, separador `/`, nombres cortos 8.3, puntos y espacios finales que Win32
+/// descarta, enlaces simbólicos y uniones en cualquier componente), comparando las rutas canónicas
+/// sin distinguir mayúsculas (en todas las plataformas: solo puede rechazar de más). En Unix,
+/// además, la identidad del fichero (`dev`, `ino`), que detecta enlaces duros. En Windows la
+/// identidad (serie del volumen e índice del fichero) no está en Rust estable sin `unsafe`: un
+/// enlace duro al origen con otro nombre **no se detecta**; [`create_output`] nunca abre un fichero
+/// existente para escribir (temporal y renombrado o enlace), así que los datos del origen no
+/// cambian, pero ese otro nombre pasa a ser la salida. Ver ADR-026, adenda de #76.
 pub fn check_output_path(src: &Source, out: &Path) -> Result<()> {
     let raw = out.to_string_lossy();
     mr_io::path_policy::check_lexical(&raw)?;
+    let unverifiable = |reason: String| ApiError::OutputNotVerifiable {
+        output: out.to_path_buf(),
+        reason,
+    };
     if out.is_dir() {
         return Err(ApiError::InvalidArgument(format!(
             "la salida {} es un directorio",
             out.display()
         )));
     }
-    // Ruta canónica de la salida (si aún no existe, la de su directorio más el nombre).
-    let canon = match std::fs::canonicalize(out) {
-        Ok(c) => c,
-        Err(_) => {
-            let parent = out
-                .parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .unwrap_or(Path::new("."));
+    #[cfg(windows)]
+    if out
+        .components()
+        .any(|c| matches!(c, std::path::Component::Normal(n) if n.to_string_lossy().contains(':')))
+    {
+        return Err(ApiError::InvalidArgument(format!(
+            "la salida {} es un flujo alternativo (`fichero:flujo`): no se admite",
+            out.display()
+        )));
+    }
+    // Ruta canónica de la salida: la suya si existe; si no, la de su directorio más el nombre.
+    let (canon, existing) = match std::fs::symlink_metadata(out) {
+        Ok(_) => {
+            let c = std::fs::canonicalize(out).map_err(|e| {
+                unverifiable(format!("la salida existe pero no se puede resolver: {e}"))
+            })?;
+            let md = std::fs::metadata(&c).map_err(|e| {
+                unverifiable(format!("no se pueden leer los metadatos de la salida: {e}"))
+            })?;
+            if md.is_dir() {
+                return Err(ApiError::InvalidArgument(format!(
+                    "la salida {} es un directorio",
+                    out.display()
+                )));
+            }
+            (c, Some(md))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let name = out.file_name().ok_or_else(|| {
                 ApiError::InvalidArgument(format!(
                     "salida sin nombre de fichero: {}",
                     out.display()
                 ))
             })?;
-            std::fs::canonicalize(parent)
-                .map_err(|e| ApiError::Io(mr_io::IoError::Io(e)))?
-                .join(name)
+            let parent = out
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            let pc = std::fs::canonicalize(parent).map_err(|e| {
+                unverifiable(format!(
+                    "no se puede resolver el directorio de la salida {}: {e}",
+                    parent.display()
+                ))
+            })?;
+            if !pc.is_dir() {
+                return Err(ApiError::InvalidArgument(format!(
+                    "{} no es un directorio",
+                    parent.display()
+                )));
+            }
+            (pc.join(name), None)
+        }
+        Err(e) => {
+            return Err(unverifiable(format!(
+                "no se puede consultar la salida: {e}"
+            )))
         }
     };
+    // La forma canónica tampoco puede ser un dispositivo (la resolución pudo cambiar la ruta).
+    mr_io::path_policy::check_canonical(&canon.to_string_lossy())?;
+    let target = comparable(&canon);
     let info = src.info();
-    let same = |p: &Path| {
-        let c = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-        c.to_string_lossy().to_lowercase() == canon.to_string_lossy().to_lowercase()
-    };
-    // Los padres de un disco diferencial también son el origen.
-    if same(&info.path)
-        || info.segments.iter().any(|s| same(s))
-        || info.external_files.iter().any(|s| same(s))
+    // Un origen sin fichero (dispositivo en memoria) no tiene nada que proteger.
+    let main = (!info.path.as_os_str().is_empty()).then_some(&info.path);
+    // Los segmentos (imagen dividida, extensiones VMDK) y los padres de un disco diferencial
+    // también son el origen.
+    for p in main
+        .into_iter()
+        .chain(&info.segments)
+        .chain(&info.external_files)
     {
-        return Err(ApiError::InvalidArgument(format!(
-            "la salida {} es el propio origen: nunca se escribe sobre él",
-            out.display()
-        )));
+        let c = std::fs::canonicalize(p).map_err(|e| {
+            unverifiable(format!(
+                "no se puede resolver el fichero del origen {}: {e}",
+                p.display()
+            ))
+        })?;
+        let same_identity = match &existing {
+            Some(md) => same_file_identity(md, &c).map_err(|e| {
+                unverifiable(format!(
+                    "no se pueden leer los metadatos del fichero del origen {}: {e}",
+                    p.display()
+                ))
+            })?,
+            None => false,
+        };
+        if same_identity || comparable(&c) == target {
+            return Err(ApiError::InvalidArgument(format!(
+                "la salida {} es el propio origen: nunca se escribe sobre él",
+                out.display()
+            )));
+        }
     }
     Ok(())
+}
+
+/// Forma comparable de una ruta canónica: sin el prefijo `\\?\` (o `\\?\UNC\` → `\\`) y en
+/// minúsculas.
+fn comparable(canon: &Path) -> String {
+    let s = canon.to_string_lossy();
+    let s = if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        s.into_owned()
+    };
+    s.to_lowercase()
+}
+
+/// `true` si `out_md` (metadatos de la salida existente) es el mismo fichero que `src_canon`.
+/// En Unix compara dispositivo e inodo (detecta enlaces duros). En Windows no hay una API estable
+/// y segura para el índice del fichero: devuelve `false` y la comparación queda en las rutas
+/// canónicas.
+#[cfg(unix)]
+fn same_file_identity(out_md: &std::fs::Metadata, src_canon: &Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let s = std::fs::metadata(src_canon)?;
+    Ok(s.dev() == out_md.dev() && s.ino() == out_md.ino())
+}
+
+#[cfg(not(unix))]
+fn same_file_identity(_out_md: &std::fs::Metadata, _src_canon: &Path) -> std::io::Result<bool> {
+    Ok(false)
 }
 
 /// Fichero de salida en curso de [`create_output`]: se escribe en un temporal del mismo
@@ -1856,6 +1972,259 @@ mod tests {
         let part = open_range(&src, 1, 4).unwrap();
         assert!(check_output_path(&part, &img).is_err());
         assert!(!dir.path().join("salida.bin").exists());
+    }
+
+    /// Origen de prueba con el fichero principal, segmentos y ficheros externos indicados (como
+    /// los construye `open_split_source`, un VMDK con extensiones o un disco diferencial).
+    fn file_source(path: &Path, segments: &[PathBuf], external: &[PathBuf]) -> Source {
+        Arc::new(OpenSource::new(
+            Arc::new(MemDevice::new(vec![0u8; 4096], 512).unwrap()),
+            Meta {
+                path: path.to_path_buf(),
+                format: ImageFormat::Raw,
+                detected: ImageFormat::Raw,
+                description: "prueba".into(),
+                segments: segments.to_vec(),
+                range: None,
+                external_files: external.to_vec(),
+            },
+        ))
+    }
+
+    fn assert_is_source(src: &Source, out: &Path) {
+        match check_output_path(src, out) {
+            Err(ApiError::InvalidArgument(m)) => assert!(m.contains("propio origen"), "{m}"),
+            other => panic!("{}: {other:?}", out.display()),
+        }
+    }
+
+    fn assert_unverifiable(src: &Source, out: &Path) {
+        match check_output_path(src, out) {
+            Err(e @ ApiError::OutputNotVerifiable { .. }) => {
+                assert!(e.to_string().contains("no se escribe"), "{e}")
+            }
+            other => panic!("{}: {other:?}", out.display()),
+        }
+    }
+
+    /// Issue #76: si un fichero del origen no se puede canonicalizar, ninguna escritura se admite
+    /// (antes se comparaba la ruta sin resolver y se podía escribir sobre el origen renombrado).
+    #[test]
+    fn output_check_fails_closed_when_a_source_file_cannot_be_resolved() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("origen.img");
+        std::fs::write(&img, vec![0u8; 4096]).unwrap();
+        let src = open_source(&img, 512).unwrap();
+        let out = dir.path().join("salida.bin");
+        check_output_path(&src, &out).unwrap();
+        // El origen se renombra con el fichero abierto: la salida con el nombre nuevo es el origen
+        // y cualquier otra salida tampoco se puede comprobar.
+        let moved = dir.path().join("movido.img");
+        std::fs::rename(&img, &moved).unwrap();
+        assert_unverifiable(&src, &moved);
+        assert_unverifiable(&src, &out);
+        assert!(create_output(&src, &moved, true).is_err());
+        assert!(create_output(&src, &out, false).is_err());
+        // Ni salida ni temporal.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        assert_eq!(std::fs::read(&moved).unwrap(), vec![0u8; 4096]);
+        // Un rango del origen hereda la ruta: también se rechaza.
+        let part = open_range(&src, 1, 4).unwrap();
+        assert_unverifiable(&part, &out);
+        std::fs::rename(&moved, &img).unwrap();
+        check_output_path(&part, &out).unwrap();
+
+        // Segmentos y ficheros externos: basta con que falte uno.
+        let files: Vec<PathBuf> = ["a.001", "a.002", "padre.vhd", "base.vhd"]
+            .iter()
+            .map(|n| dir.path().join(n))
+            .collect();
+        for f in &files {
+            std::fs::write(f, b"x").unwrap();
+        }
+        let segs = files[..2].to_vec();
+        let ext = files[2..].to_vec();
+        let multi = file_source(&files[0], &segs, &ext);
+        check_output_path(&multi, &out).unwrap();
+        for f in &files[1..] {
+            let hidden = dir.path().join("oculto.tmp");
+            std::fs::rename(f, &hidden).unwrap();
+            assert_unverifiable(&multi, &out);
+            assert_unverifiable(&multi, &hidden);
+            match create_output(&multi, &out, false) {
+                Err(ApiError::OutputNotVerifiable { .. }) => {}
+                other => panic!("{f:?}: {:?}", other.map(|_| ())),
+            }
+            std::fs::rename(&hidden, f).unwrap();
+        }
+        // Con todo en su sitio, se escribe con normalidad.
+        let mut o = create_output(&multi, &out, false).unwrap();
+        o.write_all(b"ok").unwrap();
+        o.commit().unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"ok");
+        // Un origen sin fichero (en memoria) no tiene nada que proteger.
+        let mem = source_from_device(Arc::new(MemDevice::new(vec![0u8; 512], 512).unwrap()), "m");
+        check_output_path(&mem, &dir.path().join("otra.bin")).unwrap();
+    }
+
+    /// Issue #76: la salida no se admite tampoco a través de un directorio que no se puede
+    /// resolver, ni como flujo alternativo del origen (Windows).
+    #[test]
+    fn output_check_requires_a_resolvable_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("origen.img");
+        std::fs::write(&img, vec![0u8; 4096]).unwrap();
+        let src = open_source(&img, 512).unwrap();
+        assert_unverifiable(&src, &dir.path().join("no-existe").join("salida.bin"));
+        // Un fichero como directorio.
+        assert!(check_output_path(&src, &img.join("salida.bin")).is_err());
+        #[cfg(windows)]
+        for ads in ["origen.img:flujo", "origen.img::$DATA", "otro.bin:flujo"] {
+            match check_output_path(&src, &dir.path().join(ads)) {
+                Err(ApiError::InvalidArgument(m)) => assert!(m.contains("flujo"), "{m}"),
+                other => panic!("{ads}: {other:?}"),
+            }
+        }
+    }
+
+    /// Issue #76: el origen, cada segmento y cada fichero externo se reconocen escritos de otra
+    /// forma: mayúsculas, `\\?\`, `.` y `..`, `/`, puntos y espacios finales, nombre 8.3 (si el
+    /// volumen los genera) y unión de directorios.
+    #[test]
+    fn output_equal_to_a_source_file_by_another_spelling_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir(base.join("sub")).unwrap();
+        let names = [
+            "origen con nombre largo.imagen",
+            "segmento con nombre largo.002",
+            "padre con nombre largo.vhdx",
+        ];
+        let files: Vec<PathBuf> = names.iter().map(|n| base.join(n)).collect();
+        for f in &files {
+            std::fs::write(f, b"origen").unwrap();
+        }
+        let src = file_source(
+            &files[0],
+            &[files[0].clone(), files[1].clone()],
+            &[files[2].clone()],
+        );
+        #[cfg(windows)]
+        let junction = {
+            let j = base.join("union");
+            let ok = std::process::Command::new("cmd")
+                .args(["/d", "/c", "mklink", "/J"])
+                .arg(dir.path().join("union"))
+                .arg(dir.path())
+                .output()
+                .is_ok_and(|o| o.status.success());
+            ok.then_some(j)
+        };
+        for (f, name) in files.iter().zip(names) {
+            let plain = dir.path().join(name);
+            let mut spellings = vec![
+                f.clone(),
+                plain.clone(),
+                dir.path().join(".").join(name),
+                dir.path().join("sub").join("..").join(name),
+            ];
+            #[cfg(windows)]
+            {
+                let p = plain.to_string_lossy().into_owned();
+                let verbatim = if p.starts_with(r"\\?\") {
+                    p.clone()
+                } else {
+                    format!(r"\\?\{p}")
+                };
+                spellings.extend([
+                    PathBuf::from(&verbatim),
+                    PathBuf::from(p.to_uppercase()),
+                    dir.path().join(name.to_uppercase()),
+                    PathBuf::from(p.replace('\\', "/")),
+                    PathBuf::from(format!("{p}.")),
+                    PathBuf::from(format!("{p} ")),
+                ]);
+                match short_name(f) {
+                    Some(s) => spellings.push(s),
+                    None => eprintln!(
+                        "nota: el volumen de pruebas no genera nombres 8.3; se omite ese caso"
+                    ),
+                }
+                match &junction {
+                    Some(j) => spellings.push(j.join(name)),
+                    None => eprintln!("nota: no se pudo crear la unión; se omite ese caso"),
+                }
+            }
+            for s in &spellings {
+                assert_is_source(&src, s);
+                assert!(create_output(&src, s, true).is_err(), "{}", s.display());
+            }
+        }
+        for f in &files {
+            assert_eq!(std::fs::read(f).unwrap(), b"origen");
+        }
+        // Un fichero nuevo junto a ellos sí.
+        check_output_path(&src, &base.join("salida.bin")).unwrap();
+        #[cfg(windows)]
+        if let Some(j) = &junction {
+            std::fs::remove_dir(j).unwrap();
+        }
+    }
+
+    /// Nombre corto 8.3 de `p` según `cmd` (`%~sI`), o `None` si el volumen no lo genera.
+    #[cfg(windows)]
+    fn short_name(p: &Path) -> Option<PathBuf> {
+        use std::os::windows::process::CommandExt;
+        let out = std::process::Command::new("cmd")
+            .raw_arg(format!(
+                "/d /c for %I in (\"{}\") do @echo %~sI",
+                p.display()
+            ))
+            .output()
+            .ok()?;
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let short = PathBuf::from(&s);
+        let file = short.file_name()?.to_string_lossy().into_owned();
+        (out.status.success() && file.contains('~') && short.exists()).then_some(short)
+    }
+
+    /// Issue #76: enlaces duros al origen. En Unix se detectan por identidad (`dev`, `ino`). En
+    /// Windows no (sin API estable y segura): se documenta, y se comprueba que aun así escribir
+    /// por el enlace nunca cambia los datos del origen (temporal y renombrado).
+    #[test]
+    fn hard_link_to_the_source_never_changes_its_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("origen.img");
+        std::fs::write(&img, vec![0x41u8; 4096]).unwrap();
+        let src = open_source(&img, 512).unwrap();
+        let link = dir.path().join("enlace.img");
+        if let Err(e) = std::fs::hard_link(&img, &link) {
+            eprintln!("nota: el volumen de pruebas no admite enlaces duros ({e}); se omite");
+            return;
+        }
+        // Sin `overwrite`, una salida existente nunca se toca.
+        assert!(create_output(&src, &link, false).is_err());
+        #[cfg(unix)]
+        {
+            assert_is_source(&src, &link);
+            assert!(create_output(&src, &link, true).is_err());
+        }
+        #[cfg(not(unix))]
+        {
+            use std::io::Write;
+            // Limitación documentada: el enlace no se reconoce como el origen...
+            check_output_path(&src, &link).unwrap();
+            // ...pero la escritura sustituye el nombre, no los datos del origen.
+            let mut o = create_output(&src, &link, true).unwrap();
+            o.write_all(b"nuevo").unwrap();
+            o.commit().unwrap();
+            assert_eq!(std::fs::read(&link).unwrap(), b"nuevo");
+        }
+        assert_eq!(std::fs::read(&img).unwrap(), vec![0x41u8; 4096]);
+        let mut buf = vec![0u8; 512];
+        src.read_at(0, &mut buf).unwrap();
+        assert_eq!(buf, vec![0x41u8; 512]);
     }
 
     #[test]

@@ -636,6 +636,22 @@ Atributos, runs, flujos y LZNT1 (issue #21, ADR-026, `formatos/ntfs.md`):
   carreras reales con otro hilo que crea el destino en exclusiva (gana exactamente uno y el destino
   tiene su contenido). `hard_link_unsupported_is_recognised_only_for_unsupported_errors` fija qué
   errores del enlace activan la copia. No se prueba en un volumen FAT real (requiere montarlo).
+- Salida que falla cerrada (#76, adenda de ADR-026), `mr-api`:
+  `output_check_fails_closed_when_a_source_file_cannot_be_resolved` (origen renombrado con el
+  fichero abierto: la salida con el nombre nuevo y cualquier otra salida se rechazan con
+  `OutputNotVerifiable`, `create_output` no deja nada y el origen no cambia; lo mismo para un rango
+  del origen y al quitar un segmento o cualquiera de dos ficheros externos; con todo en su sitio se
+  escribe; un origen en memoria no se ve afectado);
+  `output_check_requires_a_resolvable_directory` (directorio inexistente, fichero como directorio y,
+  en Windows, flujos alternativos `origen.img:flujo`, `origen.img::$DATA`, `otro.bin:flujo`);
+  `output_equal_to_a_source_file_by_another_spelling_is_refused` (para el fichero principal, un
+  segmento y un fichero externo: ruta canónica y sin canonicalizar, `.`, `..` y, en Windows, `\\?\`,
+  mayúsculas en toda la ruta y en el nombre, `/`, punto y espacio finales, nombre 8.3 obtenido con
+  `cmd` `%~sI` y unión `mklink /J`; si el volumen no genera nombres 8.3 o no se puede crear la
+  unión, ese caso se omite con una nota en la salida de la prueba);
+  `hard_link_to_the_source_never_changes_its_data` (en Unix el enlace duro se rechaza como el
+  origen; en Windows, limitación documentada, se admite pero escribir por él con `overwrite`
+  sustituye el nombre y los datos del origen no cambian; sin `overwrite`, `OutputExists`).
 
 Ficheros borrados (issue #23, ADR-027, `formatos/ntfs.md` «Ficheros borrados»):
 
