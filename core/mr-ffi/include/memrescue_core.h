@@ -61,6 +61,12 @@
  * (mr_vfs_find), notas (mr_vfs_note_text) y consultas con filtro como handle (mr_vfs_query con
  * mr_vfs_filter, mr_vfs_query_count, mr_vfs_query_get, mr_vfs_query_free). mr_task_status_get,
  * mr_task_cancel y mr_task_free admiten la tarea de construcción.
+ * Añadido sin cambiar la ABI 3 (M4, issue #26): recuperación de una selección del árbol virtual a
+ * una carpeta de destino como tarea (mr_recover_start con mr_recover_options versionada, opcional),
+ * progreso detallado (mr_recover_progress, mr_recover_current), preguntas de conflicto por sondeo
+ * (mr_recover_question, mr_recover_question_text, mr_recover_answer) e informe final
+ * (mr_recover_result, mr_recover_result_text). mr_task_status_get (bytes de los flujos
+ * principales), mr_task_cancel y mr_task_free admiten la tarea de recuperación.
  */
 #ifndef MEMRESCUE_CORE_H
 #define MEMRESCUE_CORE_H
@@ -1177,6 +1183,137 @@ mr_status mr_vfs_query_count(uint64_t query, uint64_t *out_count);
 mr_status mr_vfs_query_get(uint64_t query, uint64_t index, uint32_t *out_node);
 mr_status mr_vfs_query_free(uint64_t query);
 mr_status mr_vfs_free(uint64_t vfs);
+
+/* ---------- Recuperación (#26) ---------- */
+
+/* Política de conflictos (mr_recover_options.conflict) y respuestas (mr_recover_answer). */
+#define MR_RECOVER_CONFLICT_ASK             1u  /* preguntar (mr_recover_question) */
+#define MR_RECOVER_CONFLICT_RENAME          2u  /* por defecto (0 = este): "nombre (2).ext" */
+#define MR_RECOVER_CONFLICT_SKIP            3u
+#define MR_RECOVER_CONFLICT_SKIP_IDENTICAL  4u  /* mismo tamaño y SHA-256: omitir (reanudar) */
+#define MR_RECOVER_CONFLICT_OVERWRITE       5u  /* exige MR_RECOVER_CONFIRM_OVERWRITE */
+#define MR_RECOVER_ANSWER_CANCEL            6u  /* solo como respuesta: cancelar */
+
+/* mr_recover_options.flags */
+#define MR_RECOVER_INCLUDE_REALLOCATED_BYTES 1u   /* bytes del disco en tramos posiblemente sobrescritos */
+#define MR_RECOVER_NO_ALTERNATE_STREAMS      2u
+#define MR_RECOVER_NO_TIMES                  4u
+#define MR_RECOVER_NO_ATTRIBUTES             8u   /* sin solo lectura */
+#define MR_RECOVER_NO_MARK_INCOMPLETE       16u   /* sin ficheros .mrbad */
+#define MR_RECOVER_CREATE_EMPTY_DIRS        32u
+#define MR_RECOVER_CONFIRM_OVERWRITE        64u   /* confirmación explícita de la sustitución */
+#define MR_RECOVER_DELETED_ONLY            128u   /* filtro: solo entradas borradas */
+
+#define MR_RECOVER_SPLIT_NEVER             UINT64_MAX
+
+typedef struct mr_recover_options {  /* 48 bytes; todo a 0 salvo struct_size = por defecto */
+    uint32_t struct_size;        /* = sizeof(mr_recover_options) */
+    uint32_t flags;              /* MR_RECOVER_* */
+    uint32_t conflict;           /* MR_RECOVER_CONFLICT_* (0 = renombrar) */
+    uint32_t write_states;       /* estados que se escriben: 1 << MR_VFS_DATA_* (0 = íntegro,
+                                    íntegro no verificable y parcial) */
+    uint32_t categories;         /* filtro: 1 << MR_VFS_CAT_* (0 = vivo, borrado y huérfano) */
+    uint32_t data_states;        /* filtro: 1 << MR_VFS_DATA_* (0 = todos) */
+    uint64_t split_size;         /* 0 = automática (FAT32), MR_RECOVER_SPLIT_NEVER o tamaño de parte */
+    uint8_t  fill[4];            /* patrón de relleno (0 0 0 0 = "BAD!"; regla de ADR-021) */
+    uint32_t rename_limit;       /* 0 = 1000 */
+    uint64_t reserved;           /* 0 */
+} mr_recover_options;
+
+#define MR_RECOVER_PROGRESS_QUESTION  1u  /* mr_recover_progress.flags: pregunta pendiente */
+
+typedef struct mr_recover_progress {  /* 56 bytes */
+    uint32_t struct_size;
+    uint32_t flags;
+    uint64_t files_done;
+    uint64_t files_total;
+    uint64_t bytes_done;         /* flujos principales; total de los metadatos, sin leer datos */
+    uint64_t bytes_total;
+    uint64_t untrusted_bytes;
+    uint64_t errors;
+} mr_recover_progress;
+
+#define MR_RECOVER_QUESTION_DIRECTORY        1u
+#define MR_RECOVER_QUESTION_DELETED          2u
+#define MR_RECOVER_QUESTION_EXISTING_IS_DIR  4u
+#define MR_RECOVER_QUESTION_TEXT_REQUESTED   0u  /* ruta relativa pedida en el destino */
+#define MR_RECOVER_QUESTION_TEXT_EXISTING    1u  /* ruta del objeto que ya existe */
+
+typedef struct mr_recover_question {  /* 40 bytes */
+    uint32_t struct_size;
+    uint32_t flags;              /* MR_RECOVER_QUESTION_* */
+    uint64_t id;                 /* para mr_recover_answer */
+    uint32_t node;               /* nodo del árbol virtual */
+    uint32_t reserved;
+    uint64_t existing_size;      /* UINT64_MAX si es un directorio o se desconoce */
+    uint64_t new_size;
+} mr_recover_question;
+
+#define MR_RECOVER_STATUS_COMPLETE   1u
+#define MR_RECOVER_STATUS_CANCELLED  2u
+#define MR_RECOVER_STATUS_FAILED     3u   /* destino lleno u otro error que impide seguir */
+#define MR_RECOVER_CAP_NAMED_STREAMS  1u
+#define MR_RECOVER_CAP_CASE_SENSITIVE 2u
+#define MR_RECOVER_CAP_MAX_FILE_SIZE  4u
+#define MR_RECOVER_TEXT_JOURNAL       0u
+#define MR_RECOVER_TEXT_DESTINATION   1u
+#define MR_RECOVER_TEXT_REASON        2u
+
+typedef struct mr_recover_report {  /* 200 bytes */
+    uint32_t struct_size;
+    uint32_t status;             /* MR_RECOVER_STATUS_* */
+    uint64_t files_planned;
+    uint64_t dirs_planned;
+    uint64_t files_written;
+    uint64_t dirs_created;
+    uint64_t dirs_merged;
+    uint64_t bytes_written;
+    uint64_t untrusted_bytes;
+    uint64_t filled_bytes;
+    uint64_t written_integro;    /* ficheros escritos por estado final */
+    uint64_t written_integro_no_verificable;
+    uint64_t written_parcial;
+    uint64_t written_sobrescrito;
+    uint64_t written_other;
+    uint64_t skipped_state;      /* omitidos por su estado (sobrescrito, sin datos...) */
+    uint64_t skipped_conflict;
+    uint64_t skipped_identical;
+    uint64_t unsupported;        /* p. ej. cifrados (EFS) */
+    uint64_t errors;
+    uint64_t renamed;
+    uint64_t long_paths;         /* rutas de más de 259 caracteres */
+    uint64_t marked_incomplete;  /* ficheros .mrbad */
+    uint64_t cancelled_files;
+    uint32_t capabilities;       /* MR_RECOVER_CAP_* del destino */
+    uint32_t exit_code;          /* 0 todo íntegro, 3 algo no íntegro, 1 errores (como la CLI) */
+    uint64_t max_file_size;      /* con MR_RECOVER_CAP_MAX_FILE_SIZE */
+} mr_recover_report;
+
+/* Recupera los nodos (con sus descendientes) del árbol vfs, construido desde volume, en la carpeta
+ * dest (se crea). masks: reglas de nombre "regla;!exclusión" (puede ser vacía); journal: diario
+ * JSON Lines (vacío = <dest>/MemRescue-registro/recuperacion-*.jsonl; nunca se sustituye). El
+ * destino nunca es ni está dentro del origen, sus segmentos o sus ficheros externos
+ * (MR_ERR_INVALID_ARGUMENT) ni es un dispositivo (MR_ERR_PATH_REJECTED). Progreso de la tarea en
+ * bytes; cancelada con resultado parcial. options puede ser NULL. */
+mr_status mr_recover_start(uint64_t volume, uint64_t vfs, const uint32_t *nodes, size_t node_count,
+                           const mr_recover_options *options,
+                           const uint8_t *dest, size_t dest_len,
+                           const uint8_t *masks, size_t masks_len,
+                           const uint8_t *journal, size_t journal_len, uint64_t *out_task);
+mr_status mr_recover_progress(uint64_t task, mr_recover_progress *out);
+/* Ruta relativa en curso (UTF-8). */
+mr_status mr_recover_current(uint64_t task, uint8_t *buf, size_t cap, size_t *out_len);
+/* Pregunta pendiente (política MR_RECOVER_CONFLICT_ASK); ninguna: MR_ERR_NOT_FOUND. */
+mr_status mr_recover_question(uint64_t task, mr_recover_question *out);
+mr_status mr_recover_question_text(uint64_t task, uint64_t id, uint32_t which,
+                                   uint8_t *buf, size_t cap, size_t *out_len);
+/* decision: MR_RECOVER_CONFLICT_RENAME/SKIP/SKIP_IDENTICAL/OVERWRITE o MR_RECOVER_ANSWER_CANCEL;
+ * apply_to_all 0 o 1. Pregunta que ya no está pendiente: MR_ERR_NOT_FOUND. */
+mr_status mr_recover_answer(uint64_t task, uint64_t id, uint32_t decision, uint32_t apply_to_all);
+mr_status mr_recover_result(uint64_t task, mr_recover_report *out);
+/* which: MR_RECOVER_TEXT_JOURNAL, _DESTINATION o _REASON. */
+mr_status mr_recover_result_text(uint64_t task, uint32_t which, uint8_t *buf, size_t cap,
+                                 size_t *out_len);
 
 mr_status mr_task_status_get(uint64_t task, mr_task_status *out);
 mr_status mr_task_cancel(uint64_t task);

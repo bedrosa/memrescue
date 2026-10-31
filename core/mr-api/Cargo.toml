@@ -15,6 +15,7 @@ mr-store.workspace = true
 mr-part.workspace = true
 mr-fs-ntfs.workspace = true
 mr-vfs.workspace = true
+mr-recover.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

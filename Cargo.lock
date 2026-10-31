@@ -201,6 +201,7 @@ version = "0.2.0"
 dependencies = [
  "mr-api",
  "mr-common",
+ "mr-fs-ntfs",
  "mr-io",
  "mr-store",
  "tempfile",
@@ -224,6 +225,7 @@ dependencies = [
  "mr-image",
  "mr-io",
  "mr-part",
+ "mr-recover",
  "mr-store",
  "mr-vfs",
  "tempfile",
@@ -293,6 +295,19 @@ dependencies = [
  "mr-common",
  "mr-io",
  "tempfile",
+]
+
+[[package]]
+name = "mr-recover"
+version = "0.2.0"
+dependencies = [
+ "mr-api",
+ "mr-common",
+ "mr-fs-ntfs",
+ "mr-io",
+ "mr-vfs",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]

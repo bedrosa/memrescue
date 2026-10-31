@@ -5,6 +5,7 @@
 mod ntfs_deleted;
 mod ntfs_files;
 mod partition_backup;
+mod recover;
 mod vfs;
 
 use mr_api::mr_fs_ntfs::{
@@ -49,6 +50,11 @@ USO:
   memrescue-cli ntfs-recover <imagen> --record N -o SALIDA [--stream NOMBRE] [--overwrite] [ORIGEN]
   memrescue-cli vfs-ls <imagen> [RUTA] [-r] [--deleted] [--filter MÁSCARAS] [--category LISTA]
                        [--state LISTA] [ORIGEN] [--json]
+  memrescue-cli recover <imagen> --to DIR [RUTA...] [--deleted] [--filter MÁSCARAS]
+                        [--category LISTA] [--state LISTA]
+                        [--conflict rename|skip|skip-identical|overwrite [--confirm-overwrite]]
+                        [--include-overwritten] [--include-reallocated-bytes] [--journal F]
+                        [ORIGEN]
   memrescue-cli sectors <imagen> --lba N [--count M] [--retries N] [--jump N] [--read-back]
                         [--bad-fill PATRÓN] [--skip-fill PATRÓN] [ORIGEN]
   memrescue-cli verify <imagen> [--retries N] [--jump N] [--read-back]
@@ -211,11 +217,47 @@ VMDK CON DESCRIPTOR SEPARADO (vmdk-extents, --extent):
   --state LISTA      estados de los datos (p. ej. integro,parcial)
   Código de salida 3 si el árbol no es completo (directorios que no se pudieron listar o límite).
 
+RECUPERACIÓN (recover):
+  Copia ficheros y directorios del árbol virtual (vfs-ls) a la carpeta DIR, que se crea si no
+  existe y nunca puede ser el origen, uno de sus segmentos o ficheros externos, ni estar dentro
+  de ellos, ni una ruta de dispositivo. Cada fichero se escribe en un temporal y se publica con
+  su nombre final solo completo; nunca se sustituye un fichero existente sin --conflict overwrite
+  --confirm-overwrite. Detalle en docs/formatos/recuperacion.md.
+  RUTA...            nodos del árbol virtual que se recuperan («/» por defecto, su contenido va
+                     directamente a DIR); un directorio se crea en DIR con su nombre
+  --deleted, --filter, --category, --state
+                     como en vfs-ls; por defecto, categorías vivo,borrado,huerfano (sin los
+                     ficheros del sistema). Los directorios solo se crean si reciben algún fichero
+  Por estado de los datos: integro e integro_no_verificable se escriben; parcial se escribe con
+  el patrón de relleno BAD! en los tramos no fiables y un fichero «nombre.mrbad» con esos tramos;
+  sobrescrito, sin_datos, no_disponible y cifrado se omiten (y se anotan).
+  --include-overwritten
+                     escribir también los «sobrescrito» (con relleno y marcados)
+  --include-reallocated-bytes
+                     en los tramos posiblemente sobrescritos, escribir los bytes actuales del
+                     disco en lugar del relleno (siguen siendo no fiables y su hash no es el del
+                     contenido)
+  --conflict P       nombre que ya existe en DIR: rename (por defecto: «nombre (2).ext», y
+                     «nombre (borrado).ext» para la versión borrada de un nombre vivo), skip,
+                     skip-identical (omite si el existente tiene el mismo tamaño y SHA-256; para
+                     reanudar, repita la orden con esta política) u overwrite (exige
+                     --confirm-overwrite; los directorios se reutilizan)
+  --journal F        diario JSON Lines (por defecto DIR/MemRescue-registro/recuperacion-*.jsonl);
+                     nunca sustituye uno existente (docs/formatos/diario-recuperacion.md)
+  Nombres no válidos en Windows se escapan (%XX, CON → CON_, punto o espacio final); el nombre
+  original queda en el diario. Rutas de más de 260 caracteres admitidas. Fechas de creación,
+  modificación y acceso del registro y solo lectura al final. Flujos alternativos como flujos (destino NTFS) o como
+  ficheros hermanos «nombre%3Aflujo». Hashes CRC-32, MD5, SHA-1 y SHA-256 de lo escrito con su
+  ámbito: «contenido» solo sin tramos no fiables, «escrito_con_relleno» si los hay.
+  Código de salida 0 si todo es íntegro; 3 si algún fichero no lo es (parcial, sobrescrito,
+  borrado sin procedencia verificable u omitido por su estado); 1 si hubo errores.
+
 Formatos: RAW, VHD (fijo/dinámico), VHDX (fijo/dinámico), VMDK monolithicSparse,
 streamOptimized y con descriptor separado (--extent), e imágenes divididas.
 Tamaños de sector habituales: 512, 1024, 2048, 4096.
 Códigos de salida: 0 correcto, 1 error de operación, 2 uso incorrecto,
-3 hay sectores no fiables (ilegibles o saltados; su contenido es un patrón de relleno),
+3 hay sectores no fiables (ilegibles o saltados; su contenido es un patrón de relleno) o, en
+recover, algún fichero no es íntegro,
 4 el origen no coincide con la copia del particionado (partition-backup-check).
 ";
 
@@ -273,6 +315,15 @@ struct Args {
     category: Option<String>,
     /// Estados de los datos (`vfs-ls --state`).
     state: Option<String>,
+    /// Destino de `recover`.
+    to: Option<PathBuf>,
+    /// Política de conflictos de `recover`.
+    conflict: Option<String>,
+    confirm_overwrite: bool,
+    include_overwritten: bool,
+    include_reallocated_bytes: bool,
+    /// Diario de `recover`.
+    journal: Option<PathBuf>,
 }
 
 /// Analiza `--skip-codes`: códigos positivos separados por comas (decimal o `0x…`), sin
@@ -350,6 +401,12 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
         filter: None,
         category: None,
         state: None,
+        to: None,
+        conflict: None,
+        confirm_overwrite: false,
+        include_overwritten: false,
+        include_reallocated_bytes: false,
+        journal: None,
     };
     while let Some(s) = it.next() {
         match s.as_str() {
@@ -454,6 +511,12 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
             "--filter" => a.filter = Some(it.next().ok_or("falta el valor de --filter")?),
             "--category" => a.category = Some(it.next().ok_or("falta el valor de --category")?),
             "--state" => a.state = Some(it.next().ok_or("falta el valor de --state")?),
+            "--to" => a.to = Some(it.next().ok_or("falta el valor de --to")?.into()),
+            "--conflict" => a.conflict = Some(it.next().ok_or("falta el valor de --conflict")?),
+            "--confirm-overwrite" => a.confirm_overwrite = true,
+            "--include-overwritten" => a.include_overwritten = true,
+            "--include-reallocated-bytes" => a.include_reallocated_bytes = true,
+            "--journal" => a.journal = Some(it.next().ok_or("falta el valor de --journal")?.into()),
             "-o" | "--output" => {
                 a.output = Some(it.next().ok_or("falta el valor de -o")?.into());
             }
@@ -1077,11 +1140,28 @@ fn run(args: Vec<String>) -> Result<(), (u8, String)> {
         return Err(usage("-r solo se aplica a ntfs-ls y vfs-ls"));
     }
     if cmd != "vfs-ls"
+        && cmd != "recover"
         && (a.deleted || a.filter.is_some() || a.category.is_some() || a.state.is_some())
     {
         return Err(usage(
-            "--deleted, --filter, --category y --state solo se aplican a vfs-ls",
+            "--deleted, --filter, --category y --state solo se aplican a vfs-ls y recover",
         ));
+    }
+    if cmd != "recover"
+        && (a.to.is_some()
+            || a.conflict.is_some()
+            || a.confirm_overwrite
+            || a.include_overwritten
+            || a.include_reallocated_bytes
+            || a.journal.is_some())
+    {
+        return Err(usage(
+            "--to, --conflict, --confirm-overwrite, --include-overwritten, \
+             --include-reallocated-bytes y --journal solo se aplican a recover",
+        ));
+    }
+    if cmd == "recover" && a.json {
+        return Err(usage("recover no admite --json (el diario es JSON Lines)"));
     }
     if cmd == "ntfs-cat" && a.json {
         return Err(usage(
@@ -1410,6 +1490,43 @@ fn run(args: Vec<String>) -> Result<(), (u8, String)> {
                     masks: a.filter.as_deref(),
                     categories: a.category.as_deref(),
                     states: a.state.as_deref(),
+                },
+            )?;
+        }
+        "recover" => {
+            let Some((p, paths)) = a.positional.split_first() else {
+                return Err(usage("recover necesita la imagen"));
+            };
+            let dest =
+                a.to.clone()
+                    .ok_or_else(|| usage("recover necesita --to DIR"))?;
+            if let Some(c) = &a.conflict {
+                recover::parse_conflict(c).map_err(|e| usage(&e))?;
+            }
+            let src = open_src(&a, p).map_err(|e| op(&e))?;
+            let v = mr_api::ntfs_open(&src).map_err(|e| {
+                let hint = if a.partition.is_none() && a.found.is_none() && a.range.is_none() {
+                    " (si el origen es un disco con particiones, use --partition N)"
+                } else {
+                    ""
+                };
+                (1u8, format!("{e}{hint}"))
+            })?;
+            recover::run(
+                &src,
+                v,
+                &recover::RecoverArgs {
+                    paths,
+                    dest,
+                    deleted: a.deleted,
+                    masks: a.filter.as_deref(),
+                    categories: a.category.as_deref(),
+                    states: a.state.as_deref(),
+                    conflict: a.conflict.as_deref(),
+                    confirm_overwrite: a.confirm_overwrite,
+                    include_overwritten: a.include_overwritten,
+                    include_reallocated_bytes: a.include_reallocated_bytes,
+                    journal: a.journal.clone(),
                 },
             )?;
         }

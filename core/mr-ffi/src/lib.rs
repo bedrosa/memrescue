@@ -534,6 +534,8 @@ enum Entry {
     Vfs(Arc<mr_api::mr_vfs::Vfs>),
     /// Resultado de una consulta sobre el árbol virtual.
     VfsQuery(Vec<mr_api::mr_vfs::NodeId>),
+    /// Recuperación en segundo plano (#26).
+    Recover(Box<recover::RecoverEntry>),
 }
 
 /// Tarea de búsqueda de particiones con su resultado y el origen en que se hizo.
@@ -2752,6 +2754,7 @@ pub unsafe extern "C" fn mr_task_status_get(task: u64, out: *mut MrTaskStatus) -
                 Entry::NtfsDeleted(e) => (e.task.state(), e.task.progress()),
                 Entry::NtfsRecover(e) => (e.task.state(), e.task.progress()),
                 Entry::VfsBuild(e) => (e.task.state(), e.task.progress()),
+                Entry::Recover(e) => e.state_progress(),
                 Entry::Source(_)
                 | Entry::Partitions { .. }
                 | Entry::Ntfs(_)
@@ -2811,6 +2814,10 @@ pub extern "C" fn mr_task_cancel(task: u64) -> i32 {
                 e.task.cancel();
                 true
             }
+            Entry::Recover(e) => {
+                e.task.cancel();
+                true
+            }
             Entry::Source(_)
             | Entry::Partitions { .. }
             | Entry::Ntfs(_)
@@ -2840,7 +2847,8 @@ pub extern "C" fn mr_task_free(task: u64) -> i32 {
                 | Entry::NtfsCopy(_)
                 | Entry::NtfsDeleted(_)
                 | Entry::NtfsRecover(_)
-                | Entry::VfsBuild(_),
+                | Entry::VfsBuild(_)
+                | Entry::Recover(_),
             ) => {}
             _ => return bad_task(task),
         }
@@ -2854,6 +2862,7 @@ pub extern "C" fn mr_task_free(task: u64) -> i32 {
             Some(Entry::NtfsDeleted(e)) => e.task.cancel(),
             Some(Entry::NtfsRecover(e)) => e.task.cancel(),
             Some(Entry::VfsBuild(e)) => e.task.cancel(),
+            Some(Entry::Recover(e)) => e.task.cancel(),
             _ => {}
         }
         MR_OK
@@ -2864,12 +2873,16 @@ mod ntfs;
 pub use ntfs::*;
 mod vfs;
 pub use vfs::*;
+mod recover;
+pub use recover::*;
 
 #[cfg(test)]
 mod ntfs_tests;
 mod vmdk_extents;
 pub use vmdk_extents::*;
 
+#[cfg(test)]
+mod recover_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

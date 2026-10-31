@@ -2,8 +2,8 @@
 
 Crate: `core/mr-vfs` (`mr_vfs::Vfs`). Issue #25 (M4), diseño en
 `investigacion/dmde-fase2/INV-01-motor-de-recuperacion.md` §7.2 y §7.3, decisiones por defecto en
-ADR-029. Base de la recuperación (#26) y de sus informes (#27), que todavía no existen: este árbol
-solo describe; no lee datos ni escribe nada.
+ADR-029. Base de la recuperación (#26, [`recuperacion.md`](recuperacion.md)) y de sus informes
+(#27): este árbol solo describe; no lee datos ni escribe nada.
 
 ## Modelo
 

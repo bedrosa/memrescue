@@ -115,6 +115,10 @@ jobs:
         run: |
           cargo test -p mr-vfs --test vfs_corpus --locked -- --ignored
           cargo test -p memrescue-cli --test vfs_corpus --locked -- --ignored
+      - name: Recovery engine (#26) against the corpus manifests
+        run: |
+          cargo test -p mr-recover --test corpus --locked -- --ignored
+          cargo test -p memrescue-cli --test recover --locked -- --ignored
 
   dotnet:
     name: .NET build and interop tests

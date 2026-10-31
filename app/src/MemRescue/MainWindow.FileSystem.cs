@@ -113,6 +113,7 @@ public partial class MainWindow
         if (Selected == s)
         {
             ShowFileSystem(s);
+            UpdateRecoverView();
         }
         MainTabs.SelectedItem = FileSystemTab;
         return s.Ntfs;

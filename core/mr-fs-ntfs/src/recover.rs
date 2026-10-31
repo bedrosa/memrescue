@@ -14,7 +14,7 @@
 use std::collections::BTreeMap;
 
 use crate::deleted::{
-    attach_backrefs, scan_deleted, ClusterState, OwnerInfo, ScanObserver, ScanOptions,
+    attach_backrefs, scan_deleted, ClusterState, DeletedScan, OwnerInfo, ScanObserver, ScanOptions,
     StreamAssessment,
 };
 use crate::mft::RecordState;
@@ -70,8 +70,8 @@ pub fn recovery_stream<'v>(
     name: &str,
     obs: &dyn ScanObserver,
 ) -> Result<Option<(DataStream<'v>, RecoveryReport)>, NtfsError> {
-    let mut f = vol.file(record)?;
-    let mut report = RecoveryReport {
+    let f = vol.file(record)?;
+    let report = RecoveryReport {
         record,
         sequence: f.header.sequence,
         stream: name.to_string(),
@@ -94,6 +94,59 @@ pub fn recovery_stream<'v>(
     let Some(scan) = scan_deleted(vol, &opts, obs)? else {
         return Ok(None);
     };
+    prepare_deleted(vol, &scan, f, report, name).map(Some)
+}
+
+/// Como [`recovery_stream`] para un borrado, pero con un recorrido de borrados ya hecho (el de
+/// todo el volumen, para recuperar muchos ficheros sin recorrer la MFT una vez por fichero).
+/// `Ok(None)` si el recorrido no sirve para este flujo: el registro no está en él o la evaluación
+/// del flujo está truncada (tramos de clústeres no guardados); entonces hay que usar
+/// [`recovery_stream`], que evalúa el registro sin límite de tramos. Un registro en uso se abre
+/// tal cual, como en [`recovery_stream`].
+pub fn recovery_stream_from_scan<'v>(
+    vol: &'v NtfsVolume,
+    scan: &DeletedScan,
+    record: u64,
+    name: &str,
+) -> Result<Option<(DataStream<'v>, RecoveryReport)>, NtfsError> {
+    let f = vol.file(record)?;
+    let report = RecoveryReport {
+        record,
+        sequence: f.header.sequence,
+        stream: name.to_string(),
+        in_use: f.in_use(),
+        assessment: None,
+        copy: CopyReport::default(),
+        suspect: Vec::new(),
+        owners: BTreeMap::new(),
+        summary: None,
+    };
+    if f.in_use() {
+        let s = vol.stream_of(&f, name)?;
+        return Ok(Some((s, report)));
+    }
+    let usable = scan.entry(record).is_some_and(|e| {
+        e.sequence == f.header.sequence
+            && e.streams
+                .iter()
+                .any(|a| a.name == name && !a.ranges_truncated)
+    });
+    if !usable || scan.claims_truncated {
+        return Ok(None);
+    }
+    prepare_deleted(vol, scan, f, report, name).map(Some)
+}
+
+/// Abre el flujo `name` del borrado `f` con su evaluación de `scan` y los clústeres sospechosos
+/// marcados.
+fn prepare_deleted<'v>(
+    vol: &'v NtfsVolume,
+    scan: &DeletedScan,
+    mut f: crate::NtfsFile,
+    mut report: RecoveryReport,
+    name: &str,
+) -> Result<(DataStream<'v>, RecoveryReport), NtfsError> {
+    let record = f.number;
     let Some(entry) = scan.entry(record) else {
         return Err(NtfsError::RecordUnusable {
             number: record,
@@ -146,7 +199,7 @@ pub fn recovery_stream<'v>(
     report.summary = Some(scan.summary(&a));
     let s = s.with_suspect_clusters(a.suspect_clusters());
     report.assessment = Some(a);
-    Ok(Some((s, report)))
+    Ok((s, report))
 }
 
 /// Copia el flujo `name` del registro `record` a `w` (ver el módulo). `Ok(None)` si se canceló.

@@ -61,6 +61,10 @@ if (-not $SkipNtfsCorpus) {
         cargo test -p mr-vfs --test vfs_corpus -- --ignored
         if ($LASTEXITCODE -ne 0) { return }
         cargo test -p memrescue-cli --test vfs_corpus -- --ignored
+        if ($LASTEXITCODE -ne 0) { return }
+        cargo test -p mr-recover --test corpus -- --ignored
+        if ($LASTEXITCODE -ne 0) { return }
+        cargo test -p memrescue-cli --test recover -- --ignored
     }
 }
 if (-not $SkipQemu) {
