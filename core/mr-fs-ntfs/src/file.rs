@@ -322,6 +322,14 @@ impl NtfsFile {
             .collect()
     }
 
+    /// Como [`NtfsFile::file_names`], con las unidades UTF-16 originales de cada nombre (sin
+    /// pérdida; [`FileName::name`] sustituye los sustitutos sueltos por U+FFFD).
+    pub fn file_names_with_units(&self) -> Vec<(FileName, Vec<u16>)> {
+        self.typed(types::FILE_NAME, FileName::parse_with_units)
+            .filter_map(|(_, r)| r.ok())
+            .collect()
+    }
+
     pub fn object_id(&self) -> Option<ObjectId> {
         self.typed(types::OBJECT_ID, ObjectId::parse)
             .find_map(|(_, r)| r.ok())

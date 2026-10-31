@@ -1,0 +1,19 @@
+[package]
+name = "mr-vfs"
+description = "Sistema de archivos virtual de MemRescue: árbol unificado de ficheros vivos, borrados y huérfanos con estados y fiabilidad de los datos"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+mr-fs-ntfs.workspace = true
+
+[dev-dependencies]
+mr-fs-ntfs = { workspace = true, features = ["test-support"] }
+mr-io.workspace = true
+mr-part.workspace = true
+
+[lints]
+workspace = true

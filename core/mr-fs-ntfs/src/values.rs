@@ -227,6 +227,20 @@ impl FileName {
             name: utf16_lossy(&v[0x42..end]),
         })
     }
+
+    /// Como [`FileName::parse`], y además las unidades UTF-16 del nombre tal como están en disco
+    /// (sin pérdida: los sustitutos sueltos se conservan; #25, pregunta abierta 13 de INV-01).
+    pub fn parse_with_units(v: &[u8]) -> Result<(Self, Vec<u16>), ValueError> {
+        let f = FileName::parse(v)?;
+        let end = 0x42 + 2 * usize::from(v[0x40]);
+        let units = v[0x42..end]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
+            .collect();
+        Ok((f, units))
+    }
 }
 
 /// `$OBJECT_ID`.
@@ -565,5 +579,16 @@ pub(crate) mod tests {
             let (e, _) = parse_attribute_list(&v);
             assert!(e.len() <= n / ATTR_LIST_ENTRY_MIN);
         }
+    }
+
+    #[test]
+    fn file_name_units_are_lossless() {
+        let units = [0x61u16, 0xD800, 0x62, 0xDC00];
+        let v = crate::testvol::file_name_units(5 | (5 << 48), &units, 1, 0x20, 7);
+        let (f, u) = FileName::parse_with_units(&v).unwrap();
+        assert_eq!(u, units);
+        assert_eq!(f.name, "a\u{FFFD}b\u{FFFD}");
+        assert_eq!(f, FileName::parse(&v).unwrap());
+        assert!(FileName::parse_with_units(&v[..0x43]).is_err());
     }
 }
